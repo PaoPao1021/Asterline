@@ -897,6 +897,45 @@ fn session_discovered_is_persisted_and_emitted() {
 }
 
 #[test]
+fn attached_session_is_chat_scoped_and_new_session_clears_it() {
+    let mut rt = runtime();
+    let builder = MemberId::new("builder");
+    let session = AgentSessionId("attached-thread-1".to_string());
+
+    let step = rt.on_ui_command(UiCommand::BindAttachedSession {
+        member: builder.clone(),
+        session: session.clone(),
+    });
+    assert!(step.events.iter().any(|event| {
+        matches!(event, RuntimeEvent::SessionUpdated { member, session: found }
+            if member == &builder && found == &session)
+    }));
+    assert_eq!(rt.store.session_for(&builder).unwrap(), Some(session));
+    assert_eq!(
+        rt.config
+            .member(&builder)
+            .and_then(|member| member.session_id.as_deref()),
+        None,
+        "dynamic attach state must not become an explicit team.json pin"
+    );
+
+    let reset = rt.on_ui_command(UiCommand::NewSession);
+    assert!(
+        reset
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::SessionReset))
+    );
+    assert_eq!(rt.store.session_for(&builder).unwrap(), None);
+    let snapshot = rt
+        .store
+        .conversation_snapshot(rt.store.active_conversation())
+        .unwrap()
+        .unwrap();
+    assert!(snapshot.sessions.is_empty());
+}
+
+#[test]
 fn configured_session_id_is_used_for_the_first_turn() {
     let mut config = team();
     config
@@ -1208,6 +1247,114 @@ fn set_effort_updates_member_and_carries_into_runs() {
 
     let step = rt.on_ui_command(user("go"));
     assert_eq!(step.actions[0].effort, Some(Effort::High));
+}
+
+#[test]
+fn request_team_settings_returns_complete_protocol_free_settings() {
+    let mut config = team();
+    config.max_auto_relays = 9;
+    config.approvals.gate = Some(vec!["shell".to_string()]);
+    config.modes.team = Some(TeamModeConfig {
+        coordinator: Some(MemberId::new("builder")),
+        max_iterations: Some(4),
+        auto_verify: Some(false),
+        verify_command: Some("cargo test".to_string()),
+    });
+    config.members[0].system_prompt = Some("custom builder prompt".to_string());
+    inject_team_protocol(&mut config);
+    let mut rt = TeamRuntime::new(config, SqliteStore::in_memory().unwrap());
+
+    let step = rt.on_ui_command(UiCommand::RequestTeamSettings);
+    let settings = step
+        .events
+        .into_iter()
+        .find_map(|event| match event {
+            RuntimeEvent::TeamSettingsUpdated { settings } => Some(settings),
+            _ => None,
+        })
+        .expect("settings response");
+
+    assert_eq!(settings.name, "mixed");
+    assert_eq!(settings.max_auto_relays, 9);
+    assert_eq!(settings.approvals.gate, Some(vec!["shell".to_string()]));
+    assert_eq!(settings.modes.team.unwrap().max_iterations, Some(4));
+    assert_eq!(
+        settings.members[0].system_prompt.as_deref(),
+        Some("custom builder prompt")
+    );
+}
+
+#[test]
+fn replace_team_settings_updates_all_editable_fields_and_keeps_workspace() {
+    let mut rt = runtime();
+    let original_workspace = rt.config.workspace.clone();
+    let mut settings = rt.team_settings();
+    settings.name = "renamed".to_string();
+    settings.default_target = Some(DefaultTarget::All);
+    settings.max_auto_relays = 2;
+    settings.approvals.gate = Some(vec!["file".to_string()]);
+    settings.modes.team = Some(TeamModeConfig {
+        coordinator: Some(MemberId::new("reviewer")),
+        max_iterations: Some(5),
+        auto_verify: Some(false),
+        verify_command: Some("cargo check".to_string()),
+    });
+    settings.members[0].system_prompt = Some("visible prompt".to_string());
+
+    let step = rt.on_ui_command(UiCommand::ReplaceTeamSettings {
+        settings: Box::new(settings.clone()),
+    });
+
+    assert_eq!(rt.config.workspace, original_workspace);
+    assert_eq!(rt.config.name, "renamed");
+    assert_eq!(rt.config.default_target, Some(DefaultTarget::All));
+    assert_eq!(rt.config.max_auto_relays, 2);
+    assert_eq!(rt.config.approvals, settings.approvals);
+    assert_eq!(rt.config.modes, settings.modes);
+    assert!(
+        rt.config.members[0]
+            .system_prompt
+            .as_deref()
+            .unwrap()
+            .contains("ASTERLINE_TEAM_PROTOCOL_BEGIN")
+    );
+    let persisted = step.persist_team.expect("raw settings are persisted");
+    assert_eq!(persisted.workspace, original_workspace);
+    assert_eq!(
+        persisted.members[0].system_prompt.as_deref(),
+        Some("visible prompt")
+    );
+    assert!(step.events.iter().any(|event| {
+        matches!(event, RuntimeEvent::TeamSettingsUpdated { settings: updated }
+            if updated == &settings)
+    }));
+}
+
+#[test]
+fn replace_team_settings_rejects_changing_an_active_member() {
+    let mut rt = runtime();
+    rt.on_ui_command(user("go"));
+    let mut settings = rt.team_settings();
+    settings.name = "must-not-apply".to_string();
+    settings.members[0].backend = BackendKind::Claude;
+
+    let step = rt.on_ui_command(UiCommand::ReplaceTeamSettings {
+        settings: Box::new(settings),
+    });
+
+    assert_eq!(rt.config.name, "mixed");
+    assert_eq!(rt.config.members[0].backend, BackendKind::Codex);
+    assert!(step.persist_team.is_none());
+    assert!(step.events.iter().any(|event| {
+        matches!(event, RuntimeEvent::Notice(message)
+            if message.contains("cannot update builder while it is active"))
+    }));
+    assert!(
+        !step
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::TeamSettingsUpdated { .. }))
+    );
 }
 
 #[test]

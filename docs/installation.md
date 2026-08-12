@@ -14,7 +14,8 @@ a team. Rust is required only when building Asterline from source.
 The universal DMG supports both Apple silicon and Intel Macs.
 
 1. Open the
-   [latest Release](https://github.com/song0705/Asterline/releases/latest).
+   [Releases page](https://github.com/song0705/Asterline/releases) and choose
+   the latest `v*` CLI release (Desktop releases use `desktop-v*`).
 2. Download `asterline-<version>-macos-universal.dmg`.
 3. Open the DMG and double-click `Install Asterline.pkg`.
 4. Complete the standard macOS Installer flow.
@@ -76,7 +77,8 @@ instead.
 The Windows installer supports 64-bit Windows 10 and 11.
 
 1. Open the
-   [latest Release](https://github.com/song0705/Asterline/releases/latest).
+   [Releases page](https://github.com/song0705/Asterline/releases) and choose
+   the latest `v*` CLI release (Desktop releases use `desktop-v*`).
 2. Download `asterline-<version>-x86_64-windows-setup.exe`.
 3. Run Setup with the default options.
 4. Open a new PowerShell window and verify the installation:

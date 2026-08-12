@@ -492,6 +492,54 @@ pub struct TeamConfig {
     pub approvals: ApprovalPolicy,
 }
 
+/// User-editable team configuration independent of its launch workspace.
+///
+/// The workspace is deliberately owned by the application session: changing
+/// settings at runtime must not move the SQLite store or the member working
+/// tree out from underneath active runners.  This type is therefore the
+/// complete settings contract exposed to non-terminal UIs.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TeamSettings {
+    pub name: String,
+    pub members: Vec<TeamMember>,
+    #[serde(default)]
+    pub default_target: Option<DefaultTarget>,
+    #[serde(default = "default_max_auto_relays")]
+    pub max_auto_relays: u32,
+    #[serde(default, skip_serializing_if = "ModesConfig::is_default")]
+    pub modes: ModesConfig,
+    #[serde(default, skip_serializing_if = "ApprovalPolicy::is_default")]
+    pub approvals: ApprovalPolicy,
+}
+
+impl TeamSettings {
+    /// Copy every editable field from a full team configuration.
+    pub fn from_config(config: &TeamConfig) -> Self {
+        Self {
+            name: config.name.clone(),
+            members: config.members.clone(),
+            default_target: config.default_target.clone(),
+            max_auto_relays: config.max_auto_relays,
+            modes: config.modes.clone(),
+            approvals: config.approvals.clone(),
+        }
+    }
+
+    /// Reattach settings to the immutable workspace of an application
+    /// session before validation and persistence.
+    pub fn into_config(self, workspace: impl Into<PathBuf>) -> TeamConfig {
+        TeamConfig {
+            name: self.name,
+            workspace: workspace.into(),
+            members: self.members,
+            default_target: self.default_target,
+            max_auto_relays: self.max_auto_relays,
+            modes: self.modes,
+            approvals: self.approvals,
+        }
+    }
+}
+
 fn default_max_auto_relays() -> u32 {
     DEFAULT_MAX_AUTO_RELAYS
 }
@@ -507,6 +555,8 @@ pub enum TeamConfigError {
     DuplicateDisplayName(String),
     AmbiguousDisplayName(String),
     UnknownDefaultTarget(String),
+    InvalidRelayLimit,
+    InvalidMode(String),
     UnsupportedEffort {
         member: String,
         backend: BackendKind,
@@ -542,6 +592,8 @@ impl fmt::Display for TeamConfigError {
             Self::UnknownDefaultTarget(id) => {
                 write!(f, "default target refers to unknown member: {id}")
             }
+            Self::InvalidRelayLimit => f.write_str("max_auto_relays must be > 0"),
+            Self::InvalidMode(message) => write!(f, "invalid mode configuration: {message}"),
             Self::UnsupportedEffort {
                 member,
                 backend,
@@ -651,6 +703,12 @@ impl TeamConfig {
             return Err(TeamConfigError::UnknownDefaultTarget(id.to_string()));
         }
 
+        if self.max_auto_relays == 0 {
+            return Err(TeamConfigError::InvalidRelayLimit);
+        }
+        crate::domain::mode::validate_configured_modes(self)
+            .map_err(TeamConfigError::InvalidMode)?;
+
         Ok(())
     }
 
@@ -699,6 +757,35 @@ mod tests {
 
     fn claude(id: &str, role: &str) -> TeamMember {
         TeamMember::new(id, id, BackendKind::Claude, role)
+    }
+
+    #[test]
+    fn team_settings_round_trip_every_editable_field_without_workspace() {
+        let mut config = TeamConfig::new("custom", "/tmp/original")
+            .with_member(codex("builder", "implementation"));
+        config.default_target = Some(DefaultTarget::All);
+        config.max_auto_relays = 11;
+        config.approvals.gate = Some(vec!["shell".to_string()]);
+        config.modes.team = Some(crate::domain::mode::TeamModeConfig {
+            coordinator: Some(MemberId::new("builder")),
+            max_iterations: Some(7),
+            auto_verify: Some(false),
+            verify_command: Some("cargo test".to_string()),
+        });
+
+        let settings = TeamSettings::from_config(&config);
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(!json.contains("workspace"));
+        let decoded: TeamSettings = serde_json::from_str(&json).unwrap();
+        let rebuilt = decoded.into_config("/tmp/rebound");
+
+        assert_eq!(rebuilt.workspace, PathBuf::from("/tmp/rebound"));
+        assert_eq!(rebuilt.name, config.name);
+        assert_eq!(rebuilt.members, config.members);
+        assert_eq!(rebuilt.default_target, config.default_target);
+        assert_eq!(rebuilt.max_auto_relays, 11);
+        assert_eq!(rebuilt.modes, config.modes);
+        assert_eq!(rebuilt.approvals, config.approvals);
     }
 
     #[test]
@@ -940,6 +1027,24 @@ mod tests {
                 effort: Effort::Ultra,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn configured_mode_limits_are_validated_with_the_team() {
+        let mut config = TeamConfig::new("invalid mode", "/tmp/ws")
+            .with_member(codex("builder", "implementation"))
+            .with_member(codex("reviewer", "review"));
+        config.modes.brainstorm = Some(crate::domain::mode::BrainstormModeConfig {
+            participants: Some(vec![MemberId::new("builder"), MemberId::new("reviewer")]),
+            generation_rounds: Some(1),
+            ideas_per_round: Some(2),
+        });
+
+        assert!(matches!(
+            config.validate(),
+            Err(TeamConfigError::InvalidMode(message))
+                if message.contains("generation_rounds must be >= 2")
         ));
     }
 

@@ -3,7 +3,7 @@
 [English](README.md) · [简体中文](README.zh-CN.md)
 
 [![CI](https://github.com/song0705/Asterline/actions/workflows/ci.yml/badge.svg)](https://github.com/song0705/Asterline/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/song0705/Asterline)](https://github.com/song0705/Asterline/releases/latest)
+[![Latest CLI release](https://img.shields.io/github/v/tag/song0705/Asterline?filter=v%2A&label=CLI)](https://github.com/song0705/Asterline/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **Run a visible, persistent team of coding agents in one terminal.**
@@ -15,7 +15,11 @@ work as structured Runs.
 
 [Install](#installation) · [Get started](#get-started) ·
 [Documentation](#documentation) ·
-[Releases](https://github.com/song0705/Asterline/releases/latest)
+[Releases](https://github.com/song0705/Asterline/releases)
+
+Prefer a graphical workbench? **Asterline Desktop V1** adds project history,
+chat, Runs, approvals, modes, verification, and complete team settings while
+reusing this same local runtime. See the [Desktop guide](docs/desktop.md).
 
 ![Codex handing a frontend design proposal to Agy](docs/assets/asterline-codex-to-agy.webp)
 

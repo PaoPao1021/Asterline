@@ -33,6 +33,12 @@ impl RelayGuard {
         Self::new(DEFAULT_MAX_AUTO_RELAYS)
     }
 
+    /// Change the ceiling without resetting counters for a turn already in
+    /// progress. Live team-settings edits must not grant a fresh relay budget.
+    pub fn set_max_auto_relays(&mut self, max_auto_relays: u32) {
+        self.max_auto_relays = max_auto_relays;
+    }
+
     /// Record one automatic relay initiated by `sender` during `turn`.
     /// Returns [`RelayDecision::Pause`] once the sender exceeds the limit.
     pub fn record_auto_relay(&mut self, turn: TurnId, sender: &MemberId) -> RelayDecision {
@@ -128,6 +134,23 @@ mod tests {
         );
         assert_eq!(
             guard.record_auto_relay(turn2, &member("a")),
+            RelayDecision::Pause { count: 2 }
+        );
+    }
+
+    #[test]
+    fn changing_limit_preserves_existing_turn_counts() {
+        let mut guard = RelayGuard::new(3);
+        let turn = TurnId(1);
+        let sender = member("a");
+        assert_eq!(
+            guard.record_auto_relay(turn, &sender),
+            RelayDecision::Continue { count: 1 }
+        );
+
+        guard.set_max_auto_relays(1);
+        assert_eq!(
+            guard.record_auto_relay(turn, &sender),
             RelayDecision::Pause { count: 2 }
         );
     }

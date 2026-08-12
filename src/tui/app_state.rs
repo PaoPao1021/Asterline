@@ -254,6 +254,9 @@ impl AppState {
                     self.open_team_editor();
                 }
             }
+            // Complete settings are consumed by richer UI shells. The TUI's
+            // existing roster editor is refreshed by the adjacent Ready event.
+            RuntimeEvent::TeamSettingsUpdated { .. } => {}
             RuntimeEvent::ModeChanged { mode } => self.active_mode = mode,
             RuntimeEvent::TurnStarted { .. } | RuntimeEvent::TurnFinished { .. } => {
                 self.active_reasoning.clear();

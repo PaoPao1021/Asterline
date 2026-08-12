@@ -3,7 +3,7 @@
 //! and run the chat-first TUI. Exiting shuts the runtime down gracefully.
 
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -11,11 +11,11 @@ use std::thread::JoinHandle;
 
 use crate::adapter::{FakeRunner, MemberRunner, runner_for};
 use crate::domain::config::{
-    detect_backends, ensure_brainstorm_skill, ensure_team_skill, inject_team_protocol,
-    load_team_config,
+    DetectedBackends, detect_backends, ensure_brainstorm_skill, ensure_team_skill,
+    inject_team_protocol, load_team_config, strip_team_protocols,
 };
-use crate::domain::event::{ChatItem, RuntimeEvent};
-use crate::domain::team::TeamConfig;
+use crate::domain::event::{ChatItem, LogEntry, RuntimeEvent, UiCommand};
+use crate::domain::team::{TeamConfig, TeamSettings};
 use crate::runtime::{self, Runners, RuntimeHandle};
 use crate::store::sqlite::SqliteStore;
 use crate::tui;
@@ -44,24 +44,29 @@ where
         return Ok(());
     }
 
-    let prepared = match prepare(&config, cwd.as_ref())? {
-        Some(prepared) => prepared,
-        None => {
-            eprintln!(
-                "Asterline: no team config and no supported backend CLI was found on PATH.\n\
-                 Install a backend CLI, or pass --team <config.json>."
-            );
-            return Ok(());
+    let options = SessionOptions::from(&config);
+    let mut session = match bootstrap(options, cwd.as_ref())? {
+        BootstrapOutcome::Ready(session) => session,
+        BootstrapOutcome::NeedsTeamSetup(setup) => {
+            if !setup.detected.any() {
+                eprintln!(
+                    "Asterline: no team config and no supported backend CLI was found on PATH.\n\
+                     Install a backend CLI, or pass --team <config.json>."
+                );
+                return Ok(());
+            }
+            let Some(team) = crate::tui::team_builder::run(setup.detected, &setup.workspace)?
+            else {
+                return Ok(());
+            };
+            setup.start(team)?
         }
     };
 
-    let Prepared {
-        handle,
-        join,
-        events,
-        state,
-        instance_lock: _instance_lock,
-    } = prepared;
+    let mut state = AppState::new(session.take_initial_chat());
+    state.seed_logs(session.take_initial_logs());
+    let handle = session.handle();
+    let events = session.take_events();
 
     if config.banner {
         print_startup_banner();
@@ -72,8 +77,8 @@ where
     // sends Shutdown on its normal cleanup path; a duplicate send is harmless.
     let shutdown_handle = handle.clone();
     let tui_result = tui::run(handle, events, state);
-    shutdown_handle.send(crate::domain::event::UiCommand::Shutdown);
-    let runtime_result = join_runtime(join);
+    shutdown_handle.send(UiCommand::Shutdown);
+    let runtime_result = session.shutdown();
     tui_result.and(runtime_result)
 }
 
@@ -86,40 +91,229 @@ fn print_startup_banner() {
     println!("\x1b[1;36mAsterline\x1b[0m · Multi-Agent Coding Console");
 }
 
-/// Everything needed to run the TUI, wired but not yet started.
-struct Prepared {
-    handle: RuntimeHandle,
-    join: JoinHandle<()>,
-    events: mpsc::Receiver<RuntimeEvent>,
-    state: AppState,
-    instance_lock: InstanceLock,
+/// UI-independent launch options shared by the terminal and desktop shells.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionOptions {
+    pub team_path: Option<PathBuf>,
+    pub workspace: Option<PathBuf>,
+    pub db_path: Option<PathBuf>,
+    pub restore: bool,
+    pub approvals: bool,
+    pub fake: bool,
+    pub pick_team: bool,
+    pub auto_update: bool,
 }
 
-/// An OS-backed exclusive lock for one SQLite store. The marker file remains
-/// after exit, but the lock itself is released automatically with the handle.
+impl Default for SessionOptions {
+    fn default() -> Self {
+        Self {
+            team_path: None,
+            workspace: None,
+            db_path: None,
+            restore: true,
+            approvals: true,
+            fake: false,
+            pick_team: false,
+            auto_update: true,
+        }
+    }
+}
+
+impl From<&AppConfig> for SessionOptions {
+    fn from(config: &AppConfig) -> Self {
+        Self {
+            team_path: config.team_path.clone(),
+            workspace: config.workspace.clone(),
+            db_path: config.db_path.clone(),
+            restore: !config.no_restore,
+            approvals: !config.debug,
+            fake: config.fake,
+            pick_team: config.pick_team,
+            auto_update: !config.no_auto_update,
+        }
+    }
+}
+
+/// Result of resolving a workspace. UI shells decide how to collect a roster
+/// when setup is needed; the shared bootstrap never opens terminal UI.
+#[allow(clippy::large_enum_variant)]
+pub enum BootstrapOutcome {
+    Ready(AppSession),
+    NeedsTeamSetup(TeamSetup),
+}
+
+/// Information required by a UI-specific first-run team builder.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TeamSetup {
+    pub workspace: PathBuf,
+    pub save_path: PathBuf,
+    pub detected: DetectedBackends,
+    options: SessionOptions,
+}
+
+impl TeamSetup {
+    /// Validate and save a builder result, then start the shared runtime. The
+    /// builder cannot redirect the already-selected workspace.
+    pub fn start(self, mut team: TeamConfig) -> io::Result<AppSession> {
+        team.workspace = self.workspace.clone();
+        let team = strip_team_protocols(team);
+        team.validate()
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+        start_session(self.options, team, self.save_path, true)
+    }
+}
+
+/// A running Asterline core session. It owns the store lock and runtime thread
+/// and is safe to move to a desktop bridge worker thread.
+pub struct AppSession {
+    handle: RuntimeHandle,
+    join: Option<JoinHandle<()>>,
+    events: Option<mpsc::Receiver<RuntimeEvent>>,
+    initial_chat: Vec<ChatItem>,
+    initial_logs: Vec<LogEntry>,
+    workspace: PathBuf,
+    team_settings: TeamSettings,
+    _workspace_lock: InstanceLock,
+    _store_lock: InstanceLock,
+}
+
+impl AppSession {
+    pub fn handle(&self) -> RuntimeHandle {
+        self.handle.clone()
+    }
+
+    pub fn events(&self) -> &mpsc::Receiver<RuntimeEvent> {
+        self.events
+            .as_ref()
+            .expect("runtime event receiver has already been taken")
+    }
+
+    /// Transfer the sole event receiver to a UI event loop.
+    pub fn take_events(&mut self) -> mpsc::Receiver<RuntimeEvent> {
+        self.events
+            .take()
+            .expect("runtime event receiver has already been taken")
+    }
+
+    pub fn initial_chat(&self) -> &[ChatItem] {
+        &self.initial_chat
+    }
+
+    pub fn take_initial_chat(&mut self) -> Vec<ChatItem> {
+        std::mem::take(&mut self.initial_chat)
+    }
+
+    pub fn initial_logs(&self) -> &[LogEntry] {
+        &self.initial_logs
+    }
+
+    pub fn take_initial_logs(&mut self) -> Vec<LogEntry> {
+        std::mem::take(&mut self.initial_logs)
+    }
+
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
+    /// Initial settings contain user prompts with Asterline's injected
+    /// protocol removed. Subsequent changes are delivered as runtime events.
+    pub fn team_settings(&self) -> TeamSettings {
+        self.team_settings.clone()
+    }
+
+    pub fn shutdown(mut self) -> io::Result<()> {
+        self.shutdown_inner()
+    }
+
+    fn shutdown_inner(&mut self) -> io::Result<()> {
+        self.handle.send(UiCommand::Shutdown);
+        // A bounded event queue may currently have the runtime blocked in a
+        // send. Dropping our receiver unblocks that send before joining. UIs
+        // that took the receiver own its drain/drop lifecycle themselves.
+        drop(self.events.take());
+        match self.join.take() {
+            Some(join) => join_runtime(join),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for AppSession {
+    fn drop(&mut self) {
+        let _ = self.shutdown_inner();
+    }
+}
+
+/// An OS-backed exclusive lock. The marker file remains after exit, but the
+/// lock itself is released automatically with the handle.
 struct InstanceLock {
     _file: std::fs::File,
 }
 
 impl InstanceLock {
-    fn acquire(db_path: &Path) -> io::Result<Self> {
+    fn acquire_store(db_path: &Path) -> io::Result<Self> {
         let mut lock_name = db_path.as_os_str().to_os_string();
         lock_name.push(".lock");
-        let lock_path = PathBuf::from(lock_name);
+        Self::acquire_path(
+            &PathBuf::from(lock_name),
+            &format!("store {}", db_path.display()),
+        )
+    }
+
+    fn acquire_workspace(workspace: &Path) -> io::Result<Self> {
+        let canonical_workspace = workspace.canonicalize()?;
+        let state_dir = workspace.join(".asterline");
+        if std::fs::symlink_metadata(&state_dir).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing symbolic-link state directory for workspace {}",
+                    workspace.display()
+                ),
+            ));
+        }
+        std::fs::create_dir_all(&state_dir)?;
+        let canonical_state_dir = state_dir.canonicalize()?;
+        if canonical_state_dir.parent() != Some(canonical_workspace.as_path()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "workspace state directory resolves outside {}",
+                    workspace.display()
+                ),
+            ));
+        }
+        Self::acquire_path(
+            &canonical_state_dir.join("instance.lock"),
+            &format!("workspace {}", workspace.display()),
+        )
+    }
+
+    fn acquire_path(lock_path: &Path, resource: &str) -> io::Result<Self> {
+        if std::fs::symlink_metadata(lock_path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing symbolic-link lock file for {resource}"),
+            ));
+        }
         let mut options = std::fs::OpenOptions::new();
         options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
             options.share_mode(0);
         }
-        let mut file = options.open(&lock_path).map_err(|err| {
+        let file = options.open(lock_path).map_err(|err| {
             io::Error::new(
                 err.kind(),
                 format!(
-                    "could not lock {} (another Asterline instance may be using this store): \
-                     {err}",
-                    db_path.display()
+                    "could not lock {resource} (another Asterline instance may be using it): \
+                     {err}"
                 ),
             )
         })?;
@@ -130,77 +324,82 @@ impl InstanceLock {
                 let err = io::Error::last_os_error();
                 return Err(io::Error::new(
                     err.kind(),
-                    format!(
-                        "another Asterline instance is already using {}: {err}",
-                        db_path.display()
-                    ),
+                    format!("another Asterline instance is already using {resource}: {err}"),
                 ));
             }
         }
-        file.set_len(0)?;
-        writeln!(file, "pid={}", std::process::id())?;
         Ok(Self { _file: file })
     }
 }
 
-/// Build the team, store, runners, and runtime. Returns `None` if no team can
-/// be resolved (no config and no detected backends).
-fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
-    let requested_workspace = config
+/// Resolve configuration without opening a UI and start the shared runtime
+/// when a saved or explicit team is available.
+pub fn bootstrap(options: SessionOptions, cwd: impl AsRef<Path>) -> io::Result<BootstrapOutcome> {
+    let requested_workspace = options
         .workspace
         .clone()
-        .unwrap_or_else(|| cwd.to_path_buf());
+        .unwrap_or_else(|| cwd.as_ref().to_path_buf());
 
     let saved_team = requested_workspace.join(".asterline").join("team.json");
-    let mut team = match &config.team_path {
+    let mut team = match &options.team_path {
         Some(path) => load_team_config(path)?,
-        // Reuse a previously-built roster so the builder doesn't nag every
-        // launch; `--pick-team` forces re-selection.
-        None if !config.pick_team && saved_team.is_file() => load_team_config(&saved_team)?,
+        None if !options.pick_team && saved_team.is_file() => load_team_config(&saved_team)?,
         None => {
-            let detected = detect_backends();
-            if !detected.any() {
-                return Ok(None);
-            }
-            // Let the user choose the roster from the detected backends instead
-            // of silently applying a fixed default (falls back to the default
-            // roster when headless / on cancel).
-            match crate::tui::team_builder::run(detected, &requested_workspace)? {
-                Some(team) => {
-                    // Persist the choice for next time (before protocol injection).
-                    if let Some(parent) = saved_team.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    runtime::save_team_config(&saved_team, &team)?;
-                    team
-                }
-                None => return Ok(None),
-            }
+            return Ok(BootstrapOutcome::NeedsTeamSetup(TeamSetup {
+                workspace: requested_workspace,
+                save_path: saved_team,
+                detected: detect_backends(),
+                options,
+            }));
         }
     };
     // A CLI workspace is an explicit launch-time override. Without one, the
     // team file's workspace is canonical for runners, skills, and the default
     // database location.
-    if let Some(workspace) = &config.workspace {
+    if let Some(workspace) = &options.workspace {
         team.workspace = workspace.clone();
     }
-    let workspace = team.workspace.clone();
-    ensure_team_skill(&team.workspace)?;
-    ensure_brainstorm_skill(&team.workspace)?;
+    let team_save_path = options.team_path.clone().unwrap_or(saved_team);
+    start_session(options, team, team_save_path, false).map(BootstrapOutcome::Ready)
+}
+
+fn start_session(
+    options: SessionOptions,
+    team: TeamConfig,
+    team_save_path: PathBuf,
+    save_initial_team: bool,
+) -> io::Result<AppSession> {
+    let raw_team = strip_team_protocols(team);
+    raw_team
+        .validate()
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    let workspace = raw_team.workspace.clone();
+    let team_settings = TeamSettings::from_config(&raw_team);
+    // A workspace identity is locked independently from its configurable DB.
+    // This prevents `--db` from opening two runtimes over the same team, while
+    // the store sidecar also prevents different workspaces sharing one DB.
+    let workspace_lock = InstanceLock::acquire_workspace(&workspace)?;
+    crate::project_state::ensure_project_state(&workspace)?;
+    if save_initial_team {
+        runtime::save_team_config(&team_save_path, &raw_team)?;
+    }
+    ensure_team_skill(&workspace)?;
+    ensure_brainstorm_skill(&workspace)?;
+    let mut team = raw_team;
     inject_team_protocol(&mut team);
 
-    let db_path = config
+    let db_path = options
         .db_path
         .clone()
         .unwrap_or_else(|| workspace.join(".asterline").join("asterline.sqlite3"));
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let instance_lock = InstanceLock::acquire(&db_path)?;
+    let store_lock = InstanceLock::acquire_store(&db_path)?;
     let store = SqliteStore::open(&db_path).map_err(|err| io::Error::other(err.to_string()))?;
 
-    let runners = build_runners(&team, config.fake);
-    let (chat, logs) = if config.no_restore {
+    let runners = build_runners(&team, options.fake);
+    let (chat, logs) = if !options.restore {
         (Vec::new(), Vec::new())
     } else {
         // Replay only the current conversation (the latest, or a fresh one).
@@ -223,34 +422,34 @@ fn prepare(config: &AppConfig, cwd: &Path) -> io::Result<Option<Prepared>> {
         let logs = store.recent_logs(4000).unwrap_or_default();
         (chat, logs)
     };
-    let mut state = AppState::new(chat);
-    state.seed_logs(logs);
-
     // Bound the runtime-to-TUI stream so a fast or malformed backend cannot
     // turn a slow terminal renderer into an unbounded in-memory queue.
     let (events_tx, events_rx) = mpsc::sync_channel(2_048);
     #[cfg(windows)]
-    if !config.no_auto_update {
+    if options.auto_update {
         crate::update::spawn_auto_update(events_tx.clone());
     }
-    let team_save_path = config.team_path.clone().unwrap_or(saved_team);
     let (handle, join) = runtime::spawn_bounded(
         team,
         store,
         runners,
         events_tx,
-        !config.debug,
-        config.fake,
+        options.approvals,
+        options.fake,
         Some(team_save_path),
     );
 
-    Ok(Some(Prepared {
+    Ok(AppSession {
         handle,
-        join,
-        events: events_rx,
-        state,
-        instance_lock,
-    }))
+        join: Some(join),
+        events: Some(events_rx),
+        initial_chat: chat,
+        initial_logs: logs,
+        workspace,
+        team_settings,
+        _workspace_lock: workspace_lock,
+        _store_lock: store_lock,
+    })
 }
 
 fn build_runners(team: &TeamConfig, fake: bool) -> Runners {
@@ -366,6 +565,13 @@ mod tests {
     use crate::domain::event::{MessageTarget, UiCommand};
     use std::time::Duration;
 
+    fn prepare_session(config: &AppConfig, cwd: &Path) -> AppSession {
+        match bootstrap(SessionOptions::from(config), cwd).unwrap() {
+            BootstrapOutcome::Ready(session) => session,
+            BootstrapOutcome::NeedsTeamSetup(_) => panic!("expected a configured team"),
+        }
+    }
+
     #[test]
     fn parses_flags() {
         let config = AppConfig::parse([
@@ -422,6 +628,72 @@ mod tests {
     }
 
     #[test]
+    fn app_session_is_send_and_static_for_desktop_worker_ownership() {
+        fn assert_send_static<T: Send + 'static>() {}
+        assert_send_static::<AppSession>();
+    }
+
+    #[test]
+    fn bootstrap_returns_ui_neutral_team_setup_when_config_is_missing() {
+        let dir =
+            std::env::temp_dir().join(format!("asterline-app-needs-setup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let options = SessionOptions {
+            workspace: Some(dir.clone()),
+            auto_update: false,
+            ..SessionOptions::default()
+        };
+
+        let outcome = bootstrap(options, &dir).unwrap();
+        let BootstrapOutcome::NeedsTeamSetup(setup) = outcome else {
+            panic!("missing team must not open a UI or invent a roster");
+        };
+        assert_eq!(setup.workspace, dir);
+        assert_eq!(setup.save_path, dir.join(".asterline/team.json"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn team_setup_saves_raw_config_and_starts_a_session() {
+        let dir =
+            std::env::temp_dir().join(format!("asterline-app-setup-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let options = SessionOptions {
+            workspace: Some(dir.clone()),
+            fake: true,
+            auto_update: false,
+            ..SessionOptions::default()
+        };
+        let BootstrapOutcome::NeedsTeamSetup(setup) = bootstrap(options, &dir).unwrap() else {
+            panic!("setup expected");
+        };
+        let mut team = TeamConfig::new("desktop", "/must/not/win").with_member(
+            crate::domain::team::TeamMember::new(
+                "builder",
+                "Builder",
+                crate::domain::team::BackendKind::Codex,
+                "implementation",
+            ),
+        );
+        team.members[0].system_prompt = Some("visible custom prompt".to_string());
+        let session = setup.start(team).unwrap();
+
+        assert_eq!(session.workspace(), dir.as_path());
+        assert_eq!(session.team_settings().name, "desktop");
+        assert_eq!(
+            session.team_settings().members[0].system_prompt.as_deref(),
+            Some("visible custom prompt")
+        );
+        let saved = std::fs::read_to_string(dir.join(".asterline/team.json")).unwrap();
+        assert!(saved.contains("visible custom prompt"));
+        assert!(!saved.contains("ASTERLINE_TEAM_PROTOCOL"));
+        session.shutdown().unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn runtime_thread_panic_is_reported_as_an_io_error() {
         let join = std::thread::spawn(|| panic!("runtime failure"));
         let result = join_runtime(join);
@@ -440,14 +712,105 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("state.sqlite3");
 
-        let first = InstanceLock::acquire(&db).unwrap();
-        let error = InstanceLock::acquire(&db)
+        let first = InstanceLock::acquire_store(&db).unwrap();
+        let error = InstanceLock::acquire_store(&db)
             .err()
             .expect("a second instance must be rejected");
         assert!(error.to_string().contains("another Asterline instance"));
 
         drop(first);
-        InstanceLock::acquire(&db).expect("lock must be released when the owner exits");
+        InstanceLock::acquire_store(&db).expect("lock must be released when the owner exits");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instance_lock_rejects_symlinks_without_touching_the_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "asterline-instance-lock-symlink-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("keep.txt");
+        std::fs::write(&target, "do not truncate").unwrap();
+        let lock = dir.join("state.sqlite3.lock");
+        symlink(&target, &lock).unwrap();
+
+        let error = InstanceLock::acquire_store(&dir.join("state.sqlite3"))
+            .err()
+            .expect("symbolic-link lock must be rejected");
+        assert!(error.to_string().contains("symbolic-link"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "do not truncate");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn workspace_lock_uses_canonical_identity_and_releases_on_drop() {
+        let dir =
+            std::env::temp_dir().join(format!("asterline-workspace-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let first = InstanceLock::acquire_workspace(&dir).unwrap();
+        let alias = dir.join(".");
+        let error = InstanceLock::acquire_workspace(&alias)
+            .err()
+            .expect("a canonical workspace alias must share the same lock");
+        assert!(error.to_string().contains("another Asterline instance"));
+
+        drop(first);
+        InstanceLock::acquire_workspace(&alias)
+            .expect("workspace lock must be released when the owner exits");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn custom_database_cannot_bypass_the_workspace_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "asterline-workspace-session-lock-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let team =
+            TeamConfig::new("locked", &dir).with_member(crate::domain::team::TeamMember::new(
+                "builder",
+                "Builder",
+                crate::domain::team::BackendKind::Codex,
+                "implementation",
+            ));
+        let options = |db_path: PathBuf| SessionOptions {
+            workspace: Some(dir.clone()),
+            db_path: Some(db_path),
+            fake: true,
+            auto_update: false,
+            ..SessionOptions::default()
+        };
+        let save_path = dir.join(".asterline/team.json");
+        let first = start_session(
+            options(dir.join("first.sqlite3")),
+            team.clone(),
+            save_path.clone(),
+            false,
+        )
+        .unwrap();
+        let error = start_session(
+            options(dir.join("second.sqlite3")),
+            team.clone(),
+            save_path.clone(),
+            false,
+        )
+        .err()
+        .expect("a second DB path must not bypass the workspace lock");
+        assert!(error.to_string().contains("another Asterline instance"));
+
+        first.shutdown().unwrap();
+        let reopened = start_session(options(dir.join("second.sqlite3")), team, save_path, false)
+            .expect("shutdown must release both workspace and store locks");
+        reopened.shutdown().unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -500,17 +863,13 @@ mod tests {
         ])
         .unwrap();
 
-        let prepared = prepare(&config, &dir).unwrap().expect("prepared");
+        let prepared = prepare_session(&config, &dir);
         assert!(
             dir.join(crate::domain::config::ASTERLINE_TEAM_SKILL_PATH)
                 .is_file()
         );
-        let Prepared {
-            handle,
-            join,
-            events,
-            ..
-        } = prepared;
+        let handle = prepared.handle();
+        let events = prepared.events();
 
         // Drain the Ready event.
         let ready = events.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -535,7 +894,7 @@ mod tests {
         assert!(saw_completed);
 
         handle.send(UiCommand::Shutdown);
-        let _ = join.join();
+        prepared.shutdown().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -571,7 +930,7 @@ mod tests {
         ])
         .unwrap();
 
-        let prepared = prepare(&config, &invocation).unwrap().expect("prepared");
+        let prepared = prepare_session(&config, &invocation);
         assert!(
             team_workspace
                 .join(".asterline/asterline.sqlite3")
@@ -579,7 +938,7 @@ mod tests {
         );
         assert!(!invocation.join(".asterline/asterline.sqlite3").exists());
         let ready = prepared
-            .events
+            .events()
             .recv_timeout(Duration::from_secs(2))
             .expect("ready");
         assert!(matches!(
@@ -588,8 +947,8 @@ mod tests {
                 if workspace == team_workspace.display().to_string()
         ));
 
-        prepared.handle.send(UiCommand::Shutdown);
-        prepared.join.join().unwrap();
+        prepared.handle().send(UiCommand::Shutdown);
+        prepared.shutdown().unwrap();
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -627,11 +986,11 @@ mod tests {
         ])
         .unwrap();
 
-        let prepared = prepare(&config, &root).unwrap().expect("prepared");
+        let prepared = prepare_session(&config, &root);
         assert!(cli_workspace.join(".asterline/asterline.sqlite3").is_file());
         assert!(!declared_workspace.join(".asterline").exists());
         let ready = prepared
-            .events
+            .events()
             .recv_timeout(Duration::from_secs(2))
             .expect("ready");
         assert!(matches!(
@@ -640,8 +999,8 @@ mod tests {
                 if workspace == cli_workspace.display().to_string()
         ));
 
-        prepared.handle.send(UiCommand::Shutdown);
-        prepared.join.join().unwrap();
+        prepared.handle().send(UiCommand::Shutdown);
+        prepared.shutdown().unwrap();
         std::fs::remove_dir_all(&root).ok();
     }
 }

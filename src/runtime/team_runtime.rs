@@ -31,7 +31,7 @@ use crate::domain::mode::{
 };
 use crate::domain::team::{
     ApprovalSurface, BackendKind, DefaultTarget, Effort, MemberId, SessionPolicy, TeamConfig,
-    TeamMember,
+    TeamMember, TeamSettings,
 };
 use crate::router::{self, RelayDecision, RelayGuard, parse_agent_output};
 use crate::run_support::suggested_verify_command;
@@ -59,7 +59,7 @@ pub struct RuntimeStep {
 /// A runner map mutation requested after a live roster edit.
 pub enum RunnerChange {
     Upsert {
-        member: TeamMember,
+        member: Box<TeamMember>,
         workspace: PathBuf,
     },
     Remove(MemberId),
@@ -415,6 +415,14 @@ impl TeamRuntime {
                 members,
                 default_target,
             } => self.handle_replace_team(members, default_target, &mut step),
+            UiCommand::RequestTeamSettings => {
+                step.events.push(RuntimeEvent::TeamSettingsUpdated {
+                    settings: self.team_settings(),
+                });
+            }
+            UiCommand::ReplaceTeamSettings { settings } => {
+                self.handle_replace_team_settings(*settings, &mut step)
+            }
             UiCommand::NewSession => self.handle_new_session(&mut step),
             UiCommand::RequestResume => self.handle_request_resume(&mut step),
             UiCommand::ResumeConversation { conversation } => {
@@ -422,6 +430,9 @@ impl TeamRuntime {
             }
             UiCommand::ImportTranscript { member, items } => {
                 self.handle_import_transcript(member, items, &mut step)
+            }
+            UiCommand::BindAttachedSession { member, session } => {
+                self.handle_bind_attached_session(member, session, &mut step)
             }
             UiCommand::ContinueRun { run_id, note } => {
                 self.handle_continue_run(run_id, note, &mut step)
@@ -826,7 +837,7 @@ impl TeamRuntime {
         self.last_user = None;
         for member in self.config.members.clone() {
             step.runner_changes.push(RunnerChange::Upsert {
-                member,
+                member: Box::new(member),
                 workspace: self.config.workspace.clone(),
             });
         }
@@ -834,6 +845,9 @@ impl TeamRuntime {
         step.events
             .push(RuntimeEvent::ConversationResumed { conversation, chat });
         step.events.push(self.ready_event());
+        step.events.push(RuntimeEvent::TeamSettingsUpdated {
+            settings: self.team_settings(),
+        });
         step.events.push(RuntimeEvent::ModeChanged { mode });
         step.events.push(RuntimeEvent::Notice(format!(
             "resumed saved chat {conversation}"
@@ -863,6 +877,71 @@ impl TeamRuntime {
             .save_conversation_snapshot(&team, &sessions, self.active_mode)
     }
 
+    fn handle_bind_attached_session(
+        &mut self,
+        member: MemberId,
+        session: AgentSessionId,
+        step: &mut RuntimeStep,
+    ) {
+        if self.config.member(&member).is_none() {
+            step.events
+                .push(RuntimeEvent::Notice(format!("unknown member: {member}")));
+            return;
+        }
+        if self.members.get(&member).is_some_and(|state| {
+            state.status != MemberStatus::Idle || state.running.is_some() || !state.queue.is_empty()
+        }) {
+            step.events.push(RuntimeEvent::Notice(format!(
+                "cannot bind an attached session while {member} is active"
+            )));
+            return;
+        }
+        if session.0.is_empty()
+            || session.0.len() > 4_096
+            || session.0.chars().any(char::is_control)
+        {
+            step.events.push(RuntimeEvent::Notice(format!(
+                "invalid attached session id for {member}"
+            )));
+            return;
+        }
+        if self.sessions.get(&member).as_ref() == Some(&session) {
+            return;
+        }
+
+        let sessions = self
+            .config
+            .members
+            .iter()
+            .filter_map(|candidate| {
+                let session_id = if candidate.id == member {
+                    Some(session.0.clone())
+                } else {
+                    self.sessions.get(&candidate.id).map(|value| value.0)
+                }?;
+                Some(StoredConversationSession {
+                    member: candidate.id.clone(),
+                    backend: candidate.backend,
+                    session_id,
+                })
+            })
+            .collect::<Vec<_>>();
+        let raw_config = strip_team_protocols(self.config.clone());
+        if let Err(err) = self.store.replace_runtime_team_state(
+            &self.config,
+            &raw_config,
+            &sessions,
+            self.active_mode,
+            &[],
+        ) {
+            self.report_store_error("bind the attached session", err, step);
+            return;
+        }
+        self.sessions.set(member.clone(), session.clone());
+        step.events
+            .push(RuntimeEvent::SessionUpdated { member, session });
+    }
+
     fn persist_snapshot_or_notice(&self, context: &str, step: &mut RuntimeStep) {
         if let Err(err) = self.persist_conversation_snapshot() {
             self.report_store_error(context, err, step);
@@ -890,15 +969,21 @@ impl TeamRuntime {
         default_target: Option<DefaultTarget>,
         step: &mut RuntimeStep,
     ) {
-        let mut raw_config = self.config.clone();
-        raw_config.members = self.merge_member_config(members);
-        raw_config.default_target = default_target.or_else(|| {
-            raw_config
-                .members
+        let raw_config = strip_team_protocols(self.config.clone());
+        let members = self.merge_member_config(members);
+        let default_target = default_target.or_else(|| {
+            members
                 .first()
                 .map(|member| DefaultTarget::Member(member.id.clone()))
         });
-        raw_config = strip_team_protocols(raw_config);
+        let mut settings = TeamSettings::from_config(&raw_config);
+        settings.members = members;
+        settings.default_target = default_target;
+        self.handle_replace_team_settings(settings, step);
+    }
+
+    fn handle_replace_team_settings(&mut self, settings: TeamSettings, step: &mut RuntimeStep) {
+        let raw_config = strip_team_protocols(settings.into_config(self.config.workspace.clone()));
 
         if let Err(err) = raw_config.validate() {
             step.events
@@ -1061,20 +1146,22 @@ impl TeamRuntime {
         }
 
         self.config = operational_config;
-        // Rebuild even though ReplaceTeam does not carry approvals yet, so a
-        // future path that mutates config.approvals stays correct.
         self.matcher = ApprovalMatcher::from_policy(&self.config.approvals);
+        self.relay.set_max_auto_relays(self.config.max_auto_relays);
         for member in self.config.members.clone() {
             step.runner_changes.push(RunnerChange::Upsert {
-                member,
+                member: Box::new(member),
                 workspace: self.config.workspace.clone(),
             });
         }
         for turn in cleanup_turns {
             self.check_turn_complete(turn, step);
         }
-        step.persist_team = Some(raw_config);
+        step.persist_team = Some(raw_config.clone());
         step.events.push(self.ready_event());
+        step.events.push(RuntimeEvent::TeamSettingsUpdated {
+            settings: TeamSettings::from_config(&raw_config),
+        });
         step.events.push(RuntimeEvent::Notice(format!(
             "team updated: {} member(s)",
             self.config.members.len()
@@ -1108,6 +1195,10 @@ impl TeamRuntime {
                 member
             })
             .collect()
+    }
+
+    fn team_settings(&self) -> TeamSettings {
+        TeamSettings::from_config(&strip_team_protocols(self.config.clone()))
     }
 
     /// Persist and surface messages exchanged in a member's native session

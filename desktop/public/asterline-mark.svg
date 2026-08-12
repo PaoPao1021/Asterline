@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">Asterline</title>
+  <desc id="desc">Three connected paths forming an abstract letter A and star.</desc>
+  <defs>
+    <linearGradient id="asterline-gradient" x1="18" y1="108" x2="110" y2="20" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3d7d6b"/>
+      <stop offset=".54" stop-color="#5a9983"/>
+      <stop offset="1" stop-color="#e39b56"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="29" fill="#14211e"/>
+  <path d="M27 96 61.5 28a4 4 0 0 1 7 0L101 96" fill="none" stroke="url(#asterline-gradient)" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M40 78h48" fill="none" stroke="#f5f0e6" stroke-width="9" stroke-linecap="round"/>
+  <path d="m95 24 2.8 8.2L106 35l-8.2 2.8L95 46l-2.8-8.2L84 35l8.2-2.8Z" fill="#efb36f"/>
+  <circle cx="27" cy="96" r="6" fill="#74b29b"/>
+  <circle cx="101" cy="96" r="6" fill="#efb36f"/>
+</svg>

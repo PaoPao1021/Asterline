@@ -49,33 +49,52 @@ pub fn snapshot(session_id: Option<&str>, cwd: &str) -> RolloutSnapshot {
 
 /// After the attach exits, return the messages added during it (codex only).
 pub fn imported_since(snapshot: RolloutSnapshot) -> Vec<ImportedMessage> {
-    import_from_rollouts(snapshot, all_rollouts())
+    imported_since_with_session(snapshot).1
 }
 
+/// After the attach exits, return the active Codex session id together with
+/// the messages added during it. Fresh native sessions need the id so the next
+/// Asterline turn resumes the same backend conversation.
+pub fn imported_since_with_session(
+    snapshot: RolloutSnapshot,
+) -> (Option<String>, Vec<ImportedMessage>) {
+    import_from_rollouts_with_session(snapshot, all_rollouts())
+}
+
+#[cfg(test)]
 fn import_from_rollouts(snapshot: RolloutSnapshot, rollouts: Vec<PathBuf>) -> Vec<ImportedMessage> {
+    import_from_rollouts_with_session(snapshot, rollouts).1
+}
+
+fn import_from_rollouts_with_session(
+    snapshot: RolloutSnapshot,
+    rollouts: Vec<PathBuf>,
+) -> (Option<String>, Vec<ImportedMessage>) {
     // When resuming a known Codex session, only consider rollout files whose
     // names contain that session id. Otherwise a concurrent Codex session can
     // become the newest rollout and be imported into the wrong Asterline member.
+    let previous_session = snapshot.session_id.clone();
     let target = match snapshot.session_id.as_deref() {
         Some(session_id) => {
             newest_rollout_for_session_since(&rollouts, session_id, snapshot.started)
                 .or(snapshot.path)
         }
-        None => snapshot
-            .cwd
-            .as_deref()
-            .and_then(|cwd| newest_rollout_for_cwd_since(&rollouts, cwd, snapshot.started))
-            .or(snapshot.path),
+        None => snapshot.cwd.as_deref().and_then(|cwd| {
+            let mut matches = rollouts_for_cwd_since(&rollouts, cwd, snapshot.started);
+            (matches.len() == 1).then(|| matches.pop()).flatten()
+        }),
     };
     let Some(path) = target else {
-        return Vec::new();
+        return (previous_session, Vec::new());
     };
+    let session_id = rollout_session_id(&path).or(previous_session);
     let messages = parse_messages(&path);
-    messages
+    let imported = messages
         .into_iter()
         .skip(snapshot.before)
         .filter_map(to_imported)
-        .collect()
+        .collect();
+    (session_id, imported)
 }
 
 /// `$CODEX_HOME/sessions`, or the platform user profile's `.codex/sessions`.
@@ -165,12 +184,8 @@ fn rollout_matches_session(path: &Path, session_id: &str) -> bool {
         .is_some_and(|n| n.to_string_lossy().contains(session_id))
 }
 
-fn newest_rollout_for_cwd_since(
-    rollouts: &[PathBuf],
-    cwd: &str,
-    since: SystemTime,
-) -> Option<PathBuf> {
-    rollouts
+fn rollouts_for_cwd_since(rollouts: &[PathBuf], cwd: &str, since: SystemTime) -> Vec<PathBuf> {
+    let mut matches: Vec<(SystemTime, PathBuf)> = rollouts
         .iter()
         .filter(|p| {
             rollout_cwd(p)
@@ -178,8 +193,9 @@ fn newest_rollout_for_cwd_since(
         })
         .filter_map(|p| modified(p).map(|m| (m, p.clone())))
         .filter(|(m, _)| *m >= since)
-        .max_by_key(|(m, _)| *m)
-        .map(|(_, p)| p)
+        .collect();
+    matches.sort_by_key(|(modified, _)| *modified);
+    matches.into_iter().map(|(_, path)| path).collect()
 }
 
 fn rollout_cwd(path: &Path) -> Option<String> {
@@ -195,6 +211,30 @@ fn rollout_cwd(path: &Path) -> Option<String> {
             .and_then(Value::as_str)
         {
             found = Some(cwd.to_string());
+            return false;
+        }
+        true
+    });
+    found
+}
+
+fn rollout_session_id(path: &Path) -> Option<String> {
+    let mut found = None;
+    import_io::for_each_json_value(path, |value| {
+        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+            return true;
+        }
+        let payload = match value.get("payload") {
+            Some(payload) => payload,
+            None => return true,
+        };
+        if let Some(session_id) = payload
+            .get("session_id")
+            .or_else(|| payload.get("id"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            found = Some(session_id.to_string());
             return false;
         }
         true
@@ -385,7 +425,7 @@ mod tests {
         .unwrap();
         std::fs::write(&unrelated, message_line("user", "wrong session")).unwrap();
 
-        let imported = import_from_rollouts(
+        let (session_id, imported) = import_from_rollouts_with_session(
             RolloutSnapshot {
                 session_id: Some("session-abc".to_string()),
                 cwd: Some("/tmp/attached".to_string()),
@@ -396,6 +436,7 @@ mod tests {
             vec![unrelated, attached],
         );
 
+        assert_eq!(session_id.as_deref(), Some("session-abc"));
         assert_eq!(
             imported,
             vec![ImportedMessage {
@@ -433,7 +474,7 @@ mod tests {
         )
         .unwrap();
 
-        let imported = import_from_rollouts(
+        let (session_id, imported) = import_from_rollouts_with_session(
             RolloutSnapshot {
                 session_id: None,
                 cwd: Some("/tmp/attached".to_string()),
@@ -444,6 +485,7 @@ mod tests {
             vec![unrelated, attached],
         );
 
+        assert_eq!(session_id.as_deref(), Some("session-new"));
         assert_eq!(
             imported,
             vec![ImportedMessage {
@@ -453,6 +495,39 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fresh_attach_with_multiple_matching_rollouts_fails_closed() {
+        let dir =
+            std::env::temp_dir().join(format!("ast-rollout-ambiguous-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("rollout-first.jsonl");
+        let second = dir.join("rollout-second.jsonl");
+        for (path, session) in [(&first, "first"), (&second, "second")] {
+            std::fs::write(
+                path,
+                [
+                    session_meta_line(session, "/tmp/attached"),
+                    message_line("user", session),
+                ]
+                .join("\n"),
+            )
+            .unwrap();
+        }
+
+        let result = import_from_rollouts_with_session(
+            RolloutSnapshot {
+                session_id: None,
+                cwd: Some("/tmp/attached".to_string()),
+                path: None,
+                before: 0,
+                started: SystemTime::UNIX_EPOCH,
+            },
+            vec![first, second],
+        );
+        assert_eq!(result, (None, Vec::new()));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[cfg(windows)]

@@ -1038,6 +1038,11 @@ mod windows_tests {
         std::fs::write(ready, b"ready").unwrap();
         if mode == "wait" {
             let _ = descendant.wait();
+        } else {
+            // This helper intentionally exits while the descendant continues:
+            // the enclosing test verifies Windows Job Object breakaway
+            // behavior. The test process reaps the descendant independently.
+            std::mem::forget(descendant);
         }
     }
 

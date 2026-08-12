@@ -4,26 +4,28 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use crate::domain::mode::{CollabMode, ModeStatusSummary, TerminalMode};
 use crate::domain::team::{
     BackendKind, DefaultTarget, Effort, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
-    TeamMember,
+    TeamMember, TeamSettings,
 };
 
 /// A turn groups everything that happens after one user submission.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct TurnId(pub u64);
 
 /// A single chat message (user or agent) in the persisted conversation.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct MessageId(pub u64);
 
 /// A pending approval request awaiting a user decision.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct ApprovalId(pub u64);
 
 /// A persisted run used by team and structured collaboration modes.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct RunId(pub u64);
 
 macro_rules! impl_id_display {
@@ -44,7 +46,7 @@ impl_id_display! {
 }
 
 /// A backend session/thread id used to resume a member's conversation.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct AgentSessionId(pub String);
 
 impl AgentSessionId {
@@ -60,7 +62,7 @@ impl fmt::Display for AgentSessionId {
 }
 
 /// Coarse member lifecycle status surfaced in the header and team drawer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum MemberStatus {
     Idle,
     Queued,
@@ -90,7 +92,7 @@ impl fmt::Display for MemberStatus {
 }
 
 /// A user's decision on a pending approval.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ApprovalDecision {
     Approve,
     Reject,
@@ -106,7 +108,7 @@ impl ApprovalDecision {
 }
 
 /// High-level lifecycle for a user-visible run.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RunStatus {
     Planned,
     Running,
@@ -147,7 +149,7 @@ impl fmt::Display for RunStatus {
 }
 
 /// Per-run checklist item state shown in `/runs`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RunStepStatus {
     Todo,
     Doing,
@@ -183,7 +185,7 @@ impl fmt::Display for RunStepStatus {
 
 /// A destination for an agent-to-agent message, before resolution to concrete
 /// member ids. `Member` holds either an id or a display name.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RouteTo {
     Member(String),
     All,
@@ -199,7 +201,7 @@ impl fmt::Display for RouteTo {
 }
 
 /// A structured agent-to-agent message parsed from an `@@team_message` envelope.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TeamMessage {
     pub to: Vec<RouteTo>,
     pub kind: Option<String>,
@@ -207,7 +209,7 @@ pub struct TeamMessage {
 }
 
 /// Who a user submission is addressed to.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum MessageTarget {
     /// The team default target.
     Default,
@@ -221,14 +223,14 @@ pub enum MessageTarget {
 
 /// One message imported from a member's native backend session transcript
 /// (e.g. the codex rollout) after attaching to it interactively.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ImportedMessage {
     pub from_user: bool,
     pub text: String,
 }
 
 /// Commands sent from the TUI to the runtime.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum UiCommand {
     /// Select the mode used by subsequent messages in this terminal session.
     SetMode { mode: TerminalMode },
@@ -254,6 +256,12 @@ pub enum UiCommand {
         members: Vec<TeamMember>,
         default_target: Option<DefaultTarget>,
     },
+    /// Read the complete, user-editable team settings. The runtime responds
+    /// with [`RuntimeEvent::TeamSettingsUpdated`].
+    RequestTeamSettings,
+    /// Replace every editable team field while retaining the session's
+    /// immutable workspace.
+    ReplaceTeamSettings { settings: Box<TeamSettings> },
     /// Start a fresh chat: a new conversation and new backend sessions, with the
     /// transcript cleared. (codex's `/new`.)
     NewSession,
@@ -266,6 +274,13 @@ pub enum UiCommand {
     ImportTranscript {
         member: MemberId,
         items: Vec<ImportedMessage>,
+    },
+    /// Bind a session discovered by an external native attach. Unlike an
+    /// explicit `team.json` session id, this belongs only to the active chat
+    /// and is cleared by [`UiCommand::NewSession`].
+    BindAttachedSession {
+        member: MemberId,
+        session: AgentSessionId,
     },
     /// Continue an existing run, usually after a blocker or failed
     /// verification. Without a run id, the runtime targets the latest run.
@@ -325,7 +340,7 @@ pub enum UiCommand {
 /// backend stream adapters translate their output into this
 /// single vocabulary; unknown backend output becomes [`AgentEvent::Log`] or
 /// [`AgentEvent::ParseWarning`] so the TUI never crashes.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AgentEvent {
     /// A new assistant message has begun.
     MessageStarted,
@@ -372,7 +387,7 @@ pub enum AgentEvent {
 }
 
 /// Severity for a [`LogEntry`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum LogLevel {
     Debug,
     Info,
@@ -398,7 +413,7 @@ impl fmt::Display for LogLevel {
 }
 
 /// A diagnostic entry shown only in the logs drawer (never the main chat).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LogEntry {
     pub level: LogLevel,
     pub source: String,
@@ -428,7 +443,7 @@ impl LogEntry {
 }
 
 /// A short summary of one member for the header and team drawer.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MemberSummary {
     pub id: MemberId,
     pub display_name: String,
@@ -444,14 +459,14 @@ pub struct MemberSummary {
     pub session_policy: SessionPolicy,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RunVerification {
     pub command: String,
     pub ok: bool,
     pub summary: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RunEventSummary {
     pub kind: String,
     pub title: String,
@@ -460,7 +475,7 @@ pub struct RunEventSummary {
     pub attempt: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RunStepSummary {
     pub number: u32,
     pub status: RunStepStatus,
@@ -470,7 +485,7 @@ pub struct RunStepSummary {
     pub updated_at: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RunStepRequest {
     Add {
         owner: Option<MemberId>,
@@ -495,13 +510,13 @@ pub enum RunStepRequest {
 }
 
 /// Collaboration-mode status attached to a run when `mode` is set.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ModeRunStatus {
     pub mode: CollabMode,
     pub state: ModeStatusSummary,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RunSummary {
     pub id: RunId,
     pub goal: String,
@@ -525,7 +540,7 @@ pub struct RunSummary {
 
 /// Events sent from the runtime to the TUI. This is the single source of truth
 /// for TUI state — the TUI never parses free-form strings to infer state.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RuntimeEvent {
     /// Initial snapshot emitted once the runtime is ready.
     Ready {
@@ -534,6 +549,11 @@ pub enum RuntimeEvent {
         default_target: Option<DefaultTarget>,
         members: Vec<MemberSummary>,
         runs: Vec<RunSummary>,
+    },
+    /// Complete user-editable settings, emitted on request and after a
+    /// successful replacement or conversation restore.
+    TeamSettingsUpdated {
+        settings: TeamSettings,
     },
     /// The terminal-scoped message dispatch mode changed.
     ModeChanged {
@@ -671,7 +691,7 @@ pub enum RuntimeEvent {
 }
 
 /// One row in the `/resume` saved-chat picker.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ConversationSummary {
     pub id: i64,
     pub created_at: String,
@@ -682,7 +702,7 @@ pub struct ConversationSummary {
 
 /// A rendered conversation block in the single-column chat. The TUI builds these
 /// from [`RuntimeEvent`]s, and the store replays them from persisted rows.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ChatItem {
     User {
         body: String,
@@ -754,5 +774,37 @@ mod tests {
             "reviewer"
         );
         assert_eq!(RouteTo::All.to_string(), "all");
+    }
+
+    #[test]
+    fn desktop_facing_commands_and_events_round_trip_through_json() {
+        let settings = TeamSettings {
+            name: "desktop".to_string(),
+            members: vec![TeamMember::new(
+                "builder",
+                "Builder",
+                BackendKind::Codex,
+                "implementation",
+            )],
+            default_target: Some(DefaultTarget::All),
+            max_auto_relays: 4,
+            modes: crate::domain::mode::ModesConfig::default(),
+            approvals: crate::domain::team::ApprovalPolicy::default(),
+        };
+        let command = UiCommand::ReplaceTeamSettings {
+            settings: Box::new(settings.clone()),
+        };
+        let command_json = serde_json::to_string(&command).unwrap();
+        assert_eq!(
+            serde_json::from_str::<UiCommand>(&command_json).unwrap(),
+            command
+        );
+
+        let event = RuntimeEvent::TeamSettingsUpdated { settings };
+        let event_json = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            serde_json::from_str::<RuntimeEvent>(&event_json).unwrap(),
+            event
+        );
     }
 }

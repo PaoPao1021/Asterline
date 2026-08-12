@@ -12,7 +12,7 @@ use std::time::Duration;
 use std::{io, result};
 
 use rusqlite::types::Type;
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::event::{
@@ -24,6 +24,11 @@ use crate::domain::mode::{CollabMode, ModeStatusSummary, TerminalMode};
 use crate::domain::team::{BackendKind, MemberId, TeamConfig};
 
 pub type Result<T> = result::Result<T, rusqlite::Error>;
+
+/// Current SQLite schema version. This is intentionally independent from the
+/// workspace-level `project_state_format`: schema revisions can migrate within
+/// one project-state format without making the whole workspace incompatible.
+pub const SQLITE_SCHEMA_VERSION: i64 = 10;
 
 /// A pending approval row.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,8 +65,19 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(rusqlite::Error::InvalidPath(path.to_path_buf()));
+        }
         let store = Self {
-            conn: Connection::open(path)?,
+            // SQLite's NOFOLLOW flag closes the check/open race on platforms
+            // whose VFS supports symbolic links. The explicit metadata check
+            // above also rejects Windows file symlinks and gives a stable
+            // error before migrations can touch an attacker-selected target.
+            conn: Connection::open_with_flags(
+                path,
+                OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?,
             conversation: Cell::new(0),
         };
         store.initialize()?;
@@ -82,9 +98,55 @@ impl SqliteStore {
         // short write lock. Wait for it instead of failing the runtime on the
         // first SQLITE_BUSY response.
         self.conn.busy_timeout(Duration::from_secs(5))?;
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version > SQLITE_SCHEMA_VERSION {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "SQLite schema version {version} is newer than supported version \
+                         {SQLITE_SCHEMA_VERSION}"
+                    ),
+                ),
+            )));
+        }
         self.conn
             .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
-        self.create_schema()
+        if version < SQLITE_SCHEMA_VERSION {
+            self.migrate(version)?;
+            self.conn
+                .pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION)?;
+        }
+        Ok(())
+    }
+
+    /// Bring pre-versioned/v9 stores up to the current run schema.
+    ///
+    /// Releases through v0.1 used `workflow_*` tables and recorded
+    /// `PRAGMA user_version = 9`. The v0.2 schema renamed those tables to
+    /// `run_*`; some v9 databases may already contain both table families
+    /// after being opened by an unversioned v0.2 build. The migration therefore
+    /// assigns fresh run ids and keeps both data sets.
+    fn migrate(&self, from: i64) -> Result<()> {
+        if from == 0 && self.has_legacy_prototype_schema()? {
+            self.conn.execute_batch(
+                r#"
+                DROP TABLE IF EXISTS messages;
+                DROP TABLE IF EXISTS approvals;
+                DROP TABLE IF EXISTS agents;
+                DROP TABLE IF EXISTS sessions;
+                DROP TABLE IF EXISTS inter_agent_messages;
+                DROP TABLE IF EXISTS terminal_events;
+                "#,
+            )?;
+        }
+        self.create_schema()?;
+        if from <= 9 {
+            self.migrate_legacy_workflow_runs()?;
+        }
+        Ok(())
     }
 
     /// Run one compound mutation atomically. `unchecked_transaction` accepts
@@ -317,6 +379,150 @@ impl SqliteStore {
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<Result<Vec<_>>>()?;
         Ok(columns.iter().any(|name| name == column))
+    }
+
+    fn table_exists(&self, table: &str) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![table],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|row| row.is_some())
+    }
+
+    /// Detect the incompatible schema written before the event-source store.
+    /// A pre-versioned v0.2 database also has `user_version = 0`, but its
+    /// `messages.kind` column distinguishes it from this prototype.
+    fn has_legacy_prototype_schema(&self) -> Result<bool> {
+        Ok(self.table_exists("messages")? && !self.has_column("messages", "kind")?)
+    }
+
+    fn migrate_legacy_workflow_runs(&self) -> Result<()> {
+        if !self.table_exists("workflow_runs")? {
+            return Ok(());
+        }
+
+        let has_events = self.table_exists("workflow_run_events")?;
+        let has_steps = self.table_exists("workflow_run_steps")?;
+        let missing_attempt = !self.has_column("workflow_runs", "attempt")?;
+        let missing_mode = !self.has_column("workflow_runs", "mode")?;
+        let missing_mode_state = !self.has_column("workflow_runs", "mode_state")?;
+        let missing_step_owner = has_steps && !self.has_column("workflow_run_steps", "owner")?;
+
+        self.transactional(|| {
+            if missing_attempt {
+                self.conn.execute(
+                    "ALTER TABLE workflow_runs
+                     ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1",
+                    [],
+                )?;
+            }
+            if missing_mode {
+                self.conn
+                    .execute("ALTER TABLE workflow_runs ADD COLUMN mode TEXT", [])?;
+            }
+            if missing_mode_state {
+                self.conn
+                    .execute("ALTER TABLE workflow_runs ADD COLUMN mode_state TEXT", [])?;
+            }
+            if missing_step_owner {
+                self.conn
+                    .execute("ALTER TABLE workflow_run_steps ADD COLUMN owner TEXT", [])?;
+            }
+
+            // Old runs were global. Attach them to the selected/latest
+            // conversation, creating one when the old database had only runs.
+            self.conn.execute(
+                "INSERT INTO conversations (created_at)
+                 SELECT CURRENT_TIMESTAMP
+                 WHERE NOT EXISTS (SELECT 1 FROM conversations)
+                   AND EXISTS (SELECT 1 FROM workflow_runs)",
+                [],
+            )?;
+            self.conn.execute_batch(
+                r#"
+                DROP TABLE IF EXISTS temp.asterline_v9_run_ids;
+                CREATE TEMP TABLE asterline_v9_run_ids AS
+                SELECT id AS old_id,
+                       id + (SELECT COALESCE(MAX(id), 0) FROM runs) AS new_id
+                  FROM workflow_runs;
+
+                INSERT INTO runs (
+                    id, conversation_id, goal, status, coordinator,
+                    verification_command, verification_ok,
+                    verification_summary, created_at, updated_at, attempt,
+                    mode, mode_state
+                )
+                SELECT ids.new_id,
+                       COALESCE(
+                           (SELECT c.id
+                              FROM runtime_state s
+                              JOIN conversations c
+                                ON c.id = CAST(s.value AS INTEGER)
+                             WHERE s.key = 'active_conversation'),
+                           (SELECT id FROM conversations ORDER BY id DESC LIMIT 1),
+                           0
+                       ),
+                       old.goal,
+                       old.status,
+                       old.coordinator,
+                       old.verification_command,
+                       old.verification_ok,
+                       old.verification_summary,
+                       old.created_at,
+                       old.updated_at,
+                       old.attempt,
+                       CASE old.mode
+                           WHEN 'lead' THEN 'plan'
+                           WHEN 'roundtable' THEN 'brainstorm'
+                           ELSE old.mode
+                       END,
+                       old.mode_state
+                  FROM workflow_runs old
+                  JOIN asterline_v9_run_ids ids ON ids.old_id = old.id;
+                "#,
+            )?;
+            if has_events {
+                self.conn.execute(
+                    "INSERT INTO run_events (
+                        run_id, attempt, kind, title, detail, created_at
+                     )
+                     SELECT ids.new_id, old.attempt, old.kind, old.title,
+                            old.detail, old.created_at
+                       FROM workflow_run_events old
+                       JOIN asterline_v9_run_ids ids
+                         ON ids.old_id = old.run_id
+                      ORDER BY old.id",
+                    [],
+                )?;
+            }
+            if has_steps {
+                self.conn.execute(
+                    "INSERT INTO run_steps (
+                        run_id, position, status, owner, title, note,
+                        created_at, updated_at
+                     )
+                     SELECT ids.new_id, old.position, old.status, old.owner,
+                            old.title, old.note, old.created_at, old.updated_at
+                       FROM workflow_run_steps old
+                       JOIN asterline_v9_run_ids ids
+                         ON ids.old_id = old.run_id
+                      ORDER BY old.id",
+                    [],
+                )?;
+            }
+            self.conn.execute_batch(
+                r#"
+                DROP TABLE IF EXISTS workflow_run_events;
+                DROP TABLE IF EXISTS workflow_run_steps;
+                DROP TABLE workflow_runs;
+                DROP TABLE temp.asterline_v9_run_ids;
+                "#,
+            )?;
+            Ok(())
+        })
     }
 
     // --- roster snapshot -------------------------------------------------

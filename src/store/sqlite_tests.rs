@@ -6,6 +6,214 @@ fn store() -> SqliteStore {
 }
 
 #[test]
+fn new_store_records_the_sqlite_schema_version() {
+    let store = store();
+    let format: i64 = store
+        .conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(format, SQLITE_SCHEMA_VERSION);
+}
+
+#[cfg(unix)]
+#[test]
+fn store_rejects_symbolic_link_without_modifying_target() {
+    use std::os::unix::fs::symlink;
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "asterline-sqlite-symlink-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let target = directory.join("target.sqlite3");
+    let link = directory.join("asterline.sqlite3");
+    let original = b"not an Asterline database";
+    std::fs::write(&target, original).unwrap();
+    symlink(&target, &link).unwrap();
+
+    assert!(SqliteStore::open(&link).is_err());
+    assert_eq!(std::fs::read(&target).unwrap(), original);
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+#[test]
+fn legacy_store_is_migrated_and_preserves_data() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "asterline-legacy-format-{}-{unique}.sqlite3",
+        std::process::id()
+    ));
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+             );
+             INSERT INTO conversations DEFAULT VALUES;",
+        )
+        .unwrap();
+    }
+
+    let store = SqliteStore::open(&path).unwrap();
+    let format: i64 = store
+        .conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    let conversations: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(format, SQLITE_SCHEMA_VERSION);
+    assert_eq!(conversations, 1);
+    drop(store);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+}
+
+#[test]
+fn newer_sqlite_schema_is_rejected_without_schema_writes() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "asterline-future-format-{}-{unique}.sqlite3",
+        std::process::id()
+    ));
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION + 1)
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE future_sentinel (value TEXT NOT NULL);
+             INSERT INTO future_sentinel VALUES ('untouched');",
+        )
+        .unwrap();
+    }
+
+    let error = SqliteStore::open(&path).expect_err("future project state must not be opened");
+    assert!(error.to_string().contains("newer than supported"));
+    let conn = Connection::open(&path).unwrap();
+    let value: String = conn
+        .query_row("SELECT value FROM future_sentinel", [], |row| row.get(0))
+        .unwrap();
+    let runtime_state_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='runtime_state'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(value, "untouched");
+    assert_eq!(runtime_state_exists, 0);
+    drop(conn);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn sqlite_v9_fixture_migrates_workflows_without_losing_new_runs() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "asterline-sqlite-v9-{}-{unique}.sqlite3",
+        std::process::id()
+    ));
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(include_str!("fixtures/sqlite_v9.sql"))
+            .unwrap();
+    }
+
+    let store = SqliteStore::open(&path).unwrap();
+    let version: i64 = store
+        .conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, SQLITE_SCHEMA_VERSION);
+
+    let runs: Vec<(i64, i64, String, String, Option<String>)> = store
+        .conn
+        .prepare(
+            "SELECT id, conversation_id, goal, status, mode
+             FROM runs ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].2, "new run retained");
+    assert_eq!(runs[1].1, 1);
+    assert_eq!(runs[1].2, "legacy run retained");
+    assert_eq!(runs[1].3, "blocked");
+    assert_eq!(runs[1].4.as_deref(), Some("plan"));
+    let migrated_id = runs[1].0;
+
+    let event: (i64, String, String) = store
+        .conn
+        .query_row(
+            "SELECT run_id, title, detail FROM run_events WHERE title = 'Legacy event'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        event,
+        (migrated_id, "Legacy event".into(), "waiting".into())
+    );
+    let step: (i64, String, Option<String>) = store
+        .conn
+        .query_row(
+            "SELECT run_id, title, owner FROM run_steps WHERE title = 'Legacy step'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        step,
+        (migrated_id, "Legacy step".into(), Some("builder".into()))
+    );
+
+    let approval: (i64, String) = store
+        .conn
+        .query_row(
+            "SELECT conversation_id, decision FROM approvals WHERE id = 3",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(approval, (1, "rejected".into()));
+    for table in ["workflow_runs", "workflow_run_events", "workflow_run_steps"] {
+        assert!(!store.table_exists(table).unwrap());
+    }
+
+    drop(store);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+}
+
+#[test]
 fn existing_run_table_is_migrated_for_conversation_scoping() {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(

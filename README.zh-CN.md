@@ -3,14 +3,18 @@
 [English](README.md) · [简体中文](README.zh-CN.md)
 
 [![CI](https://github.com/song0705/Asterline/actions/workflows/ci.yml/badge.svg)](https://github.com/song0705/Asterline/actions/workflows/ci.yml)
-[![最新版本](https://img.shields.io/github/v/release/song0705/Asterline)](https://github.com/song0705/Asterline/releases/latest)
+[![最新 CLI 版本](https://img.shields.io/github/v/tag/song0705/Asterline?filter=v%2A&label=CLI)](https://github.com/song0705/Asterline/releases)
 [![许可证：MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **在一个终端里，运行一支看得见、能恢复的编程 Agent 团队。**
 
 Asterline 统一调度电脑上已经安装的 Codex、Claude、Grok 和 Agy 官方 CLI。它将各后端的原生事件汇入同一工作台，在成员之间路由任务，并把多步骤协作记录为结构化 Runs。
 
-[安装](#安装) · [开始使用](#开始使用) · [文档](#文档) · [版本发布](https://github.com/song0705/Asterline/releases/latest)
+[安装](#安装) · [开始使用](#开始使用) · [文档](#文档) · [版本发布](https://github.com/song0705/Asterline/releases)
+
+希望使用图形化工作台？**Asterline Desktop V1** 在复用同一本地运行时的基础上，
+提供项目历史、聊天、Runs、审批、模式、验证和完整团队设置。参阅
+[Desktop 指南](docs/desktop.zh-CN.md)。
 
 ![Codex 将前端设计方案发送给 Agy](docs/assets/asterline-codex-to-agy.webp)
 

@@ -57,10 +57,19 @@ pub fn snapshot(session_id: Option<&str>, cwd: &str) -> ClaudeSnapshot {
 
 /// After the attach exits, return the messages added during it.
 pub fn imported_since(snapshot: ClaudeSnapshot) -> Vec<ImportedMessage> {
+    imported_since_with_session(snapshot).1
+}
+
+/// After the attach exits, return the active Claude session id together with
+/// the messages added during it. This preserves continuity when attach started
+/// a fresh or forked native session.
+pub fn imported_since_with_session(
+    snapshot: ClaudeSnapshot,
+) -> (Option<String>, Vec<ImportedMessage>) {
     let Some(root) = default_projects_root() else {
-        return Vec::new();
+        return (snapshot.session_id, Vec::new());
     };
-    imported_since_with_root(snapshot, &root)
+    imported_since_with_root_and_session(snapshot, &root)
 }
 
 /// The platform user profile's `.claude/projects` directory (may not exist).
@@ -95,7 +104,16 @@ fn snapshot_with_root(root: &Path, session_id: Option<&str>, cwd: &str) -> Claud
     }
 }
 
+#[cfg(test)]
 fn imported_since_with_root(snapshot: ClaudeSnapshot, root: &Path) -> Vec<ImportedMessage> {
+    imported_since_with_root_and_session(snapshot, root).1
+}
+
+fn imported_since_with_root_and_session(
+    snapshot: ClaudeSnapshot,
+    root: &Path,
+) -> (Option<String>, Vec<ImportedMessage>) {
+    let previous_session = snapshot.session_id.clone();
     let project = projects_dir_for(root, &snapshot.cwd);
     let candidates = candidate_files(&snapshot, &project);
     let threshold = snapshot
@@ -103,12 +121,13 @@ fn imported_since_with_root(snapshot: ClaudeSnapshot, root: &Path) -> Vec<Import
         .checked_sub(CLOCK_SKEW)
         .unwrap_or(SystemTime::UNIX_EPOCH);
 
-    let mut out: Vec<ImportedMessage> = Vec::new();
-    let mut last_text: Option<String> = None;
+    let mut imported_candidates: Vec<(bool, Option<String>, Vec<ImportedMessage>)> = Vec::new();
 
     for path in candidates {
         let is_original = snapshot.path.as_ref().is_some_and(|p| p == &path);
         let rows = parse_classified(&path);
+        let mut messages = Vec::new();
+        let mut last_text: Option<String> = None;
         for (index, row) in rows.into_iter().enumerate() {
             let qualifies = match row.timestamp {
                 Some(ts) => ts >= threshold,
@@ -121,10 +140,33 @@ fn imported_since_with_root(snapshot: ClaudeSnapshot, root: &Path) -> Vec<Import
                 continue;
             }
             last_text = Some(row.msg.text.clone());
-            out.push(row.msg);
+            messages.push(row.msg);
+        }
+        if !messages.is_empty() {
+            let session_id = path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string);
+            imported_candidates.push((is_original, session_id, messages));
         }
     }
-    out
+    if previous_session.is_some()
+        && let Some(index) = imported_candidates
+            .iter()
+            .position(|(is_original, _, _)| *is_original)
+    {
+        let (_, session_id, messages) = imported_candidates.swap_remove(index);
+        return (session_id.or(previous_session), messages);
+    }
+    if imported_candidates.len() == 1 {
+        let (_, session_id, messages) = imported_candidates.pop().expect("length checked");
+        return (session_id.or(previous_session), messages);
+    }
+    // Multiple newly-written sessions in one project directory are
+    // indistinguishable. Importing or binding any of them could leak another
+    // concurrent Claude conversation into this member, so fail closed.
+    (previous_session, Vec::new())
 }
 
 /// Candidate session files: the snapshot path (if present) plus every `.jsonl`
@@ -577,7 +619,8 @@ mod tests {
         content.push_str(&new2);
         std::fs::write(&path, content).unwrap();
 
-        let imported = imported_since_with_root(snap, &root);
+        let (session_id, imported) = imported_since_with_root_and_session(snap, &root);
+        assert_eq!(session_id.as_deref(), Some(sid));
         assert_eq!(
             imported,
             vec![
@@ -613,7 +656,8 @@ mod tests {
         let new2 = assistant_line("fork reply", "2099-06-01T12:00:01Z");
         write_session(&root, cwd, new_sid, &[&old1, &old2, &new1, &new2]);
 
-        let imported = imported_since_with_root(snap, &root);
+        let (session_id, imported) = imported_since_with_root_and_session(snap, &root);
+        assert_eq!(session_id.as_deref(), Some(new_sid));
         assert_eq!(
             imported,
             vec![

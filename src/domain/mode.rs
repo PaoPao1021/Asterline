@@ -124,6 +124,26 @@ impl ModesConfig {
     }
 }
 
+/// Validate only mode sections explicitly present in a team configuration.
+/// Unconfigured modes retain their runtime-derived defaults and therefore do
+/// not make a one-member normal-chat team invalid.
+pub fn validate_configured_modes(config: &TeamConfig) -> Result<(), String> {
+    if config.modes.review.is_some() {
+        resolve_mode_roles(config, CollabMode::Review)?;
+    }
+    if config.modes.plan.is_some() {
+        resolve_mode_roles(config, CollabMode::Plan)?;
+    }
+    if config.modes.brainstorm.is_some() {
+        resolve_mode_roles(config, CollabMode::Brainstorm)?;
+    }
+    if config.modes.team.is_some() {
+        resolve_team_coordinator(config)?;
+        resolve_team_limits(config)?;
+    }
+    Ok(())
+}
+
 /// Review-only role and iteration settings stored in `team.json`.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

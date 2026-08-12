@@ -2,9 +2,11 @@
 //!
 //! Portable copies never rewrite themselves. An Inno Setup installation is
 //! identified by a marker next to the executable. At most once per day, the
-//! installed app checks the latest stable GitHub Release, verifies the setup
-//! executable against that release's SHA256SUMS, and starts the installer with
-//! a request to wait for this Asterline process to exit before replacing files.
+//! installed app checks the latest stable CLI GitHub Release, verifies the
+//! setup executable against that release's SHA256SUMS, and starts the installer
+//! with a request to wait for this Asterline process to exit before replacing
+//! files. Desktop releases use a separate `desktop-v*` tag series and are
+//! deliberately ignored here.
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -20,16 +22,20 @@ use sha2::{Digest, Sha256};
 
 use crate::domain::event::RuntimeEvent;
 
-const RELEASE_API: &str = "https://api.github.com/repos/song0705/Asterline/releases/latest";
+const RELEASE_API: &str = "https://api.github.com/repos/song0705/Asterline/releases?per_page=100";
 const INSTALL_MARKER: &str = ".asterline-installer-managed";
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const STALE_LOCK_AGE: Duration = Duration::from_secs(10 * 60);
 const MAX_INSTALLER_BYTES: u64 = 128 * 1024 * 1024;
-const MAX_METADATA_BYTES: u64 = 1024 * 1024;
+const MAX_METADATA_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 struct Release {
     tag_name: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
     assets: Vec<ReleaseAsset>,
 }
 
@@ -163,11 +169,11 @@ fn check_and_schedule(force: bool) -> Result<UpdateOutcome, String> {
     }
 
     let agent = update_agent();
-    let release: Release =
+    let releases: Vec<Release> =
         serde_json::from_str(&get_text(&agent, RELEASE_API, MAX_METADATA_BYTES)?)
             .map_err(|error| format!("invalid release metadata: {error}"))?;
-
-    let latest = parse_release_version(&release.tag_name)?;
+    let (release, latest) = latest_cli_release(releases)
+        .ok_or_else(|| "no stable Asterline CLI release was found".to_string())?;
     let current = Version::parse(env!("CARGO_PKG_VERSION"))
         .map_err(|error| format!("invalid installed version: {error}"))?;
     if latest <= current {
@@ -248,8 +254,21 @@ fn find_asset<'a>(release: &'a Release, name: &str) -> Result<&'a ReleaseAsset, 
 }
 
 fn parse_release_version(tag: &str) -> Result<Version, String> {
-    Version::parse(tag.strip_prefix('v').unwrap_or(tag))
-        .map_err(|error| format!("invalid release tag {tag}: {error}"))
+    let version = tag
+        .strip_prefix('v')
+        .ok_or_else(|| format!("invalid CLI release tag {tag}"))?;
+    Version::parse(version).map_err(|error| format!("invalid release tag {tag}: {error}"))
+}
+
+fn latest_cli_release(releases: Vec<Release>) -> Option<(Release, Version)> {
+    releases
+        .into_iter()
+        .filter(|release| !release.draft && !release.prerelease)
+        .filter_map(|release| {
+            let version = parse_release_version(&release.tag_name).ok()?;
+            Some((release, version))
+        })
+        .max_by(|left, right| left.1.cmp(&right.1))
 }
 
 fn installer_name(version: &Version) -> String {
@@ -431,6 +450,28 @@ mod tests {
             Version::new(1, 2, 3)
         );
         assert!(parse_release_version("release-1.2.3").is_err());
+        assert!(parse_release_version("desktop-v9.0.0").is_err());
+    }
+
+    #[test]
+    fn latest_cli_release_ignores_desktop_drafts_and_prereleases() {
+        let release = |tag: &str, draft: bool, prerelease: bool| Release {
+            tag_name: tag.to_string(),
+            draft,
+            prerelease,
+            assets: Vec::new(),
+        };
+        let releases = vec![
+            release("desktop-v8.0.0", false, false),
+            release("v3.0.0", true, false),
+            release("v2.5.0", false, true),
+            release("v2.4.0", false, false),
+            release("v1.9.0", false, false),
+        ];
+
+        let (selected, version) = latest_cli_release(releases).unwrap();
+        assert_eq!(selected.tag_name, "v2.4.0");
+        assert_eq!(version, Version::new(2, 4, 0));
     }
 
     #[test]

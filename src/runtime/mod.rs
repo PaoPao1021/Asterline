@@ -713,7 +713,7 @@ mod tests {
     use crate::adapter::FakeRunner;
     use crate::domain::event::MessageTarget;
     use crate::domain::event::RunStatus;
-    use crate::domain::team::{BackendKind, TeamMember};
+    use crate::domain::team::{BackendKind, DefaultTarget, TeamMember, TeamSettings};
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
@@ -901,6 +901,65 @@ mod tests {
         handle.send(UiCommand::Shutdown);
         let _ = join.join();
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn runtime_thread_replaces_full_team_settings_and_saves_protocol_free_config() {
+        let dir = std::env::temp_dir().join(format!(
+            "asterline-runtime-settings-{}-{}",
+            std::process::id(),
+            TEAM_SAVE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let save_path = dir.join("team.json");
+        let mut initial = single_codex_team();
+        initial.workspace = dir.clone();
+        let (evt_tx, evt_rx) = mpsc::channel();
+        let (handle, join) = spawn(
+            initial.clone(),
+            SqliteStore::in_memory().unwrap(),
+            HashMap::new(),
+            evt_tx,
+            false,
+            true,
+            Some(save_path.clone()),
+        );
+        let _ = evt_rx.recv_timeout(Duration::from_secs(2)).expect("ready");
+
+        let mut settings = TeamSettings::from_config(&initial);
+        settings.name = "desktop team".to_string();
+        settings.default_target = Some(DefaultTarget::All);
+        settings.max_auto_relays = 13;
+        settings.approvals.gate = Some(vec!["shell".to_string()]);
+        settings.members[0].system_prompt = Some("desktop prompt".to_string());
+        assert!(handle.send(UiCommand::ReplaceTeamSettings {
+            settings: Box::new(settings.clone()),
+        }));
+
+        let mut emitted = None;
+        while let Ok(event) = evt_rx.recv_timeout(Duration::from_secs(2)) {
+            if let RuntimeEvent::TeamSettingsUpdated { settings } = event {
+                emitted = Some(settings);
+                break;
+            }
+        }
+        assert_eq!(emitted, Some(settings.clone()));
+        let saved = std::fs::read_to_string(&save_path).unwrap();
+        let saved_config: TeamConfig = serde_json::from_str(&saved).unwrap();
+        assert_eq!(saved_config.name, "desktop team");
+        assert_eq!(saved_config.workspace, dir);
+        assert_eq!(saved_config.default_target, Some(DefaultTarget::All));
+        assert_eq!(saved_config.max_auto_relays, 13);
+        assert_eq!(saved_config.approvals.gate, Some(vec!["shell".to_string()]));
+        assert_eq!(
+            saved_config.members[0].system_prompt.as_deref(),
+            Some("desktop prompt")
+        );
+        assert!(!saved.contains("ASTERLINE_TEAM_PROTOCOL"));
+
+        handle.send(UiCommand::Shutdown);
+        join.join().unwrap();
+        std::fs::remove_dir_all(&saved_config.workspace).ok();
     }
 
     #[test]
@@ -1099,6 +1158,10 @@ mod tests {
 
     #[test]
     fn runtime_thread_runs_run_verification() {
+        let mut config = single_codex_team();
+        // `/tmp/ws` is a valid fixture path on Unix but not on Windows, and
+        // verification launches its shell with the team workspace as cwd.
+        config.workspace = std::env::temp_dir();
         let mut runners: Runners = HashMap::new();
         runners.insert(
             MemberId::new("builder"),
@@ -1106,7 +1169,7 @@ mod tests {
         );
         let (evt_tx, evt_rx) = mpsc::channel();
         let (handle, join) = spawn(
-            single_codex_team(),
+            config,
             SqliteStore::in_memory().unwrap(),
             runners,
             evt_tx,

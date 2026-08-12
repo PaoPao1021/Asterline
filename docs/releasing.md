@@ -106,3 +106,37 @@ accepting an update.
 
 Do not move or reuse a published version tag. Fix the issue, increment the
 version, and publish a new tag instead.
+
+## Desktop releases
+
+Asterline Desktop has an independent version line and release workflow. Keep
+these three versions identical:
+
+- `desktop/package.json`
+- `desktop/src-tauri/Cargo.toml`
+- `desktop/src-tauri/tauri.conf.json`
+
+Run the frontend and native quality gates documented in
+[`desktop.md`](desktop.md), commit the release, and wait for Desktop CI to pass.
+Then create an annotated `desktop-v<version>` tag. Do not use a CLI `v*` tag for
+Desktop:
+
+```bash
+version=$(node -p "require('./desktop/package.json').version")
+git tag -a "desktop-v$version" -m "Asterline Desktop $version"
+git push origin main "desktop-v$version"
+```
+
+`.github/workflows/desktop-release.yml` validates the version triplet, rebuilds
+and tests both the shared runtime and Desktop bridge, and publishes an
+independent GitHub Release. It produces a Windows x64 Inno Setup installer and
+portable ZIP, Intel and Apple-silicon macOS DMGs and portable app archives, and
+x64/ARM64 Linux AppImages. Checksums and GitHub artifact attestations are
+published with the release. The Windows installer embeds Microsoft's signed
+Evergreen WebView2 bootstrapper, installs the runtime when absent, and the
+release job launches the installed application before publishing it.
+
+macOS artifacts require the same certificate secrets as the CLI release plus
+the App Store Connect API-key secrets documented above. The Desktop release
+workflow fails closed when they are absent so an unsigned DMG cannot be
+published accidentally.
