@@ -53,7 +53,7 @@ export function Sidebar({
   return (
     <aside className={`sidebar ${open ? "is-open" : "is-closed"}`} aria-label={t("menu")}>
       <div className="brand-row">
-        <div className="brand-mark" aria-hidden="true"><span /><span /><span /></div>
+        <img className="brand-mark" src="/asterline-mark.svg" alt="" />
         <div className="brand-copy">
           <strong>{t("appName")}</strong>
           <small>{t("desktop")}</small>
