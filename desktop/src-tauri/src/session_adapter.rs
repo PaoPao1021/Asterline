@@ -15,12 +15,12 @@ use asterline::domain::event::{
     RunStepStatus, RuntimeEvent, UiCommand,
 };
 use asterline::domain::mode::{CollabMode, TerminalMode};
-use asterline::domain::team::{Effort, MemberId, TeamSettings};
+use asterline::domain::team::{MemberId, TeamSettings};
 use asterline::domain::{resolve_mode_roles, resolve_team_coordinator, resolve_team_limits};
 use asterline::runtime::RuntimeHandle;
 
 use crate::bridge::{
-    ApprovalChoiceV1, DesktopCommandV1, EffortV1, MessageTargetV1, RunStepStatusV1, TeamSettingsV1,
+    ApprovalChoiceV1, DesktopCommandV1, MessageTargetV1, RunStepStatusV1, TeamSettingsV1,
     TerminalModeV1, team_settings_from_domain, team_settings_to_domain,
 };
 
@@ -107,42 +107,34 @@ impl ActiveSession {
         }
     }
 
-    pub fn import_transcript(
-        &self,
-        member: String,
-        items: Vec<(bool, String)>,
-    ) -> Result<(), String> {
-        let items = items
-            .into_iter()
-            .map(|(from_user, text)| ImportedMessage { from_user, text })
-            .collect();
-        self.send(UiCommand::ImportTranscript {
+    pub fn request_attach(&self, member: &str) -> Result<(), String> {
+        self.send(UiCommand::RequestAttach {
             member: MemberId::new(member),
-            items,
         })
     }
 
-    /// Bind a session discovered by the native attach helper before importing
-    /// its transcript. Both runtime commands share one ordered sender, so the
-    /// next Asterline turn resumes the attached backend conversation.
+    /// Atomically finish the runtime's attach reservation, bind any proven
+    /// native session identity, and import the bounded transcript delta.
     pub fn finish_attach(
         &self,
         member: &str,
         session: Option<String>,
         items: Vec<(bool, String)>,
     ) -> Result<(), String> {
-        if let Some(session) = session {
+        let session = if let Some(session) = session {
             validate_session_id(&session)?;
-            self.send(UiCommand::BindAttachedSession {
-                member: MemberId::new(member),
-                session: AgentSessionId(session),
-            })?;
-        }
-        if items.is_empty() {
-            Ok(())
+            Some(AgentSessionId(session))
         } else {
-            self.import_transcript(member.to_string(), items)
-        }
+            None
+        };
+        let items = items
+            .into_iter()
+            .map(|(from_user, text)| ImportedMessage { from_user, text })
+            .collect();
+        self.handle
+            .finish_attach_with_session(MemberId::new(member), session, items)
+            .then_some(())
+            .ok_or_else(|| "Asterline runtime is no longer available".to_string())
     }
 
     fn stop_and_join(&mut self) {
@@ -231,10 +223,9 @@ pub fn command_to_runtime(
         DesktopCommandV1::ResolvePausedRoute { resume } => {
             Ok(UiCommand::ResolvePausedRoute { resume })
         }
-        DesktopCommandV1::SetEffort { member, effort } => Ok(UiCommand::SetEffort {
-            member: MemberId::new(member),
-            effort: effort_value(effort),
-        }),
+        DesktopCommandV1::SetEffort { .. } => {
+            Err("effort changes must be normalized through team settings".to_string())
+        }
         DesktopCommandV1::ReplaceTeamSettings { settings } => {
             ensure_workspace_matches(&settings, workspace).map_err(|error| error.to_string())?;
             let settings: TeamSettings = team_settings_to_domain(&settings)?;
@@ -369,17 +360,6 @@ fn collab_mode(mode: TerminalModeV1) -> Option<CollabMode> {
         TerminalModeV1::Plan => Some(CollabMode::Plan),
         TerminalModeV1::Brainstorm => Some(CollabMode::Brainstorm),
         TerminalModeV1::Team => Some(CollabMode::Team),
-    }
-}
-
-fn effort_value(effort: EffortV1) -> Effort {
-    match effort {
-        EffortV1::Low => Effort::Low,
-        EffortV1::Medium => Effort::Medium,
-        EffortV1::High => Effort::High,
-        EffortV1::Xhigh => Effort::Xhigh,
-        EffortV1::Max => Effort::Max,
-        EffortV1::Ultra => Effort::Ultra,
     }
 }
 

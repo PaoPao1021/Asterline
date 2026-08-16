@@ -29,13 +29,16 @@ Asterline 统一调度电脑上已经安装的 Codex、Claude、Grok 和 Agy 官
 
 Asterline 支持 macOS、Linux 和 Windows 10/11。使用前，至少需要安装并登录一个受支持的 CLI。
 
-| 平台    | 推荐安装方式                                                                         |
-| ------- | ------------------------------------------------------------------------------------ |
-| macOS   | 下载 `asterline-<version>-macos-universal.dmg`，打开后运行 `Install Asterline.pkg`。 |
-| Windows | 下载并运行 `asterline-<version>-x86_64-windows-setup.exe`。                          |
-| Linux   | 下载 `x86_64-unknown-linux-gnu` 或 `aarch64-unknown-linux-gnu` 对应的压缩包。        |
+- **macOS：**下载 `asterline-<version>-macos-universal.dmg`，打开后运行
+  `Install Asterline.pkg`。
+- **Windows：**下载并运行 `asterline-<version>-x86_64-windows-setup.exe`。
+- **Linux：**按 CPU 架构选择 `asterline-v<version>-Linux-x86_64` 或
+  `asterline-v<version>-Linux-arm64` 的 `.tar.gz`、`.deb` 或 `.rpm`。
+- **Homebrew（macOS 和 Linux）：**`brew install song0705/asterline/asterline`。
 
-安装器会同时提供完整命令 `asterline` 和短命令 `ast`。便携安装、源码构建、版本校验、自动更新、卸载与故障排查请参阅[安装指南](docs/installation.zh-CN.md)。
+Linux 发布包要求 GNU/glibc 2.28 或更高版本，并内置 SQLite；目前不提供 Alpine/musl 发布目标。
+
+安装器会同时提供完整命令 `asterline` 和短命令 `ast`。Homebrew、便携安装、源码构建、版本校验、自动更新、卸载与故障排查请参阅[安装指南](docs/installation.zh-CN.md)。
 
 ## 开始使用
 
@@ -67,16 +70,16 @@ ast
 
 ### 基于原生 CLI 的实时团队
 
-同一团队可以混用多个提供商，也可以多次使用同一后端。每个成员都可以独立设置职责、模型、推理强度、工作目录、系统提示、沙箱、权限模式、工具白名单与会话策略。
+同一团队可以混用多个提供商，也可以多次使用同一后端。每个成员都可以独立设置职责、模型、受后端支持的推理设置、工作目录、系统提示、沙箱、权限模式、工具白名单与会话策略。
 
 ![Asterline Team 编辑器](docs/assets/asterline-team.webp)
 
-| 后端   | 接入方式               | 会话恢复 | 模型发现                       |
-| ------ | ---------------------- | -------- | ------------------------------ |
-| Codex  | `codex exec --json`    | 支持     | `codex debug models`           |
-| Claude | 流式 JSON              | 支持     | CLI 设置与模型别名             |
-| Grok   | `grok agent stdio` ACP | 支持     | `grok --no-auto-update models` |
-| Agy    | `stream-json` 事件     | 支持     | `agy models`                   |
+| 后端   | 接入方式                                | 会话恢复 | 模型发现                                  |
+| ------ | --------------------------------------- | -------- | ----------------------------------------- |
+| Codex  | 持久 App Server（默认）；可选旧版 exec  | 支持     | App Server `model/list`（旧命令作回退）   |
+| Claude | 流式 JSON                               | 支持     | CLI 设置与模型别名                        |
+| Grok   | `grok agent stdio` ACP                  | 支持     | `grok --no-auto-update models`            |
+| Agy    | `stream-json` 事件                      | 支持     | `agy models`                              |
 
 Asterline 不代替各提供商的认证、计费、模型授权或用量限制。
 
@@ -103,7 +106,8 @@ Runs 会保存当前阶段、清单负责人、尝试次数、阻塞原因、备
 
 ### 保存在本地、可以恢复的历史记录
 
-`/new` 创建干净的新对话；`/resume` 恢复已保存的聊天、团队、后端会话、模式与 Runs。项目状态默认保存在：
+重新打开 Asterline 默认复用上一次对话。`/new` 与 `/clear` 等价，都会创建干净的新对话；`/resume`
+恢复已保存的聊天、团队、后端会话、模式与 Runs。项目状态默认保存在：
 
 ```text
 <workspace>/.asterline/
@@ -130,19 +134,20 @@ Asterline 为高风险请求、Agent 间转发、工作流派发和 Agent 发起
 | `/team`                | 编辑当前团队             |
 | `/resume`              | 恢复已保存的对话         |
 | `/approve` / `/reject` | 处理待审批请求           |
-| `/abort`               | 取消正在运行的工作与验证 |
 | `/help`                | 打开命令面板             |
 
-[完整命令与键盘参考](docs/commands.zh-CN.md)还包含原生会话接入、导航、Run 步骤、Skills、日志、搜索和 diff。
+[完整命令与键盘参考](docs/commands.zh-CN.md)还包含原生会话接入、导航、Run 步骤、定向 Skill 调用、日志、搜索和 diff。
 
 ## 文档
 
 - [安装与更新](docs/installation.zh-CN.md)
 - [命令与键盘参考](docs/commands.zh-CN.md)
-- [配置与本地数据](docs/configuration.md)
-- [审批与工具控制](docs/approvals.md)
-- [版本发布说明](docs/releases/v0.2.3.md)
-- [维护者发布流程](docs/releasing.md)
+- [配置与本地数据](docs/configuration.zh-CN.md)
+- [审批与工具控制](docs/approvals.zh-CN.md)
+- [真实后端冒烟测试](docs/real-smoke.zh-CN.md)
+- [版本发布说明](docs/releases/v0.2.9.md)
+- [维护者发布流程](docs/releasing.zh-CN.md)
+- [第三方包定义](packaging/README.zh-CN.md)
 
 程序内可通过 `/help` 和 `asterline --help` 查看帮助。
 
@@ -160,9 +165,10 @@ cargo run -- --fake
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked --no-fail-fast
+cargo audit
 ```
 
-源码构建需要 Rust 1.85 或更高版本。真实后端 smoke 测试需要显式启用。可复现的问题和范围明确的建议请提交到 [GitHub Issues](https://github.com/song0705/Asterline/issues)。
+完整质量检查需要 Rust 1.88 或更高版本以及 `cargo-audit` 0.22.2。真实后端 smoke 测试需要显式启用，受控的本地与 Actions 入口见[说明文档](docs/real-smoke.md)。可复现的问题和范围明确的建议请提交到 [GitHub Issues](https://github.com/song0705/Asterline/issues)。
 
 ## 项目状态
 

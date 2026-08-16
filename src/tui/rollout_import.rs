@@ -14,6 +14,7 @@ use std::time::SystemTime;
 use serde_json::Value;
 
 use crate::domain::{config, event::ImportedMessage};
+use crate::tui::attach::AttachOutcome;
 use crate::tui::import_io;
 
 const MAX_ROLLOUT_FILES: usize = 10_000;
@@ -24,8 +25,6 @@ const MAX_ROLLOUT_SCAN_ENTRIES: usize = 50_000;
 pub struct RolloutSnapshot {
     /// The Codex session id being attached, if Asterline knows it.
     session_id: Option<String>,
-    /// Workspace cwd for fresh Codex sessions where no session id exists yet.
-    cwd: Option<String>,
     /// The rollout file identified for this session (if found up front).
     path: Option<PathBuf>,
     /// Number of `message` items already present in `path` before the attach.
@@ -35,12 +34,13 @@ pub struct RolloutSnapshot {
 }
 
 /// Snapshot the codex rollout for `session_id` (if any) before attaching.
-pub fn snapshot(session_id: Option<&str>, cwd: &str) -> RolloutSnapshot {
-    let path = session_id.and_then(find_rollout);
+pub fn snapshot(session_id: Option<&str>, _cwd: &str) -> RolloutSnapshot {
+    // A fresh attach is fail-closed and does not inspect nearby rollouts, so
+    // avoid walking the entire Codex history until there is a bound id to diff.
+    let path = session_id.and_then(|id| newest_rollout_for_session(&all_rollouts(), id));
     let before = path.as_deref().map(count_messages).unwrap_or(0);
     RolloutSnapshot {
         session_id: session_id.map(str::to_string),
-        cwd: (!cwd.trim().is_empty()).then(|| cwd.to_string()),
         path,
         before,
         started: SystemTime::now(),
@@ -49,7 +49,7 @@ pub fn snapshot(session_id: Option<&str>, cwd: &str) -> RolloutSnapshot {
 
 /// After the attach exits, return the messages added during it (codex only).
 pub fn imported_since(snapshot: RolloutSnapshot) -> Vec<ImportedMessage> {
-    imported_since_with_session(snapshot).1
+    imported_attach_since(snapshot).items
 }
 
 /// After the attach exits, return the active Codex session id together with
@@ -58,43 +58,60 @@ pub fn imported_since(snapshot: RolloutSnapshot) -> Vec<ImportedMessage> {
 pub fn imported_since_with_session(
     snapshot: RolloutSnapshot,
 ) -> (Option<String>, Vec<ImportedMessage>) {
-    import_from_rollouts_with_session(snapshot, all_rollouts())
+    let outcome = imported_attach_since(snapshot);
+    (outcome.session.map(|session| session.0), outcome.items)
 }
 
-#[cfg(test)]
-fn import_from_rollouts(snapshot: RolloutSnapshot, rollouts: Vec<PathBuf>) -> Vec<ImportedMessage> {
-    import_from_rollouts_with_session(snapshot, rollouts).1
+/// Return messages from the already-bound native session. A fresh native
+/// session is deliberately not guessed from nearby rollout files: another
+/// concurrent CLI in the same workspace cannot be distinguished reliably.
+pub(crate) fn imported_attach_since(snapshot: RolloutSnapshot) -> AttachOutcome {
+    import_from_rollouts(snapshot, all_rollouts())
 }
 
-fn import_from_rollouts_with_session(
-    snapshot: RolloutSnapshot,
-    rollouts: Vec<PathBuf>,
-) -> (Option<String>, Vec<ImportedMessage>) {
+fn import_from_rollouts(snapshot: RolloutSnapshot, rollouts: Vec<PathBuf>) -> AttachOutcome {
     // When resuming a known Codex session, only consider rollout files whose
     // names contain that session id. Otherwise a concurrent Codex session can
     // become the newest rollout and be imported into the wrong Asterline member.
-    let previous_session = snapshot.session_id.clone();
-    let target = match snapshot.session_id.as_deref() {
-        Some(session_id) => {
-            newest_rollout_for_session_since(&rollouts, session_id, snapshot.started)
-                .or(snapshot.path)
-        }
-        None => snapshot.cwd.as_deref().and_then(|cwd| {
-            let mut matches = rollouts_for_cwd_since(&rollouts, cwd, snapshot.started);
-            (matches.len() == 1).then(|| matches.pop()).flatten()
-        }),
+    let Some(session_id) = snapshot.session_id.as_deref() else {
+        return AttachOutcome {
+            notice: Some(
+                "the fresh Codex session is not yet bound to this member, so its transcript was not imported; select its session ID in /team before the next attach"
+                    .to_string(),
+            ),
+            ..AttachOutcome::default()
+        };
     };
+    let target =
+        newest_rollout_for_session_since(&rollouts, session_id, snapshot.started).or(snapshot.path);
+    let fallback_session = import_io::safe_session_id(session_id);
     let Some(path) = target else {
-        return (previous_session, Vec::new());
+        return AttachOutcome::default();
     };
-    let session_id = rollout_session_id(&path).or(previous_session);
-    let messages = parse_messages(&path);
-    let imported = messages
-        .into_iter()
-        .skip(snapshot.before)
-        .filter_map(to_imported)
-        .collect();
-    (session_id, imported)
+    let mut imported = Vec::new();
+    let mut retained_bytes = 0_usize;
+    let mut message_index = 0_usize;
+    import_io::for_each_json_value(&path, |value| {
+        let Some(message) = parse_rollout_message(&value) else {
+            return true;
+        };
+        let index = message_index;
+        message_index = message_index.saturating_add(1);
+        if index < snapshot.before {
+            return true;
+        }
+        let Some(message) = to_imported(message) else {
+            return true;
+        };
+        import_io::push_imported_bounded(&mut imported, &mut retained_bytes, message)
+    });
+    AttachOutcome {
+        items: imported,
+        // The session was selected before attach, so preserve that established
+        // identity instead of trusting uncorrelated transcript metadata.
+        session: fallback_session,
+        notice: None,
+    }
 }
 
 /// `$CODEX_HOME/sessions`, or the platform user profile's `.codex/sessions`.
@@ -134,11 +151,15 @@ fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>, entries_remaining: &mut usi
         }
         *entries_remaining -= 1;
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
             collect_jsonl(&path, out, entries_remaining, depth + 1);
-        } else if path
-            .extension()
-            .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("jsonl"))
+        } else if file_type.is_file()
+            && path
+                .extension()
+                .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("jsonl"))
             && path
                 .file_name()
                 .is_some_and(|n| n.to_string_lossy().starts_with("rollout-"))
@@ -146,10 +167,6 @@ fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>, entries_remaining: &mut usi
             out.push(path);
         }
     }
-}
-
-fn find_rollout(session_id: &str) -> Option<PathBuf> {
-    newest_rollout_for_session(&all_rollouts(), session_id)
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
@@ -180,66 +197,12 @@ fn newest_rollout_for_session_since(
 }
 
 fn rollout_matches_session(path: &Path, session_id: &str) -> bool {
+    if session_id.is_empty() || session_id.contains(['/', '\\']) {
+        return false;
+    }
+    let suffix = format!("-{session_id}.jsonl");
     path.file_name()
-        .is_some_and(|n| n.to_string_lossy().contains(session_id))
-}
-
-fn rollouts_for_cwd_since(rollouts: &[PathBuf], cwd: &str, since: SystemTime) -> Vec<PathBuf> {
-    let mut matches: Vec<(SystemTime, PathBuf)> = rollouts
-        .iter()
-        .filter(|p| {
-            rollout_cwd(p)
-                .is_some_and(|actual| config::paths_equivalent(Path::new(&actual), Path::new(cwd)))
-        })
-        .filter_map(|p| modified(p).map(|m| (m, p.clone())))
-        .filter(|(m, _)| *m >= since)
-        .collect();
-    matches.sort_by_key(|(modified, _)| *modified);
-    matches.into_iter().map(|(_, path)| path).collect()
-}
-
-fn rollout_cwd(path: &Path) -> Option<String> {
-    let mut found = None;
-    import_io::for_each_json_value(path, |value| {
-        let event_type = value.get("type").and_then(Value::as_str);
-        if event_type != Some("session_meta") && event_type != Some("turn_context") {
-            return true;
-        }
-        if let Some(cwd) = value
-            .get("payload")
-            .and_then(|payload| payload.get("cwd"))
-            .and_then(Value::as_str)
-        {
-            found = Some(cwd.to_string());
-            return false;
-        }
-        true
-    });
-    found
-}
-
-fn rollout_session_id(path: &Path) -> Option<String> {
-    let mut found = None;
-    import_io::for_each_json_value(path, |value| {
-        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
-            return true;
-        }
-        let payload = match value.get("payload") {
-            Some(payload) => payload,
-            None => return true,
-        };
-        if let Some(session_id) = payload
-            .get("session_id")
-            .or_else(|| payload.get("id"))
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-        {
-            found = Some(session_id.to_string());
-            return false;
-        }
-        true
-    });
-    found
+        .is_some_and(|name| name.to_string_lossy().ends_with(&suffix))
 }
 
 /// One parsed `message` response item from the rollout.
@@ -249,40 +212,53 @@ struct RolloutMessage {
 }
 
 fn count_messages(path: &Path) -> usize {
-    parse_messages(path).len()
+    let mut count = 0_usize;
+    import_io::for_each_json_value(path, |value| {
+        if parse_rollout_message(&value).is_some() {
+            count = count.saturating_add(1);
+        }
+        true
+    });
+    count
 }
 
+#[cfg(test)]
 fn parse_messages(path: &Path) -> Vec<RolloutMessage> {
     let mut out = Vec::new();
     import_io::for_each_json_value(path, |value| {
-        if value.get("type").and_then(Value::as_str) != Some("response_item") {
-            return true;
+        if let Some(message) = parse_rollout_message(&value) {
+            out.push(message);
         }
-        let payload = match value.get("payload") {
-            Some(p) => p,
-            None => return true,
-        };
-        if payload.get("type").and_then(Value::as_str) != Some("message") {
-            return true;
-        }
-        let role = payload
-            .get("role")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let text = payload
-            .get("content")
-            .and_then(Value::as_array)
-            .map(|items| join_text(items))
-            .unwrap_or_default();
-        out.push(RolloutMessage { role, text });
         true
     });
     out
 }
 
-/// Join the text of a message's content parts, dropping codex's injected
-/// context blocks (environment, AGENTS.md, user-instructions wrappers).
+fn parse_rollout_message(value: &Value) -> Option<RolloutMessage> {
+    if value.get("type").and_then(Value::as_str) != Some("response_item") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("message") {
+        return None;
+    }
+    let role = payload
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let text = payload
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|items| join_text(items))
+        .unwrap_or_default();
+    Some(RolloutMessage { role, text })
+}
+
+/// Join the text of a message's content parts, dropping Codex's injected
+/// context blocks (environment, plugin inventory, AGENTS.md, and
+/// user-instructions wrappers). These are encoded as `user` messages in a
+/// rollout but are not user-authored chat content.
 fn join_text(items: &[Value]) -> String {
     let mut parts = Vec::new();
     for item in items {
@@ -300,6 +276,7 @@ fn join_text(items: &[Value]) -> String {
 fn is_injected_context(text: &str) -> bool {
     let t = text.trim_start();
     t.starts_with("<environment_context>")
+        || t.starts_with("<recommended_plugins>")
         || t.starts_with("<user_instructions>")
         || t.starts_with("# AGENTS.md")
         || t.starts_with("<INSTRUCTIONS>")
@@ -344,11 +321,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ast-rollout-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rollout-x-abc.jsonl");
-        // session_meta, an injected user context, a real user msg, an assistant
-        // reply, a developer message (skipped), and a reasoning item (skipped).
+        // session_meta, injected user context/plugin inventory, a real user
+        // message, an assistant reply, a developer message (skipped), and a
+        // reasoning item (skipped).
         let lines = [
             r#"{"type":"session_meta","payload":{"id":"abc"}}"#,
             r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n cwd </environment_context>"}]}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<recommended_plugins>\n plugin list </recommended_plugins>"}]}}"#,
             r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi there"}]}}"#,
             r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello back"}]}}"#,
             r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"sys"}]}}"#,
@@ -356,8 +335,8 @@ mod tests {
         ];
         std::fs::write(&path, lines.join("\n")).unwrap();
 
-        // 4 message items total (3 user/assistant/developer + 1 injected user).
-        assert_eq!(count_messages(&path), 4);
+        // 5 message items total (4 user/assistant/developer + 2 injected user).
+        assert_eq!(count_messages(&path), 5);
 
         // Import everything: injected context dropped, developer dropped.
         let imported: Vec<ImportedMessage> = parse_messages(&path)
@@ -425,10 +404,9 @@ mod tests {
         .unwrap();
         std::fs::write(&unrelated, message_line("user", "wrong session")).unwrap();
 
-        let (session_id, imported) = import_from_rollouts_with_session(
+        let imported = import_from_rollouts(
             RolloutSnapshot {
                 session_id: Some("session-abc".to_string()),
-                cwd: Some("/tmp/attached".to_string()),
                 path: Some(attached.clone()),
                 before: 1,
                 started: SystemTime::UNIX_EPOCH,
@@ -436,141 +414,78 @@ mod tests {
             vec![unrelated, attached],
         );
 
-        assert_eq!(session_id.as_deref(), Some("session-abc"));
         assert_eq!(
-            imported,
+            imported.items,
             vec![ImportedMessage {
                 from_user: true,
                 text: "typed while attached".to_string()
             }]
         );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn fresh_attach_imports_only_rollout_from_matching_cwd() {
-        let dir = std::env::temp_dir().join(format!("ast-rollout-cwd-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let attached = dir.join("rollout-2026-session-new.jsonl");
-        let unrelated = dir.join("rollout-2026-session-other-cwd.jsonl");
-
-        std::fs::write(
-            &attached,
-            [
-                session_meta_line("session-new", "/tmp/attached"),
-                message_line("user", "fresh attach message"),
-            ]
-            .join("\n"),
-        )
-        .unwrap();
-        std::fs::write(
-            &unrelated,
-            [
-                session_meta_line("session-other", "/tmp/other"),
-                message_line("user", "wrong cwd"),
-            ]
-            .join("\n"),
-        )
-        .unwrap();
-
-        let (session_id, imported) = import_from_rollouts_with_session(
-            RolloutSnapshot {
-                session_id: None,
-                cwd: Some("/tmp/attached".to_string()),
-                path: None,
-                before: 0,
-                started: SystemTime::UNIX_EPOCH,
-            },
-            vec![unrelated, attached],
-        );
-
-        assert_eq!(session_id.as_deref(), Some("session-new"));
         assert_eq!(
-            imported,
-            vec![ImportedMessage {
-                from_user: true,
-                text: "fresh attach message".to_string()
-            }]
+            imported.session.as_ref().map(|session| session.as_str()),
+            Some("session-abc")
         );
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn fresh_attach_with_multiple_matching_rollouts_fails_closed() {
-        let dir =
-            std::env::temp_dir().join(format!("ast-rollout-ambiguous-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let first = dir.join("rollout-first.jsonl");
-        let second = dir.join("rollout-second.jsonl");
-        for (path, session) in [(&first, "first"), (&second, "second")] {
-            std::fs::write(
-                path,
-                [
-                    session_meta_line(session, "/tmp/attached"),
-                    message_line("user", session),
-                ]
-                .join("\n"),
-            )
-            .unwrap();
-        }
-
-        let result = import_from_rollouts_with_session(
-            RolloutSnapshot {
-                session_id: None,
-                cwd: Some("/tmp/attached".to_string()),
-                path: None,
-                before: 0,
-                started: SystemTime::UNIX_EPOCH,
-            },
-            vec![first, second],
-        );
-        assert_eq!(result, (None, Vec::new()));
-        std::fs::remove_dir_all(dir).ok();
+    fn rollout_session_matching_is_exact_and_rejects_empty_ids() {
+        let path = Path::new("rollout-2026-session-abc.jsonl");
+        assert!(rollout_matches_session(path, "session-abc"));
+        assert!(!rollout_matches_session(path, "session"));
+        assert!(!rollout_matches_session(path, ""));
+        assert!(!rollout_matches_session(path, "../session-abc"));
     }
 
-    #[cfg(windows)]
     #[test]
-    fn fresh_attach_matches_windows_cwd_case_and_separators() {
-        let dir =
-            std::env::temp_dir().join(format!("ast-rollout-windows-cwd-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let attached = dir.join("rollout-2026-session-new.jsonl");
-        std::fs::write(
-            &attached,
-            [
-                session_meta_line("session-new", "c:/work/asterline"),
-                message_line("user", "windows attach message"),
-            ]
-            .join("\n"),
-        )
-        .unwrap();
-
+    fn fresh_attach_never_guesses_a_rollout_or_session() {
+        let path = PathBuf::from("rollout-2026-session-unrelated.jsonl");
         let imported = import_from_rollouts(
             RolloutSnapshot {
                 session_id: None,
-                cwd: Some(r"C:\Work\Asterline".to_string()),
                 path: None,
                 before: 0,
                 started: SystemTime::UNIX_EPOCH,
             },
-            vec![attached],
+            vec![path],
         );
 
-        assert_eq!(imported[0].text, "windows attach message");
+        assert!(imported.items.is_empty());
+        assert!(imported.session.is_none());
+        assert!(imported.notice.is_some());
+    }
+
+    #[test]
+    fn attached_codex_import_stops_at_aggregate_item_budget() {
+        let dir =
+            std::env::temp_dir().join(format!("ast-rollout-import-budget-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-2026-session-budget.jsonl");
+        let lines = (0..import_io::MAX_IMPORTED_ITEMS + 25)
+            .map(|index| message_line("user", &format!("message-{index}")))
+            .collect::<Vec<_>>();
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let imported = import_from_rollouts(
+            RolloutSnapshot {
+                session_id: Some("session-budget".to_string()),
+                path: Some(path.clone()),
+                before: 0,
+                started: SystemTime::UNIX_EPOCH,
+            },
+            vec![path],
+        );
+
+        assert_eq!(imported.items.len(), import_io::MAX_IMPORTED_ITEMS);
+        assert_eq!(imported.items.last().unwrap().text, "message-999");
         std::fs::remove_dir_all(dir).ok();
     }
 
     fn message_line(role: &str, text: &str) -> String {
         format!(
             r#"{{"type":"response_item","payload":{{"type":"message","role":"{role}","content":[{{"type":"input_text","text":"{text}"}}]}}}}"#
-        )
-    }
-
-    fn session_meta_line(session_id: &str, cwd: &str) -> String {
-        format!(
-            r#"{{"type":"session_meta","payload":{{"session_id":"{session_id}","cwd":"{cwd}"}}}}"#
         )
     }
 }

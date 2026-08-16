@@ -346,7 +346,7 @@ export function App() {
           <small>ORCHESTRATED INTELLIGENCE / LIVE SYSTEM</small>
         </div>
         <header className="topbar">
-          {!sidebarOpen && <button className="icon-button mobile-panel-button" onClick={toggleSidebar} aria-label={t("expand")}><PanelLeftIcon /></button>}
+          {!sidebarOpen && <button className="icon-button panel-restore-button" onClick={toggleSidebar} aria-label={t("expand")}><PanelLeftIcon /></button>}
           <div className="topbar-title"><span className="topbar-folder"><FolderIcon size={16} /></span><div><span className="topbar-kicker">LIVE WORKSPACE / 01</span><strong>{snapshot?.team?.name || snapshot?.workspace?.split(/[\\/]/).at(-1) || t("workspace")}</strong><small><i className={snapshot?.phase === "ready" ? "online" : ""} />{snapshot?.phase === "ready" ? t("connected") : t("starting")}</small></div></div>
           <div className="topbar-actions">
             {client.kind === "mock" && <span className="demo-pill">{t("demo")}</span>}
@@ -354,7 +354,7 @@ export function App() {
             <button className="icon-button" aria-label={t("theme")} title={t("theme")} onClick={() => setTheme((value) => value === "light" ? "dark" : "light")}>{theme === "light" ? <MoonIcon /> : <SunIcon />}</button>
             <button className={`icon-button ${updateBusy ? "is-spinning" : ""}`} aria-label={t("update")} title={t("update")} disabled={updateBusy} onClick={() => void checkUpdate()}><RefreshIcon /></button>
             <button className="icon-button" aria-label={t("settings")} title={t("settings")} onClick={() => setSettingsOpen(true)}><SettingsIcon /></button>
-            {!inspectorOpen && <button className="icon-button mobile-panel-button" onClick={toggleInspector} aria-label={t("details")}><PanelRightIcon /></button>}
+            {!inspectorOpen && <button className="icon-button panel-restore-button" onClick={toggleInspector} aria-label={t("details")}><PanelRightIcon /></button>}
           </div>
         </header>
 

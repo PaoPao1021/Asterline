@@ -249,8 +249,6 @@ pub enum UiCommand {
     SetRelayPaused(bool),
     /// Continue (`true`) or drop (`false`) the next paused relay.
     ResolvePausedRoute { resume: bool },
-    /// Set a member's reasoning effort.
-    SetEffort { member: MemberId, effort: Effort },
     /// Replace the editable team roster while the TUI is running.
     ReplaceTeam {
         members: Vec<TeamMember>,
@@ -275,12 +273,19 @@ pub enum UiCommand {
         member: MemberId,
         items: Vec<ImportedMessage>,
     },
-    /// Bind a session discovered by an external native attach. Unlike an
-    /// explicit `team.json` session id, this belongs only to the active chat
-    /// and is cleared by [`UiCommand::NewSession`].
-    BindAttachedSession {
+    /// Ask the runtime to reserve exclusive access to one member's native
+    /// interactive session. This travels through the ordered work queue so it
+    /// cannot overtake earlier user commands.
+    RequestAttach { member: MemberId },
+    /// Atomically import messages from the native interactive CLI and release
+    /// its attach reservation. This is control traffic so completion can be
+    /// processed while ordinary work consumption is paused.
+    AttachFinished {
         member: MemberId,
-        session: AgentSessionId,
+        /// A session identity recovered from the attached transcript, when it
+        /// can be proven without guessing among concurrent native sessions.
+        session: Option<AgentSessionId>,
+        items: Vec<ImportedMessage>,
     },
     /// Continue an existing run, usually after a blocker or failed
     /// verification. Without a run id, the runtime targets the latest run.
@@ -366,6 +371,13 @@ pub enum AgentEvent {
     },
     /// The backend session/thread id was discovered or updated.
     SessionDiscovered(AgentSessionId),
+    /// Codex App Server needs an explicit user decision before it can continue
+    /// the active turn. `request_id` is scoped to the currently live runner.
+    NativeApprovalRequested {
+        request_id: u64,
+        action: String,
+        body: String,
+    },
     /// A raw, unparsed stdout line from the backend (persisted to `stream_events`
     /// for later parser fixes; not shown in the chat).
     Raw(String),
@@ -420,6 +432,9 @@ pub struct LogEntry {
     pub message: String,
 }
 
+pub const MAX_LOG_SOURCE_BYTES: usize = 256;
+pub const MAX_LOG_MESSAGE_BYTES: usize = 16 * 1024;
+
 impl LogEntry {
     pub fn new(level: LogLevel, source: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
@@ -439,6 +454,33 @@ impl LogEntry {
 
     pub fn error(source: impl Into<String>, message: impl Into<String>) -> Self {
         Self::new(LogLevel::Error, source, message)
+    }
+
+    /// Bound untrusted backend diagnostics before they are persisted or
+    /// rendered. A single stderr line must not consume the entire log drawer.
+    pub fn bounded(mut self) -> Self {
+        truncate_log_text(&mut self.source, MAX_LOG_SOURCE_BYTES);
+        truncate_log_text(&mut self.message, MAX_LOG_MESSAGE_BYTES);
+        self
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.source.len().saturating_add(self.message.len())
+    }
+}
+
+fn truncate_log_text(text: &mut String, limit: usize) {
+    const TRUNCATION: &str = "… [truncated]";
+    if text.len() <= limit {
+        return;
+    }
+    let mut end = limit.saturating_sub(TRUNCATION.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    if limit >= TRUNCATION.len() {
+        text.push_str(TRUNCATION);
     }
 }
 
@@ -575,10 +617,6 @@ pub enum RuntimeEvent {
         member: MemberId,
         status: MemberStatus,
     },
-    MemberEffort {
-        member: MemberId,
-        effort: Effort,
-    },
     /// A new agent message cell begins.
     MessageStarted {
         msg: MessageId,
@@ -620,6 +658,7 @@ pub enum RuntimeEvent {
     FileChange {
         member: MemberId,
         files: Vec<(String, String)>,
+        ok: bool,
     },
     /// An agent-to-agent message was routed (shown inline in the chat).
     Route {
@@ -644,9 +683,25 @@ pub enum RuntimeEvent {
         reason: String,
         queued: usize,
     },
+    /// Authoritative count after paused routes are resolved or cancelled.
+    RouteQueueUpdated {
+        queued: usize,
+    },
     SessionUpdated {
         member: MemberId,
         session: AgentSessionId,
+    },
+    /// The runtime is globally quiescent and has reserved exclusive native
+    /// session access for `member` until [`UiCommand::AttachFinished`].
+    AttachGranted {
+        member: MemberId,
+    },
+    /// An attach reservation was not created. `reason` is display-ready but
+    /// the event remains structured so the TUI can clear pending handshake
+    /// state without parsing a notice.
+    AttachDenied {
+        member: MemberId,
+        reason: String,
     },
     ApprovalRequested {
         id: ApprovalId,
@@ -706,6 +761,12 @@ pub struct ConversationSummary {
 pub enum ChatItem {
     User {
         body: String,
+        /// Members this prompt was routed to. Empty on legacy replay rows.
+        targets: Vec<MemberId>,
+        /// Members already working when this prompt was sent, excluding
+        /// `targets`. Later output from these members stays under their
+        /// previous block; otherwise the transcript stays chronological.
+        interrupted: Vec<MemberId>,
     },
     Agent {
         member: MemberId,
@@ -723,6 +784,7 @@ pub enum ChatItem {
     Diff {
         member: MemberId,
         files: Vec<(String, String)>,
+        ok: bool,
     },
     Route {
         from: MemberId,

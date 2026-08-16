@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 use asterline::domain::event::RuntimeEvent;
 use tauri::{AppHandle, Emitter, Manager, Runtime, State, WindowEvent};
@@ -31,6 +32,7 @@ struct HostInner {
     generation: u64,
     sequence: u64,
     attaching: std::collections::HashSet<String>,
+    attach_waiters: std::collections::HashMap<String, mpsc::SyncSender<Result<(), String>>>,
 }
 
 #[derive(Default)]
@@ -66,6 +68,7 @@ fn bootstrap_desktop(
         }
         inner.generation = inner.generation.saturating_add(1);
         inner.pending = None;
+        inner.attach_waiters.clear();
         inner.workspace = Some(workspace.clone());
         let previous_sequence = inner.sequence;
         inner.model = DesktopModel::default();
@@ -134,6 +137,30 @@ fn dispatch_desktop_command(
     if matches!(command, DesktopCommandV1::Shutdown) {
         return shutdown_desktop(app, state);
     }
+
+    // Upstream 0.2.9 makes the complete team settings document the single
+    // authoritative mutation path. Preserve the compact Desktop effort action
+    // by translating it into that validated atomic update.
+    let command = match command {
+        DesktopCommandV1::SetEffort { member, effort } => {
+            let mut settings = state
+                .lock()?
+                .model
+                .snapshot()
+                .team
+                .ok_or_else(|| "team settings are not available".to_string())?;
+            let target = settings
+                .members
+                .iter_mut()
+                .find(|candidate| candidate.id == member)
+                .ok_or_else(|| format!("unknown member: {member}"))?;
+            target.effort = Some(effort);
+            DesktopCommandV1::ReplaceTeamSettings {
+                settings: Box::new(settings),
+            }
+        }
+        command => command,
+    };
 
     {
         let inner = state.lock()?;
@@ -207,6 +234,7 @@ fn shutdown_desktop(app: AppHandle, state: State<'_, DesktopHost>) -> Result<(),
         inner.generation = inner.generation.saturating_add(1);
         inner.pending = None;
         inner.attaching.clear();
+        inner.attach_waiters.clear();
         let event = inner.model.set_phase(DesktopPhase::ShuttingDown, None);
         emit_locked(&app, &mut inner, event);
         inner.active.take()
@@ -260,6 +288,7 @@ fn open_native_session(
     state: State<'_, DesktopHost>,
     member: String,
 ) -> Result<ExternalAttachLaunchV1, String> {
+    let (attach_tx, attach_rx) = mpsc::sync_channel(1);
     let (summary, generation) = {
         let mut inner = state.lock()?;
         if inner.active.is_none() {
@@ -295,12 +324,39 @@ fn open_native_session(
         if !inner.attaching.insert(member.clone()) {
             return Err(format!("an attach is already open for {member}"));
         }
+        inner.attach_waiters.insert(member.clone(), attach_tx);
+        if let Err(error) = inner
+            .active
+            .as_ref()
+            .expect("active session checked above")
+            .request_attach(&member)
+        {
+            inner.attach_waiters.remove(&member);
+            inner.attaching.remove(&member);
+            return Err(error);
+        }
         (summary, inner.generation)
     };
+    match attach_rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Err(error),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            return Err(
+                "timed out waiting for the runtime to reserve the native session".to_string(),
+            );
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err("the runtime attach handshake stopped unexpectedly".to_string());
+        }
+    }
     let (launch, watch) = match attach::launch(&app, &summary) {
         Ok(value) => value,
         Err(error) => {
-            state.lock()?.attaching.remove(&member);
+            let mut inner = state.lock()?;
+            if let Some(active) = inner.active.as_ref() {
+                let _ = active.finish_attach(&member, None, Vec::new());
+            }
+            inner.attaching.remove(&member);
             return Err(error);
         }
     };
@@ -309,50 +365,65 @@ fn open_native_session(
     if let Err(error) = thread::Builder::new()
         .name(format!("asterline-attach-{watch_member}"))
         .spawn(move || {
-            if let Some(result) = watch.wait() {
-                let state = watch_app.state::<DesktopHost>();
-                let current = state
-                    .lock()
-                    .map(|inner| inner.generation == generation)
-                    .unwrap_or(false);
-                if !current {
-                    return;
-                }
-                match result {
-                    Ok(import) => {
-                        let imported_count = import.items.len();
-                        let discovered_session = import.session.is_some();
-                        let state = watch_app.state::<DesktopHost>();
-                        let result = state.lock().ok().and_then(|inner| {
-                            if inner.generation != generation {
-                                return None;
-                            }
-                            let active = inner.active.as_ref()?;
-                            Some(active.finish_attach(&watch_member, import.session, import.items))
-                        });
-                        match result {
-                            Some(Ok(())) if imported_count == 0 && discovered_session => {
-                                emit_notice_for_generation(
-                                    &watch_app,
-                                    generation,
-                                    format!(
-                                        "returned from {watch_member}; session continuity was saved"
-                                    ),
-                                );
-                            }
-                            Some(Ok(())) if imported_count == 0 => emit_notice_for_generation(
+            let result = watch.wait();
+            let state = watch_app.state::<DesktopHost>();
+            let current = state
+                .lock()
+                .map(|inner| inner.generation == generation)
+                .unwrap_or(false);
+            if !current {
+                return;
+            }
+            match result {
+                Some(Ok(import)) => {
+                    let imported_count = import.items.len();
+                    let discovered_session = import.session.is_some();
+                    let state = watch_app.state::<DesktopHost>();
+                    let result = state.lock().ok().and_then(|inner| {
+                        if inner.generation != generation {
+                            return None;
+                        }
+                        let active = inner.active.as_ref()?;
+                        Some(active.finish_attach(&watch_member, import.session, import.items))
+                    });
+                    match result {
+                        Some(Ok(())) if imported_count == 0 && discovered_session => {
+                            emit_notice_for_generation(
                                 &watch_app,
                                 generation,
-                                format!("returned from {watch_member}; no new transcript messages"),
-                            ),
-                            Some(Ok(())) => {}
-                            Some(Err(error)) => {
-                                emit_notice_for_generation(&watch_app, generation, error);
-                            }
-                            None => {}
+                                format!(
+                                    "returned from {watch_member}; session continuity was saved"
+                                ),
+                            );
                         }
+                        Some(Ok(())) if imported_count == 0 => emit_notice_for_generation(
+                            &watch_app,
+                            generation,
+                            format!("returned from {watch_member}; no new transcript messages"),
+                        ),
+                        Some(Ok(())) => {}
+                        Some(Err(error)) => {
+                            emit_notice_for_generation(&watch_app, generation, error);
+                        }
+                        None => {}
                     }
-                    Err(error) => emit_notice_for_generation(&watch_app, generation, error),
+                }
+                Some(Err(error)) => {
+                    if let Ok(inner) = watch_app.state::<DesktopHost>().lock()
+                        && inner.generation == generation
+                        && let Some(active) = inner.active.as_ref()
+                    {
+                        let _ = active.finish_attach(&watch_member, None, Vec::new());
+                    }
+                    emit_notice_for_generation(&watch_app, generation, error);
+                }
+                None => {
+                    if let Ok(inner) = watch_app.state::<DesktopHost>().lock()
+                        && inner.generation == generation
+                        && let Some(active) = inner.active.as_ref()
+                    {
+                        let _ = active.finish_attach(&watch_member, None, Vec::new());
+                    }
                 }
             }
             if let Ok(mut inner) = watch_app.state::<DesktopHost>().lock()
@@ -362,7 +433,11 @@ fn open_native_session(
             }
         })
     {
-        state.lock()?.attaching.remove(&member);
+        let mut inner = state.lock()?;
+        if let Some(active) = inner.active.as_ref() {
+            let _ = active.finish_attach(&member, None, Vec::new());
+        }
+        inner.attaching.remove(&member);
         return Err(format!("could not start attach watcher: {error}"));
     }
     Ok(launch)
@@ -407,6 +482,27 @@ fn install_prepared(
                 };
                 if inner.generation != generation {
                     break;
+                }
+                match &event {
+                    RuntimeEvent::AttachGranted { member } => {
+                        let member = member.as_str().to_string();
+                        if let Some(waiter) = inner.attach_waiters.remove(&member)
+                            && waiter.send(Ok(())).is_err()
+                        {
+                            if let Some(active) = inner.active.as_ref() {
+                                let _ = active.finish_attach(&member, None, Vec::new());
+                            }
+                            inner.attaching.remove(&member);
+                        }
+                    }
+                    RuntimeEvent::AttachDenied { member, reason } => {
+                        let member = member.as_str().to_string();
+                        if let Some(waiter) = inner.attach_waiters.remove(&member) {
+                            let _ = waiter.send(Err(reason.clone()));
+                        }
+                        inner.attaching.remove(&member);
+                    }
+                    _ => {}
                 }
                 let event = inner.model.apply_runtime(event);
                 emit_locked(&pump_app, &mut inner, event);
@@ -515,6 +611,7 @@ pub fn run() {
                     let active = state.lock().ok().and_then(|mut inner| {
                         inner.generation = inner.generation.saturating_add(1);
                         inner.attaching.clear();
+                        inner.attach_waiters.clear();
                         inner.active.take()
                     });
                     if let Some(active) = active {

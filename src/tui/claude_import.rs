@@ -4,18 +4,19 @@
 //! Claude Code stores sessions at
 //! `~/.claude/projects/<munged-cwd>/<session-id>.jsonl`, one JSON object per
 //! line. When the user attaches (`claude --resume <id>`), chats, and exits,
-//! new turns land in that file — or, on resume, Claude may *fork* into a new
-//! session id whose file replays the prior history plus the new turns. A pure
-//! count-based diff on the old file would miss the fork, so import is primarily
-//! timestamp-based (with a count fallback for rows that lack timestamps).
+//! new turns land in that file — or Claude may fork into a new session id whose
+//! file replays the prior history plus the new turns. The original transcript
+//! uses a row-count delta; a fork must prove lineage by copying a snapshotted
+//! message UUID before any of its new rows are imported.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
 use crate::domain::{config, event::ImportedMessage};
+use crate::tui::attach::AttachOutcome;
 use crate::tui::import_io;
 
 /// Clock-skew grace: import rows whose timestamp is up to this much earlier
@@ -27,17 +28,17 @@ const MAX_CANDIDATE_SCAN_ENTRIES: usize = 50_000;
 /// A snapshot taken before launching the interactive session, used to import
 /// only the messages added while attached.
 pub struct ClaudeSnapshot {
-    /// The Claude session id being attached, if Asterline knows it.
-    /// Retained for diagnostics / future fork matching; import uses `path` + mtime.
-    #[allow(dead_code)]
-    session_id: Option<String>,
     /// Workspace cwd used to locate `~/.claude/projects/<munged-cwd>/`.
     cwd: String,
     /// Session file located up front (when the session id is known).
     path: Option<PathBuf>,
     /// Message rows already present in `path` before the attach.
     before: usize,
-    /// When the attach started, to filter by timestamp and spot new session files.
+    /// UUID of the last importable row in the original session. A copied UUID
+    /// proves that another transcript is a fork instead of an unrelated
+    /// concurrent session in the same project directory.
+    lineage_anchor: Option<String>,
+    /// When the attach started, to spot newly written fork session files.
     started: SystemTime,
 }
 
@@ -46,10 +47,10 @@ pub fn snapshot(session_id: Option<&str>, cwd: &str) -> ClaudeSnapshot {
     match default_projects_root() {
         Some(root) => snapshot_with_root(&root, session_id, cwd),
         None => ClaudeSnapshot {
-            session_id: session_id.map(str::to_string),
             cwd: cwd.to_string(),
             path: None,
             before: 0,
+            lineage_anchor: None,
             started: SystemTime::now(),
         },
     }
@@ -57,7 +58,7 @@ pub fn snapshot(session_id: Option<&str>, cwd: &str) -> ClaudeSnapshot {
 
 /// After the attach exits, return the messages added during it.
 pub fn imported_since(snapshot: ClaudeSnapshot) -> Vec<ImportedMessage> {
-    imported_since_with_session(snapshot).1
+    imported_attach_since(snapshot).items
 }
 
 /// After the attach exits, return the active Claude session id together with
@@ -66,10 +67,19 @@ pub fn imported_since(snapshot: ClaudeSnapshot) -> Vec<ImportedMessage> {
 pub fn imported_since_with_session(
     snapshot: ClaudeSnapshot,
 ) -> (Option<String>, Vec<ImportedMessage>) {
+    let outcome = imported_attach_since(snapshot);
+    (outcome.session.map(|session| session.0), outcome.items)
+}
+
+/// Return both the messages added while attached and the session identity when
+/// the transcript itself proves it. Fresh sessions are safe when their caller
+/// supplied Claude with a session UUID; unnamed sessions are never guessed
+/// from files that merely appeared beside the project transcript.
+pub(crate) fn imported_attach_since(snapshot: ClaudeSnapshot) -> AttachOutcome {
     let Some(root) = default_projects_root() else {
-        return (snapshot.session_id, Vec::new());
+        return AttachOutcome::default();
     };
-    imported_since_with_root_and_session(snapshot, &root)
+    imported_attach_since_with_root(snapshot, &root)
 }
 
 /// The platform user profile's `.claude/projects` directory (may not exist).
@@ -93,80 +103,140 @@ fn munge_cwd(cwd: &str) -> String {
 
 fn snapshot_with_root(root: &Path, session_id: Option<&str>, cwd: &str) -> ClaudeSnapshot {
     let project = projects_dir_for(root, cwd);
-    let path = session_id.map(|id| project.join(format!("{id}.jsonl")));
-    let before = path.as_deref().map(count_messages).unwrap_or(0);
+    let path = session_id.and_then(|id| claude_session_path(&project, id));
+    let (before, lineage_anchor) = path
+        .as_deref()
+        .map(classified_snapshot)
+        .unwrap_or((0, None));
     ClaudeSnapshot {
-        session_id: session_id.map(str::to_string),
         cwd: cwd.to_string(),
         path,
         before,
+        lineage_anchor,
         started: SystemTime::now(),
     }
 }
 
-#[cfg(test)]
-fn imported_since_with_root(snapshot: ClaudeSnapshot, root: &Path) -> Vec<ImportedMessage> {
-    imported_since_with_root_and_session(snapshot, root).1
+/// Claude session ids are used as a filename suffix. Keep the lookup to the
+/// normal UUID-like identifiers emitted by the CLI; never let a persisted or
+/// streamed id introduce a path component on either Unix or Windows.
+fn claude_session_path(project: &Path, session_id: &str) -> Option<PathBuf> {
+    let valid = !session_id.is_empty()
+        && session_id.len() <= 256
+        && session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    valid.then(|| project.join(format!("{session_id}.jsonl")))
 }
 
-fn imported_since_with_root_and_session(
-    snapshot: ClaudeSnapshot,
-    root: &Path,
-) -> (Option<String>, Vec<ImportedMessage>) {
-    let previous_session = snapshot.session_id.clone();
+#[cfg(test)]
+fn imported_since_with_root(snapshot: ClaudeSnapshot, root: &Path) -> Vec<ImportedMessage> {
+    imported_attach_since_with_root(snapshot, root).items
+}
+
+fn imported_attach_since_with_root(snapshot: ClaudeSnapshot, root: &Path) -> AttachOutcome {
     let project = projects_dir_for(root, &snapshot.cwd);
-    let candidates = candidate_files(&snapshot, &project);
-    let threshold = snapshot
-        .started
-        .checked_sub(CLOCK_SKEW)
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-
-    let mut imported_candidates: Vec<(bool, Option<String>, Vec<ImportedMessage>)> = Vec::new();
-
-    for path in candidates {
-        let is_original = snapshot.path.as_ref().is_some_and(|p| p == &path);
-        let rows = parse_classified(&path);
-        let mut messages = Vec::new();
-        let mut last_text: Option<String> = None;
-        for (index, row) in rows.into_iter().enumerate() {
-            let qualifies = match row.timestamp {
-                Some(ts) => ts >= threshold,
-                None => is_original && index >= snapshot.before,
+    if let Some(path) = snapshot.path.as_deref() {
+        let original = import_original_delta(path, snapshot.before);
+        if original.saw_delta {
+            return AttachOutcome {
+                items: original.items,
+                session: session_id_from_path(path),
+                notice: None,
             };
-            if !qualifies {
-                continue;
-            }
-            if last_text.as_ref() == Some(&row.msg.text) {
-                continue;
-            }
-            last_text = Some(row.msg.text.clone());
-            messages.push(row.msg);
-        }
-        if !messages.is_empty() {
-            let session_id = path
-                .file_stem()
-                .and_then(|name| name.to_str())
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_string);
-            imported_candidates.push((is_original, session_id, messages));
         }
     }
-    if previous_session.is_some()
-        && let Some(index) = imported_candidates
-            .iter()
-            .position(|(is_original, _, _)| *is_original)
-    {
-        let (_, session_id, messages) = imported_candidates.swap_remove(index);
-        return (session_id.or(previous_session), messages);
+
+    if let Some(anchor) = snapshot.lineage_anchor.as_deref() {
+        let mut fork_delta = None;
+        for path in candidate_files(&snapshot, &project) {
+            if snapshot.path.as_ref() == Some(&path) {
+                continue;
+            }
+            let candidate = import_fork_delta(&path, anchor);
+            if !candidate.saw_delta {
+                continue;
+            }
+            if fork_delta.is_some() {
+                // Multiple descendants are ambiguous: do not guess which branch
+                // the interactive CLI used.
+                return AttachOutcome {
+                    notice: Some(
+                        "could not safely identify the forked Claude session; its attached transcript was not imported"
+                            .to_string(),
+                    ),
+                    ..AttachOutcome::default()
+                };
+            }
+            fork_delta = Some((candidate.items, path));
+        }
+        return fork_delta.map_or_else(AttachOutcome::default, |(items, path)| AttachOutcome {
+            items,
+            session: session_id_from_path(&path),
+            notice: None,
+        });
     }
-    if imported_candidates.len() == 1 {
-        let (_, session_id, messages) = imported_candidates.pop().expect("length checked");
-        return (session_id.or(previous_session), messages);
+
+    // An unnamed native session has no pre-existing id or lineage anchor. A
+    // pre/post directory diff cannot prove which local CLI created a new file,
+    // so do not import or claim it. Asterline's fresh Claude attach supplies
+    // `--session-id`, so it takes the deterministic path above instead.
+    AttachOutcome {
+        notice: Some(
+            "could not identify an unnamed Claude session, so its transcript was not imported"
+                .to_string(),
+        ),
+        ..AttachOutcome::default()
     }
-    // Multiple newly-written sessions in one project directory are
-    // indistinguishable. Importing or binding any of them could leak another
-    // concurrent Claude conversation into this member, so fail closed.
-    (previous_session, Vec::new())
+}
+
+struct ImportDelta {
+    items: Vec<ImportedMessage>,
+    saw_delta: bool,
+}
+
+fn import_original_delta(path: &Path, before: usize) -> ImportDelta {
+    let mut items = Vec::new();
+    let mut retained_bytes = 0_usize;
+    let mut classified_index = 0_usize;
+    let mut saw_delta = false;
+    import_io::for_each_json_value(path, |value| {
+        let Some(message) = classify_row(&value) else {
+            return true;
+        };
+        let index = classified_index;
+        classified_index = classified_index.saturating_add(1);
+        if index < before {
+            return true;
+        }
+        saw_delta = true;
+        import_io::push_imported_bounded(&mut items, &mut retained_bytes, message)
+    });
+    ImportDelta { items, saw_delta }
+}
+
+fn import_fork_delta(path: &Path, anchor: &str) -> ImportDelta {
+    let mut items = Vec::new();
+    let mut retained_bytes = 0_usize;
+    let mut anchor_seen = false;
+    let mut saw_delta = false;
+    import_io::for_each_json_value(path, |value| {
+        let Some(message) = classify_row(&value) else {
+            return true;
+        };
+        if !anchor_seen {
+            anchor_seen = value.get("uuid").and_then(Value::as_str) == Some(anchor);
+            return true;
+        }
+        saw_delta = true;
+        import_io::push_imported_bounded(&mut items, &mut retained_bytes, message)
+    });
+    ImportDelta { items, saw_delta }
+}
+
+fn session_id_from_path(path: &Path) -> Option<crate::domain::event::AgentSessionId> {
+    let stem = path.file_stem()?.to_str()?;
+    import_io::safe_session_id(stem)
 }
 
 /// Candidate session files: the snapshot path (if present) plus every `.jsonl`
@@ -222,27 +292,35 @@ fn modified(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
-/// One classified chat row plus its optional timestamp.
+/// One classified chat row (test inspection only).
+#[cfg(test)]
 struct ClassifiedRow {
     msg: ImportedMessage,
-    timestamp: Option<SystemTime>,
 }
 
-fn count_messages(path: &Path) -> usize {
-    parse_classified(path).len()
+fn classified_snapshot(path: &Path) -> (usize, Option<String>) {
+    let mut count = 0_usize;
+    let mut lineage_anchor = None;
+    import_io::for_each_json_value(path, |value| {
+        if classify_row(&value).is_some() {
+            count = count.saturating_add(1);
+            if let Some(uuid) = value.get("uuid").and_then(Value::as_str) {
+                lineage_anchor = Some(uuid.to_string());
+            }
+        }
+        true
+    });
+    (count, lineage_anchor)
 }
 
+#[cfg(test)]
 fn parse_classified(path: &Path) -> Vec<ClassifiedRow> {
     let mut out = Vec::new();
     import_io::for_each_json_value(path, |value| {
         let Some(msg) = classify_row(&value) else {
             return true;
         };
-        let timestamp = value
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .and_then(rfc3339_to_system_time);
-        out.push(ClassifiedRow { msg, timestamp });
+        out.push(ClassifiedRow { msg });
         true
     });
     out
@@ -329,95 +407,6 @@ fn concat_text_blocks(blocks: &[Value]) -> String {
     parts.join("\n").trim().to_string()
 }
 
-/// Parse `YYYY-MM-DDTHH:MM:SS(.fff)?Z` (UTC only) into [`SystemTime`].
-fn rfc3339_to_system_time(s: &str) -> Option<SystemTime> {
-    let s = s.trim();
-    if !s.ends_with('Z') {
-        return None;
-    }
-    let body = &s[..s.len() - 1];
-    let (date, time) = body.split_once('T')?;
-    let mut date_parts = date.split('-');
-    let year: i32 = date_parts.next()?.parse().ok()?;
-    let month: u32 = date_parts.next()?.parse().ok()?;
-    let day: u32 = date_parts.next()?.parse().ok()?;
-    if date_parts.next().is_some() || !(1..=12).contains(&month) || day == 0 || day > 31 {
-        return None;
-    }
-
-    let (hms, frac) = match time.split_once('.') {
-        Some((hms, frac)) => (hms, Some(frac)),
-        None => (time, None),
-    };
-    let mut time_parts = hms.split(':');
-    let hour: u64 = time_parts.next()?.parse().ok()?;
-    let minute: u64 = time_parts.next()?.parse().ok()?;
-    let second: u64 = time_parts.next()?.parse().ok()?;
-    if time_parts.next().is_some() || hour > 23 || minute > 59 || second > 60 {
-        return None;
-    }
-
-    let days = days_from_civil(year, month, day)?;
-    let secs = days
-        .checked_mul(86_400)?
-        .checked_add(hour as i64 * 3600)?
-        .checked_add(minute as i64 * 60)?
-        .checked_add(second as i64)?;
-    if secs < 0 {
-        return None;
-    }
-    let mut duration = Duration::from_secs(secs as u64);
-    if let Some(frac) = frac {
-        // Up to 9 digits of fractional seconds → nanoseconds.
-        let digits: String = frac
-            .chars()
-            .take(9)
-            .filter(|c| c.is_ascii_digit())
-            .collect();
-        if digits.len() != frac.chars().take(9).count() {
-            return None;
-        }
-        if digits.is_empty() && !frac.is_empty() {
-            return None;
-        }
-        let padded = format!("{digits:0<9}");
-        let nanos: u32 = padded.parse().ok()?;
-        duration = duration.checked_add(Duration::from_nanos(nanos as u64))?;
-    }
-    UNIX_EPOCH.checked_add(duration)
-}
-
-/// Days since civil 1970-01-01 (Howard Hinnant's algorithm). Returns `None` for
-/// clearly invalid calendar dates (e.g. month out of range already checked).
-fn days_from_civil(y: i32, m: u32, d: u32) -> Option<i64> {
-    // Reject impossible day-of-month roughly; leap-year Feb 29 is allowed.
-    let dim = days_in_month(y, m)?;
-    if d == 0 || d > dim {
-        return None;
-    }
-    let mut y = y;
-    let m = m as i32;
-    y -= i32::from(m <= 2);
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u32;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) as u32 + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Some(era as i64 * 146_097 + doe as i64 - 719_468)
-}
-
-fn days_in_month(y: i32, m: u32) -> Option<u32> {
-    match m {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => Some(31),
-        4 | 6 | 9 | 11 => Some(30),
-        2 => Some(if is_leap(y) { 29 } else { 28 }),
-        _ => None,
-    }
-}
-
-fn is_leap(y: i32) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,7 +417,7 @@ mod tests {
             name,
             std::process::id(),
             std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
+                .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos()
         ));
@@ -456,6 +445,18 @@ mod tests {
         )
     }
 
+    fn user_line_with_uuid(text: &str, ts: &str, uuid: &str) -> String {
+        format!(
+            r#"{{"type":"user","uuid":"{uuid}","isSidechain":false,"timestamp":"{ts}","message":{{"role":"user","content":"{text}"}}}}"#
+        )
+    }
+
+    fn assistant_line_with_uuid(text: &str, ts: &str, uuid: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","uuid":"{uuid}","isSidechain":false,"timestamp":"{ts}","message":{{"role":"assistant","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        )
+    }
+
     #[test]
     fn munge_cwd_replaces_non_alnum() {
         assert_eq!(munge_cwd("/Users/x/proj.name"), "-Users-x-proj-name");
@@ -473,6 +474,28 @@ mod tests {
         assert_eq!(
             projects_dir_for(root, "/Users/x/proj"),
             PathBuf::from("/fake/claude/projects/-Users-x-proj")
+        );
+    }
+
+    #[test]
+    fn session_lookup_rejects_path_like_ids() {
+        let project = Path::new("/fake/claude/projects/project");
+        for invalid in [
+            "",
+            "../secret",
+            "..\\secret",
+            "/absolute",
+            "has space",
+            "id.jsonl",
+        ] {
+            assert!(
+                claude_session_path(project, invalid).is_none(),
+                "{invalid:?}"
+            );
+        }
+        assert_eq!(
+            claude_session_path(project, "session-abc_123"),
+            Some(project.join("session-abc_123.jsonl"))
         );
     }
 
@@ -580,24 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn rfc3339_parse_with_and_without_fraction() {
-        let a = rfc3339_to_system_time("2020-01-01T00:00:00Z").unwrap();
-        let b = rfc3339_to_system_time("2020-01-01T00:00:00.500Z").unwrap();
-        assert_eq!(
-            a.duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            1_577_836_800
-        );
-        assert_eq!(
-            b.duration_since(UNIX_EPOCH).unwrap().as_millis(),
-            1_577_836_800_500
-        );
-        assert!(rfc3339_to_system_time("not-a-date").is_none());
-        assert!(rfc3339_to_system_time("2020-01-01T00:00:00+00:00").is_none());
-        assert!(rfc3339_to_system_time("2020-13-01T00:00:00Z").is_none());
-    }
-
-    #[test]
-    fn snapshot_import_round_trip_timestamp_filter() {
+    fn snapshot_import_round_trip_uses_original_row_count() {
         let root = fixture_root("roundtrip");
         let cwd = "/tmp/ws-claude";
         let sid = "sess-round";
@@ -619,10 +625,13 @@ mod tests {
         content.push_str(&new2);
         std::fs::write(&path, content).unwrap();
 
-        let (session_id, imported) = imported_since_with_root_and_session(snap, &root);
-        assert_eq!(session_id.as_deref(), Some(sid));
+        let imported = imported_attach_since_with_root(snap, &root);
         assert_eq!(
-            imported,
+            imported.session.as_ref().map(|session| session.as_str()),
+            Some(sid)
+        );
+        assert_eq!(
+            imported.items,
             vec![
                 ImportedMessage {
                     from_user: true,
@@ -639,12 +648,58 @@ mod tests {
     }
 
     #[test]
-    fn fork_session_imports_only_new_timestamped_rows() {
+    fn unnamed_fresh_attach_never_guesses_a_claude_session() {
+        let root = fixture_root("fresh-attach");
+        let snapshot = snapshot_with_root(&root, None, "/tmp/ws-fresh-claude");
+        let imported = imported_attach_since_with_root(snapshot, &root);
+        assert!(imported.items.is_empty());
+        assert!(imported.session.is_none());
+        assert!(imported.notice.is_some());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn supplied_fresh_session_id_imports_and_binds_without_guessing() {
+        let root = fixture_root("supplied-fresh-id");
+        let cwd = "/tmp/ws-supplied-fresh-id";
+        let session_id = "3e2f3488-c08a-4d09-9cac-fc64f632a590";
+        let snapshot = snapshot_with_root(&root, Some(session_id), cwd);
+        let user = user_line("new user", "2099-06-01T00:00:00Z");
+        let assistant = assistant_line("new assistant", "2099-06-01T00:00:01Z");
+        write_session(&root, cwd, session_id, &[&user, &assistant]);
+
+        let imported = imported_attach_since_with_root(snapshot, &root);
+        assert_eq!(
+            imported.session,
+            Some(crate::domain::event::AgentSessionId(session_id.to_string()))
+        );
+        assert_eq!(
+            imported.items,
+            vec![
+                ImportedMessage {
+                    from_user: true,
+                    text: "new user".to_string(),
+                },
+                ImportedMessage {
+                    from_user: false,
+                    text: "new assistant".to_string(),
+                },
+            ]
+        );
+        assert!(imported.notice.is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fork_session_imports_only_rows_after_lineage_anchor() {
         let root = fixture_root("fork");
         let cwd = "/tmp/ws-fork";
         let old_sid = "sess-old";
-        let old1 = user_line("prior user", "2020-06-01T12:00:00Z");
-        let old2 = assistant_line("prior assistant", "2020-06-01T12:00:01Z");
+        let old1 = user_line_with_uuid("prior user", "2020-06-01T12:00:00Z", "old-user");
+        let old2 =
+            assistant_line_with_uuid("prior assistant", "2020-06-01T12:00:01Z", "lineage-anchor");
         write_session(&root, cwd, old_sid, &[&old1, &old2]);
 
         let snap = snapshot_with_root(&root, Some(old_sid), cwd);
@@ -656,10 +711,13 @@ mod tests {
         let new2 = assistant_line("fork reply", "2099-06-01T12:00:01Z");
         write_session(&root, cwd, new_sid, &[&old1, &old2, &new1, &new2]);
 
-        let (session_id, imported) = imported_since_with_root_and_session(snap, &root);
-        assert_eq!(session_id.as_deref(), Some(new_sid));
+        let imported = imported_attach_since_with_root(snap, &root);
         assert_eq!(
-            imported,
+            imported.session.as_ref().map(|session| session.as_str()),
+            Some(new_sid)
+        );
+        assert_eq!(
+            imported.items,
             vec![
                 ImportedMessage {
                     from_user: true,
@@ -673,6 +731,74 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn unrelated_concurrent_session_in_same_cwd_is_not_imported() {
+        let root = fixture_root("unrelated");
+        let cwd = "/tmp/ws-unrelated";
+        let original =
+            user_line_with_uuid("original history", "2020-06-01T12:00:00Z", "lineage-anchor");
+        write_session(&root, cwd, "sess-original", &[&original]);
+        let snap = snapshot_with_root(&root, Some("sess-original"), cwd);
+
+        let unrelated = user_line_with_uuid(
+            "must not cross sessions",
+            "2099-06-01T12:00:00Z",
+            "unrelated-message",
+        );
+        write_session(&root, cwd, "sess-unrelated", &[&unrelated]);
+
+        assert!(imported_since_with_root(snap, &root).is_empty());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn fork_lineage_wins_over_unrelated_concurrent_session() {
+        let root = fixture_root("fork-with-unrelated");
+        let cwd = "/tmp/ws-fork-with-unrelated";
+        let old1 = user_line_with_uuid("old user", "2020-06-01T12:00:00Z", "old-user");
+        let anchor =
+            assistant_line_with_uuid("old assistant", "2020-06-01T12:00:01Z", "lineage-anchor");
+        write_session(&root, cwd, "sess-original", &[&old1, &anchor]);
+        let snap = snapshot_with_root(&root, Some("sess-original"), cwd);
+
+        let fork_new =
+            user_line_with_uuid("from proven fork", "2099-06-01T12:00:00Z", "fork-message");
+        write_session(&root, cwd, "sess-fork", &[&old1, &anchor, &fork_new]);
+        let unrelated = user_line_with_uuid(
+            "must not cross sessions",
+            "2099-06-01T12:00:01Z",
+            "unrelated-message",
+        );
+        write_session(&root, cwd, "sess-unrelated", &[&unrelated]);
+
+        assert_eq!(
+            imported_since_with_root(snap, &root),
+            vec![ImportedMessage {
+                from_user: true,
+                text: "from proven fork".to_string(),
+            }]
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn multiple_fork_descendants_are_treated_as_ambiguous() {
+        let root = fixture_root("ambiguous-forks");
+        let cwd = "/tmp/ws-ambiguous-forks";
+        let anchor =
+            user_line_with_uuid("original history", "2020-06-01T12:00:00Z", "lineage-anchor");
+        write_session(&root, cwd, "sess-original", &[&anchor]);
+        let snap = snapshot_with_root(&root, Some("sess-original"), cwd);
+
+        let fork_a = user_line_with_uuid("fork a", "2099-06-01T12:00:00Z", "fork-a-message");
+        let fork_b = user_line_with_uuid("fork b", "2099-06-01T12:00:01Z", "fork-b-message");
+        write_session(&root, cwd, "sess-fork-a", &[&anchor, &fork_a]);
+        write_session(&root, cwd, "sess-fork-b", &[&anchor, &fork_b]);
+
+        assert!(imported_since_with_root(snap, &root).is_empty());
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -694,10 +820,10 @@ mod tests {
 
         // before = 2 (the two pre-existing classified rows).
         let snap = ClaudeSnapshot {
-            session_id: Some(sid.to_string()),
             cwd: cwd.to_string(),
             path: Some(path),
             before: 2,
+            lineage_anchor: None,
             started: SystemTime::now(),
         };
 
@@ -743,5 +869,30 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn attached_claude_import_stops_at_aggregate_item_budget() {
+        let root = fixture_root("aggregate-budget");
+        let cwd = "/tmp/ws-budget";
+        let sid = "sess-budget";
+        let lines = (0..import_io::MAX_IMPORTED_ITEMS + 25)
+            .map(|index| user_line(&format!("message-{index}"), "2099-01-01T00:00:00Z"))
+            .collect::<Vec<_>>();
+        let refs = lines.iter().map(String::as_str).collect::<Vec<_>>();
+        let path = write_session(&root, cwd, sid, &refs);
+        let snapshot = ClaudeSnapshot {
+            cwd: cwd.to_string(),
+            path: Some(path),
+            before: 0,
+            lineage_anchor: None,
+            started: SystemTime::UNIX_EPOCH,
+        };
+
+        let imported = imported_since_with_root(snapshot, &root);
+
+        assert_eq!(imported.len(), import_io::MAX_IMPORTED_ITEMS);
+        assert_eq!(imported.last().unwrap().text, "message-999");
+        std::fs::remove_dir_all(root).ok();
     }
 }

@@ -650,24 +650,6 @@ impl DesktopModel {
                     }
                 }
             }
-            MemberEffort { member, effort } => {
-                let id = member.to_string();
-                if let Some(summary) = self
-                    .snapshot
-                    .members
-                    .iter_mut()
-                    .find(|value| value.id == id)
-                {
-                    summary.effort = Some(effort_v1(effort.as_str()));
-                    DesktopRuntimeEventV1::MemberUpdated {
-                        member: summary.clone(),
-                    }
-                } else {
-                    DesktopRuntimeEventV1::Notice {
-                        message: format!("effort received for unknown member {id}"),
-                    }
-                }
-            }
             MessageStarted { msg, turn, member } => {
                 let member_id = member.to_string();
                 let (display_name, backend) = self.member_identity(&member_id);
@@ -748,7 +730,7 @@ impl DesktopModel {
                     }
                 }
             }
-            FileChange { member, files } => {
+            FileChange { member, files, ok } => {
                 let member_id = member.to_string();
                 let id = self.fresh_id("diff");
                 let (display_name, backend) = self.member_identity(&member_id);
@@ -757,6 +739,7 @@ impl DesktopModel {
                 item.display_name = display_name;
                 item.backend = backend;
                 item.files = Some(files);
+                item.ok = Some(ok);
                 self.add_timeline(item)
             }
             Route {
@@ -938,6 +921,26 @@ impl DesktopModel {
                     Err(message) => DesktopRuntimeEventV1::Notice { message },
                 }
             }
+            RouteQueueUpdated { queued } => {
+                let current = self
+                    .snapshot
+                    .timeline
+                    .iter()
+                    .filter(|item| item.kind == TimelineKindV1::RoutePaused)
+                    .count();
+                for _ in queued..current {
+                    self.clear_next_paused_route();
+                }
+                DesktopRuntimeEventV1::SnapshotReplaced {
+                    snapshot: self.snapshot(),
+                }
+            }
+            AttachGranted { member } => DesktopRuntimeEventV1::Notice {
+                message: format!("native session reserved for {member}"),
+            },
+            AttachDenied { member, reason } => DesktopRuntimeEventV1::Notice {
+                message: format!("could not attach to {member}: {reason}"),
+            },
         }
     }
 
@@ -1129,7 +1132,7 @@ fn normalize_default_target_to_domain(value: &mut Value) -> Result<(), String> {
 
 fn timeline_from_chat(id: String, item: ChatItem) -> TimelineItemV1 {
     match item {
-        ChatItem::User { body } => {
+        ChatItem::User { body, .. } => {
             let mut item = TimelineItemV1::new(id, TimelineKindV1::User);
             item.text = Some(body);
             item
@@ -1162,7 +1165,7 @@ fn timeline_from_chat(id: String, item: ChatItem) -> TimelineItemV1 {
             item.ok = ok;
             item
         }
-        ChatItem::Diff { member, files } => {
+        ChatItem::Diff { member, files, .. } => {
             let mut item = TimelineItemV1::new(id, TimelineKindV1::Diff);
             item.member = Some(member.to_string());
             item.files = Some(files);

@@ -1,5 +1,7 @@
 # Installing Asterline
 
+[简体中文](installation.zh-CN.md)
+
 Asterline publishes native packages for macOS, Linux, and Windows. Every release
 contains both the full `asterline` command and the shorter `ast` alias.
 
@@ -27,6 +29,18 @@ ast --help
 
 The package installs `ast` and `asterline` into `/usr/local/bin`.
 
+## Homebrew (macOS and Linux)
+
+Install the official Formula, then use the same command for later updates:
+
+```bash
+brew install song0705/asterline/asterline
+ast update
+```
+
+`ast update` verifies that the running binary belongs to the installed Formula,
+then runs `brew update` and `brew upgrade song0705/asterline/asterline`.
+
 ### Portable macOS archive
 
 Use a portable archive when a system-wide installation is not appropriate:
@@ -49,8 +63,11 @@ If a new terminal cannot find `ast`, add `$HOME/.local/bin` to `PATH` in
 
 ### macOS security prompt
 
-Developer ID signed and notarized releases open through the standard Installer
-flow. For an unsigned preview build, macOS may require an explicit override:
+The v0.2.3 DMG is known to be unsigned. New Release DMGs are Developer ID
+signed and notarized only when the release workflow has Apple credentials;
+otherwise they are published unsigned and unnotarized. Verify the release
+checksum and provenance before using the security override for any unsigned
+DMG:
 
 1. Control-click `Install Asterline.pkg` and choose **Open**.
 2. Confirm **Open** in the security dialog.
@@ -100,8 +117,10 @@ before replacing the binaries.
 Run an update check immediately:
 
 ```powershell
-ast --update
+ast update
 ```
+
+`ast --update` remains a compatible alias.
 
 Skip the background check for one launch:
 
@@ -109,7 +128,9 @@ Skip the background check for one launch:
 ast --no-auto-update
 ```
 
-Portable ZIP copies and source builds do not update themselves.
+Portable ZIP copies and source builds do not update themselves. `ast update`
+also leaves direct macOS packages and direct `.deb`/`.rpm` Release installs
+untouched; install their next matching Release package explicitly.
 
 ### Portable Windows ZIP
 
@@ -129,12 +150,24 @@ the extracted directory.
 
 ## Linux
 
-Download the `.tar.gz` archive matching the machine:
+Download the asset matching the machine:
 
-| Architecture        | Release target              |
-| ------------------- | --------------------------- |
-| Intel or AMD 64-bit | `x86_64-unknown-linux-gnu`  |
-| ARM64               | `aarch64-unknown-linux-gnu` |
+- **ARM64:** `asterline-v<version>-Linux-arm64.tar.gz`,
+  `asterline-v<version>-Linux-arm64.deb`, or
+  `asterline-v<version>-Linux-arm64.rpm`.
+- **Intel or AMD 64-bit (`x86_64`):**
+  `asterline-v<version>-Linux-x86_64.tar.gz`,
+  `asterline-v<version>-Linux-x86_64.deb`, or
+  `asterline-v<version>-Linux-x86_64.rpm`.
+
+These are GNU/Linux builds produced on a maintained glibc 2.28 baseline. They
+require glibc 2.28 or newer, so they do not run on Alpine/musl. SQLite is built
+from bundled source and does not require a system `libsqlite3` package.
+
+> Historical exception: the existing v0.2.3 Linux archives predate this release
+> guarantee. They require glibc 2.39 and dynamically link system `libsqlite3`.
+> Use them only with those runtime dependencies; otherwise build from source or
+> use a distribution package.
 
 Extract the archive, then install the commands for the current user:
 
@@ -150,9 +183,33 @@ open a new shell and run `ast --help`.
 To uninstall a portable Linux copy, remove `$HOME/.local/bin/ast` and
 `$HOME/.local/bin/asterline`.
 
+### Debian and Ubuntu
+
+The `.deb` files are smoke-tested on Debian 12 and Ubuntu 24.04. Download the
+matching architecture, then install it locally:
+
+```bash
+sudo apt install ./asterline-v<version>-Linux-x86_64.deb
+ast --help
+```
+
+### Fedora and Rocky Linux
+
+The `.rpm` files are built on Rocky Linux 8 and smoke-tested again on Fedora
+44. Download the matching architecture, then install it locally:
+
+```bash
+sudo dnf install ./asterline-v<version>-Linux-x86_64.rpm
+ast --help
+```
+
+These are versioned GitHub Release assets, not configured APT or DNF
+repositories. Verify the file against `SHA256SUMS` and its GitHub artifact
+attestation before installing it.
+
 ## Build from source
 
-Install Rust 1.85 or newer, clone the repository, and run:
+Install Rust 1.88 or newer, clone the repository, and run:
 
 ```bash
 cargo install --path . --locked --force
@@ -160,6 +217,8 @@ cargo install --path . --locked --force
 
 Cargo installs both commands into `$HOME/.cargo/bin` on macOS and Linux, or
 `%USERPROFILE%\.cargo\bin` on Windows. Ensure that directory is on `PATH`.
+Run the same Cargo command again after pulling the source changes; `ast update`
+does not modify source builds.
 
 ## Verify a release
 

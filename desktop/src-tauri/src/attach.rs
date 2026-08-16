@@ -244,23 +244,30 @@ fn run_helper(path: &Path, token: &str) -> Result<(), String> {
         Some(program) => program,
         None => return write_failed_result(&descriptor, &format!("{program_name} is not on PATH")),
     };
-    let arguments = backend_arguments(descriptor.backend, descriptor.session.as_deref());
+    let fresh_session = (descriptor.backend == BackendKindV1::Claude
+        && descriptor.session.is_none())
+    .then(|| uuid::Uuid::new_v4().to_string());
+    let transcript_session = descriptor.session.as_deref().or(fresh_session.as_deref());
+    let arguments = backend_arguments(
+        descriptor.backend,
+        descriptor.session.as_deref(),
+        fresh_session.as_deref(),
+    );
 
     enum Snapshot {
         Codex(asterline::tui::rollout_import::RolloutSnapshot),
         Claude(asterline::tui::claude_import::ClaudeSnapshot),
     }
-    let snapshot = match descriptor.backend {
-        BackendKindV1::Codex => Some(Snapshot::Codex(asterline::tui::rollout_import::snapshot(
-            descriptor.session.as_deref(),
-            &descriptor.cwd,
-        ))),
-        BackendKindV1::Claude => Some(Snapshot::Claude(asterline::tui::claude_import::snapshot(
-            descriptor.session.as_deref(),
-            &descriptor.cwd,
-        ))),
-        BackendKindV1::Grok | BackendKindV1::Agy => None,
-    };
+    let snapshot =
+        match descriptor.backend {
+            BackendKindV1::Codex => Some(Snapshot::Codex(
+                asterline::tui::rollout_import::snapshot(transcript_session, &descriptor.cwd),
+            )),
+            BackendKindV1::Claude => Some(Snapshot::Claude(
+                asterline::tui::claude_import::snapshot(transcript_session, &descriptor.cwd),
+            )),
+            BackendKindV1::Grok | BackendKindV1::Agy => None,
+        };
 
     println!(
         "\n── {} · {} {} ──\n  Exit the backend CLI to return to Asterline Desktop.\n",
@@ -286,6 +293,7 @@ fn run_helper(path: &Path, token: &str) -> Result<(), String> {
             }
         })
         .unwrap_or_else(|| (descriptor.session.clone(), Vec::new()));
+    let session = session.or(fresh_session);
     let mut imported = imported
         .into_iter()
         .map(|item| AttachImported {
@@ -441,19 +449,28 @@ fn backend_program(backend: BackendKindV1) -> &'static str {
     }
 }
 
-fn backend_arguments(backend: BackendKindV1, session: Option<&str>) -> Vec<String> {
-    match (backend, session) {
-        (BackendKindV1::Codex, Some(session)) => vec!["resume".to_string(), session.to_string()],
-        (BackendKindV1::Claude, Some(session)) => {
+fn backend_arguments(
+    backend: BackendKindV1,
+    session: Option<&str>,
+    fresh_session: Option<&str>,
+) -> Vec<String> {
+    match (backend, session, fresh_session) {
+        (BackendKindV1::Codex, Some(session), _) => {
+            vec!["resume".to_string(), session.to_string()]
+        }
+        (BackendKindV1::Claude, Some(session), _) => {
             vec!["--resume".to_string(), session.to_string()]
         }
-        (BackendKindV1::Grok, Some(session)) => {
+        (BackendKindV1::Claude, None, Some(session)) => {
+            vec!["--session-id".to_string(), session.to_string()]
+        }
+        (BackendKindV1::Grok, Some(session), _) => {
             vec!["--resume".to_string(), session.to_string()]
         }
-        (BackendKindV1::Agy, Some(session)) => {
+        (BackendKindV1::Agy, Some(session), _) => {
             vec!["--conversation".to_string(), session.to_string()]
         }
-        (_, None) => Vec::new(),
+        (_, None, _) => Vec::new(),
     }
 }
 
@@ -588,8 +605,12 @@ mod tests {
     #[test]
     fn backend_arguments_do_not_pass_through_a_shell() {
         assert_eq!(
-            backend_arguments(BackendKindV1::Codex, Some("thread;echo bad")),
+            backend_arguments(BackendKindV1::Codex, Some("thread;echo bad"), None),
             vec!["resume", "thread;echo bad"]
+        );
+        assert_eq!(
+            backend_arguments(BackendKindV1::Claude, None, Some("fresh-id")),
+            vec!["--session-id", "fresh-id"]
         );
     }
 

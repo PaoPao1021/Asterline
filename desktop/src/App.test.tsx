@@ -80,4 +80,29 @@ describe("Asterline desktop workspace", () => {
     expect(sidebar).toHaveClass("is-closed");
     expect(inspector).toHaveClass("is-open");
   });
+
+  it("can restore both side panels after collapsing them on desktop", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    const sidebar = await screen.findByRole("complementary", { name: "Menu" });
+    const inspector = screen.getByRole("complementary", { name: "Inspector" });
+
+    await user.click(within(sidebar).getByRole("button", { name: "Collapse sidebar" }));
+    expect(sidebar).toHaveClass("is-closed");
+    const restoreSidebar = within(screen.getByRole("main")).getByRole("button", {
+      name: "Open navigation",
+    });
+    expect(restoreSidebar).toHaveClass("panel-restore-button");
+    await user.click(restoreSidebar);
+    expect(sidebar).toHaveClass("is-open");
+
+    await user.click(within(inspector).getByRole("button", { name: "Details" }));
+    expect(inspector).toHaveClass("is-closed");
+    const restoreInspector = within(screen.getByRole("main")).getByRole("button", {
+      name: "Details",
+    });
+    expect(restoreInspector).toHaveClass("panel-restore-button");
+    await user.click(restoreInspector);
+    expect(inspector).toHaveClass("is-open");
+  });
 });

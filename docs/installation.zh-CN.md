@@ -1,5 +1,7 @@
 # 安装 Asterline
 
+[English](installation.md)
+
 Asterline 为 macOS、Linux 和 Windows 提供原生发布包。每个发布包都同时包含完整命令 `asterline` 和短命令 `ast`。
 
 ## 安装前准备
@@ -22,6 +24,18 @@ ast --help
 
 安装包会把 `ast` 和 `asterline` 安装到 `/usr/local/bin`。
 
+## Homebrew（macOS 和 Linux）
+
+安装官方 Formula，之后使用同一个命令更新：
+
+```bash
+brew install song0705/asterline/asterline
+ast update
+```
+
+`ast update` 会先确认当前二进制属于已安装的 Formula，再运行 `brew update` 和
+`brew upgrade song0705/asterline/asterline`。
+
 ### macOS 便携包
 
 不适合进行系统级安装时，可以改用便携包：
@@ -43,7 +57,9 @@ install -m 755 ast "$HOME/.local/bin/ast"
 
 ### macOS 安全提示
 
-使用 Developer ID 签名并通过公证的版本可以直接进入标准安装流程。对于未签名的预览构建，macOS 可能要求用户明确允许：
+v0.2.3 DMG 已知未签名。只有在发布 workflow 配置了 Apple 凭据时，新的 Release
+DMG 才会使用 Developer ID 签名并通过公证；否则会以未签名、未公证的形式发布。
+对任何未签名 DMG 使用安全绕过前，请先核对 Release 校验和和 provenance：
 
 1. 按住 Control 点击 `Install Asterline.pkg`，选择“打开”。
 2. 在安全提示中再次确认“打开”。
@@ -84,8 +100,10 @@ ast --help
 立即检查更新：
 
 ```powershell
-ast --update
+ast update
 ```
+
+`ast --update` 仍可作为兼容别名使用。
 
 单次启动跳过后台检查：
 
@@ -93,7 +111,8 @@ ast --update
 ast --no-auto-update
 ```
 
-便携 ZIP 和源码构建版本不会自动更新。
+便携 ZIP 和源码构建版本不会自动更新。`ast update` 也不会改写直接安装的 macOS
+安装包或 `.deb`/`.rpm` Release 包；请明确安装下一个匹配的 Release 包。
 
 ### Windows 便携 ZIP
 
@@ -111,12 +130,23 @@ ast --no-auto-update
 
 ## Linux
 
-根据机器架构下载对应的 `.tar.gz`：
+根据机器架构下载对应的资产：
 
-| 架构               | 发布目标                    |
-| ------------------ | --------------------------- |
-| Intel 或 AMD 64 位 | `x86_64-unknown-linux-gnu`  |
-| ARM64              | `aarch64-unknown-linux-gnu` |
+- **ARM64：**`asterline-v<version>-Linux-arm64.tar.gz`、
+  `asterline-v<version>-Linux-arm64.deb` 或
+  `asterline-v<version>-Linux-arm64.rpm`。
+- **Intel 或 AMD 64 位（`x86_64`）：**
+  `asterline-v<version>-Linux-x86_64.tar.gz`、
+  `asterline-v<version>-Linux-x86_64.deb` 或
+  `asterline-v<version>-Linux-x86_64.rpm`。
+
+这些 GNU/Linux 发布包使用仍受维护的 glibc 2.28 基线构建，要求 glibc 2.28
+或更高版本，因此不能在 Alpine/musl 上运行。SQLite 由内置源码静态构建，
+无需系统提供 `libsqlite3`。
+
+> 历史例外：现有的 v0.2.3 Linux 归档早于上述发布保证，实际要求 glibc 2.39，
+> 并动态链接系统的 `libsqlite3`。仅应在具备这些运行时依赖时使用；否则请从源码
+> 构建或使用发行版软件包。
 
 解压后，为当前用户安装两个命令：
 
@@ -130,15 +160,37 @@ install -m 755 ast "$HOME/.local/bin/ast"
 
 卸载 Linux 便携版时，删除 `$HOME/.local/bin/ast` 和 `$HOME/.local/bin/asterline` 即可。
 
+### Debian 和 Ubuntu
+
+`.deb` 包已在 Debian 12 和 Ubuntu 24.04 上完成冒烟验证。下载匹配的架构后，在本地安装：
+
+```bash
+sudo apt install ./asterline-v<version>-Linux-x86_64.deb
+ast --help
+```
+
+### Fedora 和 Rocky Linux
+
+`.rpm` 包在 Rocky Linux 8 上构建，并在 Fedora 44 上再次完成冒烟验证。下载匹配的架构后，
+在本地安装：
+
+```bash
+sudo dnf install ./asterline-v<version>-Linux-x86_64.rpm
+ast --help
+```
+
+这些文件是带版本号的 GitHub Release 附件，而不是配置好的 APT 或 DNF 软件源。安装前请先用
+`SHA256SUMS` 和 GitHub artifact attestation 校验下载文件。
+
 ## 从源码构建
 
-安装 Rust 1.85 或更高版本，克隆仓库后运行：
+安装 Rust 1.88 或更高版本，克隆仓库后运行：
 
 ```bash
 cargo install --path . --locked --force
 ```
 
-Cargo 会把两个命令安装到 macOS/Linux 的 `$HOME/.cargo/bin`，或 Windows 的 `%USERPROFILE%\.cargo\bin`。请确认对应目录已经加入 `PATH`。
+Cargo 会把两个命令安装到 macOS/Linux 的 `$HOME/.cargo/bin`，或 Windows 的 `%USERPROFILE%\.cargo\bin`。请确认对应目录已经加入 `PATH`。拉取源码变更后再次运行同一条 Cargo 命令；`ast update` 不会改写源码构建版本。
 
 ## 校验发布包
 

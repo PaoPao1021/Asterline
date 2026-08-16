@@ -18,7 +18,6 @@ pub mod markdown;
 pub mod notify;
 pub mod rollout_import;
 pub mod runs_view;
-pub mod selection;
 pub mod session_picker;
 pub mod skills;
 pub mod status_indicator;
@@ -27,6 +26,7 @@ pub mod team_editor;
 pub mod theme;
 
 use std::io::{self, Read, Write};
+#[cfg(test)]
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use crossterm::clipboard::CopyToClipboard;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyboardEnhancementFlags, MouseButton, MouseEvent,
+    Event, KeyEvent, KeyEventKind, KeyboardEnhancementFlags, MouseButton, MouseEvent,
     MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
@@ -50,18 +50,17 @@ use ratatui::backend::CrosstermBackend;
 use crate::domain::event::{RuntimeEvent, UiCommand};
 use crate::domain::mode::TerminalMode;
 use crate::domain::team::BackendKind;
-use crate::runtime::RuntimeHandle;
+use crate::runtime::{RuntimeCommandSend, RuntimeHandle};
 use crate::tui::app_state::AppState;
-use crate::tui::chat_view::ChatLayout;
 use crate::tui::commands::Submission;
 use crate::tui::keymap::Action;
-use crate::tui::selection::{ChatSelection, MouseSelection};
 use crate::tui::team_editor::TeamEditorOutcome;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_RUNTIME_EVENTS_PER_DRAIN: usize = 1_024;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const RESET_KEYBOARD_TO_LEGACY: &[u8] = b"\x1b[=0u";
+const WHEEL_SCROLL_LINES: i32 = 5;
 
 /// Asterline uses color for backend identity, status, and selection—not only
 /// decoration. Full-screen interactive sessions therefore keep color enabled
@@ -78,8 +77,8 @@ struct TerminalRestore {
     raw_mode: bool,
     keyboard_enhancement: bool,
     alternate_screen: bool,
-    mouse_capture: bool,
     bracketed_paste: bool,
+    mouse_capture: bool,
     legacy_keyboard_reset: bool,
 }
 
@@ -92,13 +91,13 @@ impl TerminalRestore {
             record_cleanup(&mut first_error, execute!(out, PopKeyboardEnhancementFlags));
             self.keyboard_enhancement = false;
         }
-        if self.mouse_capture {
-            record_cleanup(&mut first_error, execute!(out, DisableMouseCapture));
-            self.mouse_capture = false;
-        }
         if self.bracketed_paste {
             record_cleanup(&mut first_error, execute!(out, DisableBracketedPaste));
             self.bracketed_paste = false;
+        }
+        if self.mouse_capture {
+            record_cleanup(&mut first_error, execute!(out, DisableMouseCapture));
+            self.mouse_capture = false;
         }
         if self.alternate_screen {
             record_cleanup(&mut first_error, execute!(out, LeaveAlternateScreen));
@@ -159,17 +158,19 @@ pub fn run(
     enable_raw_mode()?;
     restore.raw_mode = true;
     restore.alternate_screen = true;
-    restore.mouse_capture = true;
     restore.bracketed_paste = true;
+    restore.mouse_capture = true;
+    // Full-screen alternate buffer so the header stays pinned at the top and
+    // the shell's `cargo run` / `ls` output is not mixed into the chat. Mouse
+    // capture is required so the wheel can scroll the chat pane; drag-select
+    // copy is handled in-process via OSC 52 (native selection is unavailable
+    // once the application owns mouse events).
     execute!(
         stdout,
         EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste
+        EnableBracketedPaste,
+        EnableMouseCapture
     )?;
-    // Kitty keeps separate keyboard-mode stacks for the main and alternate
-    // screens. Push only after entering the alternate screen so cleanup pops
-    // the same stack before leaving it.
     let keyboard_enhancement =
         enable_keyboard_enhancement(&mut stdout, keyboard_enhancement_allowed)?;
     restore.keyboard_enhancement = keyboard_enhancement;
@@ -189,7 +190,7 @@ pub fn run(
     // leave the keyboard protocol or raw mode enabled in the user's shell.
     let cleanup = restore.restore();
 
-    handle.send(UiCommand::Shutdown);
+    handle.shutdown();
     result.and(cleanup)
 }
 
@@ -253,24 +254,20 @@ fn run_loop(
     legacy_keyboard_reset: bool,
 ) -> io::Result<()> {
     let notify_enabled = notify::enabled_from_env();
-    let mut drawer_selection = MouseSelection::default();
-    let mut chat_selection = ChatSelection::default();
-    let mut chat_layout: Option<ChatLayout> = None;
+    let mut last_layout = None;
     loop {
         state.poll_team_editor_catalog();
         drain_runtime_events(state, events, notify_enabled);
+        state.warm_model_catalog_once();
+        if let Some(member) = state.take_attach_release_pending()
+            && !handle.finish_attach(member, Vec::new())
+        {
+            state.mark_runtime_unavailable();
+        }
 
-        let screen = terminal
-            .draw(|frame| {
-                chat_layout = chat_view::render(frame, state);
-                if let Some(layout) = chat_layout.as_ref() {
-                    chat_selection.clear_if_width_changed(layout.width);
-                    chat_selection.render(frame.buffer_mut(), layout);
-                }
-                drawer_selection.render(frame.buffer_mut());
-            })?
-            .buffer
-            .clone();
+        terminal.draw(|frame| {
+            last_layout = chat_view::render(frame, state);
+        })?;
 
         if event::poll(POLL_INTERVAL)? {
             match event::read()? {
@@ -281,14 +278,6 @@ fn run_loop(
                         }
                         continue;
                     }
-                    let any_sel = drawer_selection.is_active() || chat_selection.is_active();
-                    if any_sel && key.code == KeyCode::Esc {
-                        drawer_selection.clear();
-                        chat_selection.clear();
-                        continue;
-                    }
-                    drawer_selection.clear();
-                    chat_selection.clear();
                     if handle_team_editor_key(key, state, handle) {
                         continue;
                     }
@@ -296,20 +285,13 @@ fn run_loop(
                         handle_action(action, state, handle);
                     }
                 }
-                Event::Mouse(mouse) => handle_mouse(
-                    mouse,
-                    state,
-                    &mut drawer_selection,
-                    &mut chat_selection,
-                    chat_layout.as_ref(),
-                    &screen,
-                )?,
+                Event::Mouse(mouse) => {
+                    handle_mouse(mouse, state, last_layout.as_ref());
+                }
                 Event::Paste(text) => {
                     if !state.runtime_available() {
                         continue;
                     }
-                    drawer_selection.clear();
-                    chat_selection.clear();
                     if !state.insert_team_editor_text(&text) {
                         state.insert_text(&text);
                     }
@@ -319,19 +301,100 @@ fn run_loop(
         }
 
         if let Some(req) = state.take_attach_request() {
-            attach_to_member(
+            let member = req.member.clone();
+            let result = attach_to_member(
                 terminal,
                 state,
-                handle,
                 &req,
                 keyboard_enhancement,
                 legacy_keyboard_reset,
-            )?;
+            );
+            match result {
+                Ok(outcome) => {
+                    if let Some(notice) = outcome.notice {
+                        state.apply(RuntimeEvent::Notice(notice));
+                    }
+                    if !handle.finish_attach_with_session(member, outcome.session, outcome.items) {
+                        state.mark_runtime_unavailable();
+                    }
+                }
+                Err(err) => {
+                    if !handle.finish_attach(member, Vec::new()) {
+                        state.mark_runtime_unavailable();
+                    }
+                    return Err(err);
+                }
+            }
         }
         if state.should_quit() {
             return Ok(());
         }
     }
+}
+
+fn handle_mouse(mouse: MouseEvent, state: &mut AppState, layout: Option<&chat_view::ChatLayout>) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            if state.drawer().is_some() {
+                state.drawer_scroll_by(-WHEEL_SCROLL_LINES);
+            } else if state.completion().is_some() {
+                for _ in 0..WHEEL_SCROLL_LINES {
+                    state.popup_up();
+                }
+            } else {
+                state.scroll_by(WHEEL_SCROLL_LINES);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if state.drawer().is_some() {
+                state.drawer_scroll_by(WHEEL_SCROLL_LINES);
+            } else if state.completion().is_some() {
+                for _ in 0..WHEEL_SCROLL_LINES {
+                    state.popup_down();
+                }
+            } else {
+                state.scroll_by(-WHEEL_SCROLL_LINES);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if state.drawer().is_some() {
+                return;
+            }
+            match layout.and_then(|layout| {
+                layout
+                    .contains(mouse.column, mouse.row)
+                    .then(|| layout.screen_to_content(mouse.column, mouse.row))
+                    .flatten()
+            }) {
+                Some(pos) => state.begin_chat_selection(pos),
+                None => state.clear_chat_selection(),
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(pos) =
+                layout.and_then(|layout| layout.screen_to_content(mouse.column, mouse.row))
+            {
+                state.update_chat_selection(pos);
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if let (Some(layout), Some(selection)) = (layout, state.chat_selection()) {
+                let text = layout.selected_text(selection);
+                if text.trim().is_empty() {
+                    state.clear_chat_selection();
+                } else {
+                    copy_to_clipboard(&text);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn copy_to_clipboard(text: &str) {
+    let mut out = io::stdout();
+    let _ = execute!(out, CopyToClipboard::to_clipboard_from(text));
+    let _ = execute!(out, CopyToClipboard::to_primary_from(text));
 }
 
 fn handle_team_editor_key(key: KeyEvent, state: &mut AppState, handle: &RuntimeHandle) -> bool {
@@ -350,182 +413,15 @@ fn handle_team_editor_key(key: KeyEvent, state: &mut AppState, handle: &RuntimeH
     }
 }
 
-/// Mouse wheel scrolls the conversation (or the open drawer), a few lines per
-/// tick. Mouse capture keeps wheel events distinct from keyboard arrow keys.
-///
-/// Chat selection is content-anchored and survives wheel scroll. Drawers and
-/// the header/footer status bars use bounded screen-space selection.
-fn handle_mouse(
-    mouse: MouseEvent,
-    state: &mut AppState,
-    drawer_selection: &mut MouseSelection,
-    chat_selection: &mut ChatSelection,
-    chat_layout: Option<&ChatLayout>,
-    screen: &ratatui::buffer::Buffer,
-) -> io::Result<()> {
-    const STEP: usize = 6;
-    const EDGE_SCROLL: usize = 2;
-    match mouse.kind {
-        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-            let up = mouse.kind == MouseEventKind::ScrollUp;
-            if state.drawer().is_some() {
-                drawer_selection.clear();
-                for _ in 0..STEP {
-                    if up {
-                        state.drawer_scroll_up();
-                    } else {
-                        state.drawer_scroll_down();
-                    }
-                }
-            } else {
-                drawer_selection.clear();
-                // Keep chat selection; endpoints stay on the same content.
-                let max_scroll = chat_layout
-                    .map(ChatLayout::max_scroll)
-                    .unwrap_or(usize::MAX);
-                for _ in 0..STEP {
-                    if up {
-                        if state.scroll() < max_scroll {
-                            state.scroll_up();
-                        }
-                    } else {
-                        state.scroll_down();
-                    }
-                }
-            }
-        }
-        MouseEventKind::Down(MouseButton::Left) => {
-            if state.drawer().is_some() {
-                chat_selection.clear();
-                drawer_selection.begin_bounded(
-                    mouse.column,
-                    mouse.row,
-                    drawer_view::drawer_rect(screen.area),
-                );
-            } else {
-                drawer_selection.clear();
-                if let Some(layout) = chat_layout {
-                    if layout.contains(mouse.column, mouse.row) {
-                        if let Some(point) = layout.screen_to_content(mouse.column, mouse.row) {
-                            chat_selection.begin(point, layout.width);
-                        }
-                    } else if let Some(bounds) =
-                        status_bar_at(screen.area, layout, mouse.column, mouse.row)
-                    {
-                        chat_selection.clear();
-                        drawer_selection.begin_bounded(mouse.column, mouse.row, bounds);
-                    } else {
-                        chat_selection.clear();
-                    }
-                } else {
-                    chat_selection.clear();
-                }
-            }
-        }
-        MouseEventKind::Drag(MouseButton::Left) => {
-            if state.drawer().is_some() || drawer_selection.is_active() {
-                drawer_selection.update(mouse.column, mouse.row);
-            } else if chat_selection.is_active()
-                && let Some(layout) = chat_layout
-            {
-                // Drag-to-edge auto-scroll: extend selection across pages.
-                let area = layout.area;
-                let max_scroll = layout.max_scroll();
-                let mut scrolled = 0usize;
-                if !area.is_empty() && mouse.row <= area.y {
-                    for _ in 0..EDGE_SCROLL {
-                        if state.scroll() < max_scroll {
-                            state.scroll_up();
-                            scrolled += 1;
-                        }
-                    }
-                    let first = layout
-                        .first_line
-                        .saturating_sub(scrolled)
-                        .min(layout.lines.len().saturating_sub(1));
-                    let col = layout
-                        .screen_to_content(mouse.column, area.y)
-                        .map(|(_, c)| c)
-                        .unwrap_or(0);
-                    chat_selection.update((first, col));
-                } else if !area.is_empty() && mouse.row >= area.y + area.height.saturating_sub(1) {
-                    for _ in 0..EDGE_SCROLL {
-                        if state.scroll() > 0 {
-                            state.scroll_down();
-                            scrolled += 1;
-                        }
-                    }
-                    let height = area.height as usize;
-                    let last = (layout.first_line + height.saturating_sub(1) + scrolled)
-                        .min(layout.lines.len().saturating_sub(1));
-                    let col = layout
-                        .screen_to_content(mouse.column, area.y + area.height.saturating_sub(1))
-                        .map(|(_, c)| c)
-                        .unwrap_or(0);
-                    chat_selection.update((last, col));
-                } else if let Some(point) = layout.screen_to_content(mouse.column, mouse.row) {
-                    chat_selection.update(point);
-                }
-            }
-        }
-        MouseEventKind::Up(MouseButton::Left) => {
-            if drawer_selection.is_active() {
-                if let Some(text) = drawer_selection.finish(mouse.column, mouse.row, screen) {
-                    execute!(io::stdout(), CopyToClipboard::to_clipboard_from(text))?;
-                }
-            } else if let Some(layout) = chat_layout {
-                // screen_to_content clamps into the chat area.
-                if let Some(point) = layout.screen_to_content(mouse.column, mouse.row)
-                    && let Some(text) = chat_selection.finish(point, layout)
-                {
-                    execute!(io::stdout(), CopyToClipboard::to_clipboard_from(text))?;
-                }
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-/// Return the selectable status region under a screen point. The top status
-/// block ends where the chat begins; the bottom status bar is the last row.
-fn status_bar_at(
-    screen: ratatui::layout::Rect,
-    chat: &ChatLayout,
-    x: u16,
-    y: u16,
-) -> Option<ratatui::layout::Rect> {
-    let header = ratatui::layout::Rect::new(
-        screen.x,
-        screen.y,
-        screen.width,
-        chat.area.y.saturating_sub(screen.y),
-    );
-    let footer = ratatui::layout::Rect::new(
-        screen.x,
-        screen.y.saturating_add(screen.height.saturating_sub(1)),
-        screen.width,
-        u16::from(screen.height > 0),
-    );
-    [header, footer].into_iter().find(|area| {
-        !area.is_empty()
-            && x >= area.x
-            && x < area.x.saturating_add(area.width)
-            && y >= area.y
-            && y < area.y.saturating_add(area.height)
-    })
-}
-
 /// Hand the whole terminal to the member's real interactive CLI (resuming its
 /// session), then restore Asterline when that CLI exits.
 fn attach_to_member(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut AppState,
-    handle: &RuntimeHandle,
     req: &attach::AttachRequest,
     keyboard_enhancement: bool,
     legacy_keyboard_reset: bool,
-) -> io::Result<()> {
+) -> io::Result<attach::AttachOutcome> {
     let (program, args) = req.command();
     let exit_hint = attach_exit_hint();
 
@@ -535,7 +431,7 @@ fn attach_to_member(
         state.apply(RuntimeEvent::Notice(format!(
             "could not attach: {program} is not on PATH"
         )));
-        return Ok(());
+        return Ok(attach::AttachOutcome::default());
     };
 
     // Snapshot the backend transcript so we can import whatever is typed during
@@ -550,22 +446,20 @@ fn attach_to_member(
             &req.cwd,
         ))),
         BackendKind::Claude => Some(AttachSnapshot::Claude(claude_import::snapshot(
-            req.session.as_deref(),
+            req.transcript_session(),
             &req.cwd,
         ))),
         BackendKind::Grok | BackendKind::Agy => None,
     };
 
     // --- Suspend Asterline: hand the real terminal to the child CLI. ---
-    // Restore the cooked terminal, leave our alternate screen, and show the
-    // cursor, flushing so the child starts from a clean, owned main screen.
     let mut out = io::stdout();
     disable_keyboard_enhancement(&mut out, keyboard_enhancement)?;
     disable_raw_mode()?;
     execute!(
         out,
-        DisableBracketedPaste,
         DisableMouseCapture,
+        DisableBracketedPaste,
         LeaveAlternateScreen,
         crossterm::cursor::Show
     )?;
@@ -585,14 +479,15 @@ fn attach_to_member(
         .args(&args)
         .current_dir(&req.cwd)
         .status();
+    let attached_cli_ran = result.is_ok();
 
     // --- Resume Asterline: re-enter the alternate screen and repaint. ---
     enable_raw_mode()?;
     execute!(
         out,
         EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste
+        EnableBracketedPaste,
+        EnableMouseCapture
     )?;
     if keyboard_enhancement {
         execute!(
@@ -607,8 +502,6 @@ fn attach_to_member(
     while event::poll(Duration::from_secs(0))? {
         let _ = event::read()?;
     }
-    // Discard ratatui's cached screen contents so the next draw is a full
-    // repaint over whatever the child CLI left behind.
     terminal.clear()?;
 
     match result {
@@ -624,23 +517,21 @@ fn attach_to_member(
     // Import any messages exchanged in the attached session so they appear in
     // (and persist to) the Asterline transcript. The runtime records them and
     // emits the events the main loop renders.
-    if let Some(snapshot) = snapshot {
-        let imported = match snapshot {
-            AttachSnapshot::Codex(s) => rollout_import::imported_since(s),
-            AttachSnapshot::Claude(s) => claude_import::imported_since(s),
-        };
-        if !imported.is_empty() {
-            send_runtime(
-                state,
-                handle,
-                UiCommand::ImportTranscript {
-                    member: req.member.clone(),
-                    items: imported,
-                },
-            );
+    let mut imported = if attached_cli_ran && let Some(snapshot) = snapshot {
+        match snapshot {
+            AttachSnapshot::Codex(s) => rollout_import::imported_attach_since(s),
+            AttachSnapshot::Claude(s) => claude_import::imported_attach_since(s),
         }
+    } else {
+        attach::AttachOutcome::default()
+    };
+    // The fresh Claude UUID was generated by Asterline and supplied directly
+    // to the successfully launched CLI, so it is a deterministic identity
+    // even if the user exits before Claude writes an importable chat row.
+    if attached_cli_ran && req.backend == BackendKind::Claude && imported.session.is_none() {
+        imported.session = req.fresh_session.clone();
     }
-    Ok(())
+    Ok(imported)
 }
 
 fn attach_exit_hint() -> &'static str {
@@ -730,8 +621,6 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
                 if !state.select_previous_run_step() {
                     state.select_newer_run();
                 }
-            } else if state.drawer() == Some(drawers::Drawer::Skills) {
-                state.select_previous_skill();
             } else if state.drawer() == Some(drawers::Drawer::Resume) {
                 state.select_previous_resume();
             } else if state.drawer().is_some() {
@@ -748,8 +637,6 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
                 if !state.select_next_run_step() {
                     state.select_older_run();
                 }
-            } else if state.drawer() == Some(drawers::Drawer::Skills) {
-                state.select_next_skill();
             } else if state.drawer() == Some(drawers::Drawer::Resume) {
                 state.select_next_resume();
             } else if state.drawer().is_some() {
@@ -768,9 +655,6 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
         Action::NextMember => state.select_next_member(),
         Action::PrevMember => state.select_prev_member(),
         Action::Complete => {
-            if state.drawer() == Some(drawers::Drawer::Skills) && state.stage_selected_skill() {
-                return;
-            }
             if state.drawer() == Some(drawers::Drawer::Runs) && state.stage_selected_run_dispatch()
             {
                 return;
@@ -793,10 +677,7 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
         Action::Interrupt => {
             if !abort_active_work(state, handle) && !state.composer().is_empty() {
                 state.clear_composer();
-            } else if state.running_count() == 0
-                && !state.verification_active()
-                && state.composer().is_empty()
-            {
+            } else if !state.has_cancelable_work() && state.composer().is_empty() {
                 state.request_quit();
             }
         }
@@ -806,9 +687,6 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
                     state.close_drawer();
                     send_runtime(state, handle, command);
                 }
-                return;
-            }
-            if state.drawer() == Some(drawers::Drawer::Skills) && state.stage_selected_skill() {
                 return;
             }
             if state.drawer() == Some(drawers::Drawer::Runs) && state.stage_selected_run_action() {
@@ -821,8 +699,13 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
             }
             if let Some(idx) = state.header_selected() {
                 // Selecting a member and pressing Enter attaches to its live
-                // backend session (hands the terminal to the real codex/claude).
-                state.request_attach(idx);
+                // backend session after the runtime grants an ordered,
+                // globally-quiescent reservation.
+                if let Some(member) = state.request_attach(idx)
+                    && !send_runtime(state, handle, UiCommand::RequestAttach { member })
+                {
+                    state.attach_request_send_failed();
+                }
                 return;
             }
             submit(state, handle);
@@ -831,7 +714,13 @@ fn handle_action(action: Action, state: &mut AppState, handle: &RuntimeHandle) {
 }
 
 fn abort_active_work(state: &mut AppState, handle: &RuntimeHandle) -> bool {
-    if state.running_count() == 0 && !state.verification_active() {
+    if let Some(member) = state.cancel_pending_attach() {
+        if !handle.finish_attach(member, Vec::new()) {
+            state.mark_runtime_unavailable();
+        }
+        return true;
+    }
+    if !state.has_cancelable_work() {
         return false;
     }
     state.disarm_quit();
@@ -854,7 +743,7 @@ fn handle_search_action(action: Action, state: &mut AppState) {
     }
 }
 
-/// Capture the workspace's working-tree git diff, including untracked files
+/// Capture staged and unstaged working-tree changes, including untracked files
 /// (mirrors codex's `/diff`). Returns a human-readable message on failure.
 fn compute_git_diff(workspace: &str) -> String {
     const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
@@ -862,11 +751,7 @@ fn compute_git_diff(workspace: &str) -> String {
     const MAX_UNTRACKED_FILES: usize = 2_000;
 
     let dir = if workspace.is_empty() { "." } else { workspace };
-    let (mut out, diff_truncated) = match run_git_bounded(
-        dir,
-        &["--no-pager", "diff", "--no-ext-diff", "--no-textconv"],
-        MAX_DIFF_BYTES,
-    ) {
+    let (mut out, diff_truncated) = match tracked_git_diff(dir, MAX_DIFF_BYTES) {
         Ok(diff) => diff,
         Err(message) => return message.to_string(),
     };
@@ -892,6 +777,53 @@ fn compute_git_diff(workspace: &str) -> String {
         }
     }
     out
+}
+
+fn tracked_git_diff(dir: &str, limit: usize) -> Result<(String, bool), &'static str> {
+    // Against an existing HEAD this is one coherent patch containing index and
+    // worktree changes. An unborn repository has no HEAD, so fall back to the
+    // two comparisons Git supports there: empty-tree→index and index→worktree.
+    if let Ok(diff) = run_git_bounded(
+        dir,
+        &[
+            "--no-pager",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+            "--",
+        ],
+        limit,
+    ) {
+        return Ok(diff);
+    }
+
+    let (staged, staged_truncated) = run_git_bounded(
+        dir,
+        &[
+            "--no-pager",
+            "diff",
+            "--cached",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--",
+        ],
+        limit,
+    )?;
+    let remaining = limit
+        .saturating_sub(staged.len())
+        .saturating_sub(usize::from(!staged.is_empty()));
+    let (unstaged, unstaged_truncated) = run_git_bounded(
+        dir,
+        &["--no-pager", "diff", "--no-ext-diff", "--no-textconv", "--"],
+        remaining,
+    )?;
+    let mut combined = staged;
+    if !combined.is_empty() && !unstaged.is_empty() {
+        combined.push('\n');
+    }
+    combined.push_str(&unstaged);
+    Ok((combined, staged_truncated || unstaged_truncated))
 }
 
 fn run_git_bounded(dir: &str, args: &[&str], limit: usize) -> Result<(String, bool), &'static str> {
@@ -978,7 +910,36 @@ fn submit(state: &mut AppState, handle: &RuntimeHandle) {
     let text = state.composer().text();
     let mut reset_scroll = true;
     match commands::parse(&text) {
+        Submission::Exit => {
+            state.take_composer();
+            state.quit();
+        }
+        Submission::Attach { member } => {
+            if state.member_backend(&member).is_none() {
+                state.apply(RuntimeEvent::Notice(format!("unknown member: {member}")));
+            } else if let Some(member) = state.request_attach_member_by_name(&member) {
+                if send_runtime(state, handle, UiCommand::RequestAttach { member }) {
+                    state.record_submission(&text);
+                    state.take_composer();
+                } else {
+                    state.attach_request_send_failed();
+                }
+            }
+        }
+        Submission::TargetedSlash { member, body } => {
+            if let Some(command) = state.targeted_skill_command(&member, &body) {
+                if send_runtime(state, handle, command) {
+                    state.record_submission(&text);
+                    state.take_composer();
+                }
+            } else {
+                state.apply(RuntimeEvent::Notice(format!(
+                    "{body} is not a discovered prompt-invocable skill for {member}; use /attach <member> for that backend's native CLI"
+                )));
+            }
+        }
         Submission::Runtime(command) => {
+            let command = state.normalize_known_skill_invocation(command);
             // `/mode` and `/new` can be rejected by the runtime (for example,
             // when persistence fails or work is still active). Apply their UI
             // state only after the corresponding runtime event arrives.
@@ -1005,11 +966,6 @@ fn submit(state: &mut AppState, handle: &RuntimeHandle) {
             if drawer == drawers::Drawer::Diff && state.drawer() != Some(drawers::Drawer::Diff) {
                 let diff = compute_git_diff(state.workspace());
                 state.set_diff(diff);
-            }
-            if drawer == drawers::Drawer::Skills && state.drawer() != Some(drawers::Drawer::Skills)
-            {
-                let workspace = Path::new(state.workspace());
-                state.set_skills(skills::discover(workspace));
             }
             state.toggle_drawer(drawer);
         }
@@ -1103,11 +1059,19 @@ fn drain_runtime_events(
 }
 
 fn send_runtime(state: &mut AppState, handle: &RuntimeHandle, command: UiCommand) -> bool {
-    let sent = handle.send(command);
-    if !sent {
-        state.mark_runtime_unavailable();
+    match handle.try_send(command) {
+        RuntimeCommandSend::Sent => true,
+        RuntimeCommandSend::Full => {
+            state.apply(RuntimeEvent::Notice(
+                "runtime input queue is busy; command was not sent — try again".to_string(),
+            ));
+            false
+        }
+        RuntimeCommandSend::Disconnected => {
+            state.mark_runtime_unavailable();
+            false
+        }
     }
-    sent
 }
 
 /// Titles for attention-needed runtime events (terminal BEL + OSC 9).
@@ -1129,13 +1093,43 @@ fn notify_title_for(event: &RuntimeEvent) -> Option<&'static str> {
 mod tests {
     use super::*;
     use crate::domain::event::{
-        ChatItem, RunId, RunStatus, RunStepStatus, RunStepSummary, RunSummary,
+        ChatItem, MemberStatus, MemberSummary, RunId, RunStatus, RunStepStatus, RunStepSummary,
+        RunSummary,
     };
-    use crate::domain::team::{DefaultTarget, MemberId, TeamConfig};
+    use crate::domain::team::{
+        BackendKind, DefaultTarget, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
+        TeamConfig, TeamMember,
+    };
     use crate::runtime::{self, Runners};
     use crate::store::sqlite::SqliteStore;
     use crate::tui::drawers::Drawer;
+    use std::path::PathBuf;
     use std::sync::mpsc;
+    use std::time::SystemTime;
+
+    fn git_test_repo(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "asterline-diff-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        git_test(&dir, &["init", "--quiet"]);
+        dir
+    }
+
+    fn git_test(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
 
     #[test]
     fn attach_exit_hint_matches_platform_eof_sequence() {
@@ -1154,6 +1148,45 @@ mod tests {
 
         assert_eq!(captured, b"0123");
         assert!(truncated);
+    }
+
+    #[test]
+    fn diff_includes_staged_and_unstaged_changes() {
+        let dir = git_test_repo("head");
+        git_test(&dir, &["config", "user.email", "tests@example.invalid"]);
+        git_test(&dir, &["config", "user.name", "Asterline Tests"]);
+        std::fs::write(dir.join("tracked.txt"), "base\n").unwrap();
+        git_test(&dir, &["add", "tracked.txt"]);
+        git_test(&dir, &["commit", "--quiet", "-m", "base"]);
+
+        std::fs::write(dir.join("tracked.txt"), "unstaged\n").unwrap();
+        std::fs::write(dir.join("staged.txt"), "staged\n").unwrap();
+        git_test(&dir, &["add", "staged.txt"]);
+
+        let diff = compute_git_diff(dir.to_str().unwrap());
+
+        assert!(diff.contains("tracked.txt"));
+        assert!(diff.contains("+unstaged"));
+        assert!(diff.contains("staged.txt"));
+        assert!(diff.contains("+staged"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn diff_handles_unborn_head_and_lists_untracked_files() {
+        let dir = git_test_repo("unborn");
+        std::fs::write(dir.join("new.txt"), "from index\n").unwrap();
+        git_test(&dir, &["add", "new.txt"]);
+        std::fs::write(dir.join("new.txt"), "from index\nfrom worktree\n").unwrap();
+        std::fs::write(dir.join("untracked.txt"), "not added\n").unwrap();
+
+        let diff = compute_git_diff(dir.to_str().unwrap());
+
+        assert!(diff.contains("+from index"));
+        assert!(diff.contains("+from worktree"));
+        assert!(diff.contains("Untracked files:"));
+        assert!(diff.contains("untracked.txt"));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -1244,6 +1277,167 @@ mod tests {
     }
 
     #[test]
+    fn exit_command_quits_the_tui_without_waiting_for_runtime_input() {
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        let mut state = AppState::new(Vec::new());
+        state.insert_text("/exit");
+
+        submit(&mut state, &handle);
+
+        assert!(state.should_quit());
+        assert!(state.composer().is_empty());
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn targeted_attach_opens_the_members_native_session() {
+        let config = TeamConfig::new("test", "/tmp/ws").with_member(TeamMember::new(
+            "builder",
+            "Builder",
+            BackendKind::Codex,
+            "implementation",
+        ));
+        let (event_tx, event_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            config,
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            event_tx,
+            true,
+            true,
+            None,
+        );
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "test".to_string(),
+            workspace: "/tmp/ws".to_string(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            runs: Vec::new(),
+            members: vec![MemberSummary {
+                id: MemberId::new("builder"),
+                display_name: "Builder".to_string(),
+                backend: BackendKind::Codex,
+                role: "implementation".to_string(),
+                status: MemberStatus::Idle,
+                session: None,
+                cwd: String::new(),
+                model: None,
+                effort: None,
+                sandbox: SandboxPolicy::ReadOnly,
+                permission_mode: Some(PermissionMode::Default),
+                session_policy: SessionPolicy::Resume,
+            }],
+        });
+        state.insert_text("@Builder /attach");
+
+        submit(&mut state, &handle);
+
+        assert!(state.composer().is_empty());
+        let granted = (0..4)
+            .filter_map(|_| event_rx.recv_timeout(Duration::from_secs(1)).ok())
+            .find(|event| matches!(event, RuntimeEvent::AttachGranted { .. }))
+            .expect("attach grant");
+        state.apply(granted);
+        let request = state.take_attach_request().expect("native attach request");
+        assert_eq!(request.member, MemberId::new("builder"));
+        assert_eq!(request.display_name, "Builder");
+
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn unknown_targeted_slash_stays_out_of_noninteractive_prompt_delivery() {
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            event_tx,
+            true,
+            true,
+            None,
+        );
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "test".to_string(),
+            workspace: "/tmp/ws".to_string(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            runs: Vec::new(),
+            members: vec![MemberSummary {
+                id: MemberId::new("builder"),
+                display_name: "Builder".to_string(),
+                backend: BackendKind::Codex,
+                role: "implementation".to_string(),
+                status: MemberStatus::Idle,
+                session: None,
+                cwd: String::new(),
+                model: None,
+                effort: None,
+                sandbox: SandboxPolicy::ReadOnly,
+                permission_mode: Some(PermissionMode::Default),
+                session_policy: SessionPolicy::Resume,
+            }],
+        });
+        state.insert_text("@builder /not-a-native-command");
+
+        submit(&mut state, &handle);
+
+        assert_eq!(state.composer().text(), "@builder /not-a-native-command");
+        assert!(matches!(
+            state.chat().last(),
+            Some(ChatItem::Notice { text }) if text.contains("not a discovered prompt-invocable skill")
+        ));
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+    }
+
+    #[test]
+    fn busy_runtime_queue_keeps_draft_without_disabling_input() {
+        let (evt_tx, _evt_rx) = mpsc::sync_channel(0);
+        let (handle, join) = runtime::spawn_bounded(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        // Ready cannot enter the zero-capacity event sink, so the runtime
+        // deliberately stops consuming ordinary UI work. Fill that bounded
+        // queue and exercise the product submit path at its Full boundary.
+        while handle.try_send(UiCommand::Retry) == RuntimeCommandSend::Sent {}
+
+        let mut state = AppState::new(Vec::new());
+        state.insert_text("/retry");
+        submit(&mut state, &handle);
+
+        assert!(state.runtime_available());
+        assert_eq!(state.composer().text(), "/retry");
+        assert!(matches!(
+            state.chat().last(),
+            Some(ChatItem::Notice { text }) if text.contains("queue is busy")
+        ));
+
+        assert_eq!(
+            handle.try_send(UiCommand::Shutdown),
+            RuntimeCommandSend::Sent
+        );
+        join.join().unwrap();
+    }
+
+    #[test]
     fn no_argument_command_with_trailing_text_keeps_state_and_draft() {
         let (evt_tx, _evt_rx) = mpsc::channel();
         let (handle, join) = runtime::spawn(
@@ -1316,17 +1510,52 @@ mod tests {
 
         let mut escape = verifying_state();
         handle_action(Action::CloseOverlay, &mut escape, &handle);
-        assert!(!escape.runtime_available(), "Esc must dispatch /abort");
+        assert!(
+            !escape.runtime_available(),
+            "Esc must dispatch global cancellation"
+        );
 
         let mut interrupt = verifying_state();
         interrupt.insert_text("keep this draft");
         handle_action(Action::Interrupt, &mut interrupt, &handle);
         assert!(
             !interrupt.runtime_available(),
-            "Ctrl+C must dispatch /abort"
+            "Ctrl+C must dispatch global cancellation"
         );
         assert!(!interrupt.should_quit());
         assert_eq!(interrupt.composer().text(), "keep this draft");
+    }
+
+    #[test]
+    fn escape_aborts_paused_route_even_without_running_member() {
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let (handle, join) = runtime::spawn(
+            TeamConfig::new("test", "/tmp/ws"),
+            SqliteStore::in_memory().unwrap(),
+            Runners::new(),
+            evt_tx,
+            true,
+            true,
+            None,
+        );
+        handle.send(UiCommand::Shutdown);
+        let _ = join.join();
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::RoutePaused {
+            turn: crate::domain::event::TurnId(1),
+            from: MemberId::new("builder"),
+            to: vec!["reviewer".to_string()],
+            reason: "relay paused".to_string(),
+            queued: 1,
+        });
+
+        handle_action(Action::CloseOverlay, &mut state, &handle);
+
+        assert!(
+            !state.runtime_available(),
+            "Esc must dispatch global cancellation"
+        );
+        assert_eq!(state.paused_routes(), 0);
     }
 
     #[test]
@@ -1358,126 +1587,6 @@ mod tests {
         let mut bytes = Vec::new();
         assert!(!enable_keyboard_enhancement(&mut bytes, false).unwrap());
         assert!(bytes.is_empty());
-    }
-
-    #[test]
-    fn mouse_wheel_scrolls_chat_independently_of_arrow_history() {
-        let mut state = AppState::new(Vec::new());
-        let mut drawer_selection = MouseSelection::default();
-        let mut chat_selection = ChatSelection::default();
-        // Layout tall enough that STEP (6) scroll-ups are not capped.
-        let layout = ChatLayout {
-            area: ratatui::layout::Rect::new(1, 1, 78, 10),
-            first_line: 0,
-            width: 78,
-            lines: (0..40).map(|i| format!("line {i}")).collect(),
-        };
-        let screen = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 24));
-        let mouse = |kind| MouseEvent {
-            kind,
-            column: 0,
-            row: 0,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        };
-
-        handle_mouse(
-            mouse(MouseEventKind::ScrollUp),
-            &mut state,
-            &mut drawer_selection,
-            &mut chat_selection,
-            Some(&layout),
-            &screen,
-        )
-        .unwrap();
-        assert_eq!(state.scroll(), 6);
-        handle_mouse(
-            mouse(MouseEventKind::ScrollDown),
-            &mut state,
-            &mut drawer_selection,
-            &mut chat_selection,
-            Some(&layout),
-            &screen,
-        )
-        .unwrap();
-        assert_eq!(state.scroll(), 0);
-    }
-
-    #[test]
-    fn mouse_wheel_does_not_clear_chat_selection() {
-        let mut state = AppState::new(Vec::new());
-        let mut drawer_selection = MouseSelection::default();
-        let mut chat_selection = ChatSelection::default();
-        let layout = ChatLayout {
-            area: ratatui::layout::Rect::new(1, 1, 78, 10),
-            first_line: 0,
-            width: 78,
-            lines: (0..40).map(|i| format!("line {i}")).collect(),
-        };
-        chat_selection.begin((2, 0), layout.width);
-        chat_selection.update((5, 3));
-        assert!(chat_selection.is_active());
-        let screen = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 24));
-        handle_mouse(
-            MouseEvent {
-                kind: MouseEventKind::ScrollUp,
-                column: 0,
-                row: 0,
-                modifiers: crossterm::event::KeyModifiers::NONE,
-            },
-            &mut state,
-            &mut drawer_selection,
-            &mut chat_selection,
-            Some(&layout),
-            &screen,
-        )
-        .unwrap();
-        assert!(chat_selection.is_active());
-        assert_eq!(state.scroll(), 6);
-    }
-
-    #[test]
-    fn header_and_footer_status_bars_start_screen_selection() {
-        let mut state = AppState::new(Vec::new());
-        let mut screen_selection = MouseSelection::default();
-        let mut chat_selection = ChatSelection::default();
-        let layout = ChatLayout {
-            area: ratatui::layout::Rect::new(1, 3, 78, 17),
-            first_line: 0,
-            width: 78,
-            lines: vec!["chat".to_string()],
-        };
-        let screen = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 24));
-        let down = |row| MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 4,
-            row,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        };
-
-        handle_mouse(
-            down(1),
-            &mut state,
-            &mut screen_selection,
-            &mut chat_selection,
-            Some(&layout),
-            &screen,
-        )
-        .unwrap();
-        assert!(screen_selection.is_active());
-        assert!(!chat_selection.is_active());
-
-        screen_selection.clear();
-        handle_mouse(
-            down(23),
-            &mut state,
-            &mut screen_selection,
-            &mut chat_selection,
-            Some(&layout),
-            &screen,
-        )
-        .unwrap();
-        assert!(screen_selection.is_active());
-        assert!(!chat_selection.is_active());
     }
 
     #[test]

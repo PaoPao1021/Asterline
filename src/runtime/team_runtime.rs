@@ -39,12 +39,17 @@ use crate::runtime::approval::ApprovalMatcher;
 use crate::runtime::mode_prompts::{
     brainstorm_build_prompt, brainstorm_propose_prompt, brainstorm_stretch_prompt,
     brainstorm_synthesis_prompt, brainstorm_vote_prompt, plan_iteration_prompt, plan_nudge_prompt,
-    plan_plan_prompt, plan_progress_prompt, plan_review_prompt, plan_verify_failure_prompt,
-    review_iteration_prompt, review_prompt, review_task_prompt, step_dispatch_prompt,
-    verdict_nudge_prompt, verify_failure_prompt,
+    plan_plan_prompt, plan_progress_prompt, plan_review_prompt, plan_step_nudge_prompt,
+    plan_verify_failure_prompt, review_iteration_prompt, review_prompt, review_task_prompt,
+    step_dispatch_prompt, verdict_nudge_prompt, verify_failure_prompt,
 };
 use crate::runtime::session_registry::SessionRegistry;
 use crate::store::sqlite::{SqliteStore, StoredConversationSession};
+
+pub(super) const MAX_IMPORTED_ITEMS: usize = 1_000;
+pub(super) const MAX_IMPORTED_ITEM_BYTES: usize = 1024 * 1024;
+pub(super) const MAX_IMPORTED_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ACTIVE_REASONING_BYTES: usize = 8 * 1024;
 
 /// What the core wants the transport layer to do after handling an input.
 #[derive(Default)]
@@ -53,6 +58,7 @@ pub struct RuntimeStep {
     pub actions: Vec<RunAction>,
     pub verify_actions: Vec<VerifyAction>,
     pub runner_changes: Vec<RunnerChange>,
+    pub runner_controls: Vec<RunnerControl>,
     pub persist_team: Option<TeamConfig>,
 }
 
@@ -63,6 +69,17 @@ pub enum RunnerChange {
         workspace: PathBuf,
     },
     Remove(MemberId),
+}
+
+/// A control message for a live backend runner. These are delivered by the
+/// transport outside the pure runtime core, after the corresponding decision
+/// has been durably recorded.
+pub enum RunnerControl {
+    ResolveNativeApproval {
+        member: MemberId,
+        request_id: u64,
+        decision: ApprovalDecision,
+    },
 }
 
 /// A run the transport layer should start for a member.
@@ -98,7 +115,9 @@ struct RunningState {
     turn: TurnId,
     message: Option<MessageId>,
     text: String,
+    reasoning: String,
     failed: bool,
+    raw_persistence_failed: bool,
 }
 
 struct QueuedPrompt {
@@ -151,6 +170,15 @@ struct HeldApproval {
     member_request: Option<(MemberId, TeamMember)>,
 }
 
+/// An approval emitted by a live backend while a turn is already running.
+/// Unlike [`HeldApproval`], approving it resumes the same runner instead of
+/// enqueueing a new prompt.
+struct NativeApproval {
+    member: MemberId,
+    request_id: u64,
+    turn: TurnId,
+}
+
 pub struct TeamRuntime {
     config: TeamConfig,
     store: SqliteStore,
@@ -160,6 +188,7 @@ pub struct TeamRuntime {
     relay_paused: bool,
     paused_routes: VecDeque<PausedRoute>,
     held_approvals: HashMap<ApprovalId, HeldApproval>,
+    native_approvals: HashMap<ApprovalId, NativeApproval>,
     run_turns: HashMap<TurnId, RunId>,
     failed_runs: HashSet<RunId>,
     mode_sessions: HashMap<RunId, ModeSession>,
@@ -171,6 +200,7 @@ pub struct TeamRuntime {
     approvals_enabled: bool,
     matcher: ApprovalMatcher,
     startup_notices: Vec<String>,
+    startup_reconciled: bool,
 }
 
 impl TeamRuntime {
@@ -208,16 +238,19 @@ impl TeamRuntime {
             }
         };
         // In-flight mode runs cannot be resumed losslessly across process restarts.
+        let mut startup_reconciled = true;
         match store.running_mode_runs() {
             Ok(ids) => {
                 for id in ids {
                     if let Err(err) = store.block_run(id, "interrupted by restart") {
+                        startup_reconciled = false;
                         startup_notices
                             .push(format!("could not block interrupted run {id}: {err}"));
                     }
                 }
             }
             Err(err) => {
+                startup_reconciled = false;
                 startup_notices.push(format!("could not inspect interrupted runs: {err}"));
             }
         }
@@ -250,6 +283,7 @@ impl TeamRuntime {
             relay_paused: false,
             paused_routes: VecDeque::new(),
             held_approvals: HashMap::new(),
+            native_approvals: HashMap::new(),
             run_turns: HashMap::new(),
             failed_runs: HashSet::new(),
             mode_sessions: HashMap::new(),
@@ -259,6 +293,7 @@ impl TeamRuntime {
             approvals_enabled: true,
             matcher,
             startup_notices,
+            startup_reconciled,
         };
         let mut runtime = runtime;
         if let Err(err) = runtime.persist_conversation_snapshot() {
@@ -324,6 +359,36 @@ impl TeamRuntime {
 
     pub fn on_ui_command(&mut self, cmd: UiCommand) -> RuntimeStep {
         let mut step = RuntimeStep::default();
+        let requires_reconciled_startup = matches!(
+            &cmd,
+            UiCommand::UserMessage { .. }
+                | UiCommand::Retry
+                | UiCommand::NewSession
+                | UiCommand::ResumeConversation { .. }
+                | UiCommand::RequestAttach { .. }
+                | UiCommand::Approve {
+                    decision: ApprovalDecision::Approve,
+                    ..
+                }
+                | UiCommand::ResolvePausedRoute { resume: true }
+                | UiCommand::ContinueRun { .. }
+                | UiCommand::VerifyRun { .. }
+                | UiCommand::RunMode { .. }
+        );
+        if requires_reconciled_startup && !self.startup_reconciled {
+            let reason = "cannot change chats or dispatch work because interrupted runs were not reconciled; restart after fixing SQLite persistence"
+                .to_string();
+            match &cmd {
+                UiCommand::RequestAttach { member } => {
+                    step.events.push(RuntimeEvent::AttachDenied {
+                        member: member.clone(),
+                        reason,
+                    });
+                }
+                _ => step.events.push(RuntimeEvent::Notice(reason)),
+            }
+            return step;
+        }
         match cmd {
             UiCommand::SetMode { mode } => {
                 let previous = self.active_mode;
@@ -364,53 +429,6 @@ impl TeamRuntime {
             UiCommand::ResolvePausedRoute { resume } => {
                 self.resolve_next_paused_route(resume, &mut step)
             }
-            UiCommand::SetEffort { member, effort } => {
-                match self
-                    .config
-                    .find(member.as_str())
-                    .map(|m| (m.id.clone(), m.backend))
-                {
-                    Some((id, BackendKind::Agy))
-                        if !matches!(effort, Effort::Low | Effort::Medium | Effort::High) =>
-                    {
-                        step.events.push(RuntimeEvent::Notice(format!(
-                            "{id} uses agy, which supports low, medium, or high effort"
-                        )));
-                    }
-                    Some((id, backend))
-                        if effort == Effort::Ultra && backend != BackendKind::Codex =>
-                    {
-                        step.events.push(RuntimeEvent::Notice(format!(
-                            "{id} uses {backend}, which does not support ultra effort"
-                        )));
-                    }
-                    Some((id, _)) => {
-                        if let Some(state) = self.members.get_mut(&id) {
-                            state.effort = Some(effort);
-                        }
-                        if let Some(member) = self
-                            .config
-                            .members
-                            .iter_mut()
-                            .find(|member| member.id == id)
-                        {
-                            member.effort = Some(effort);
-                        }
-                        self.persist_snapshot_or_notice("save member effort", &mut step);
-                        step.events.push(RuntimeEvent::MemberEffort {
-                            member: id.clone(),
-                            effort,
-                        });
-                        step.events.push(RuntimeEvent::Notice(format!(
-                            "{id} reasoning effort → {}",
-                            effort.as_str()
-                        )));
-                    }
-                    None => step
-                        .events
-                        .push(RuntimeEvent::Notice(format!("unknown member: {member}"))),
-                }
-            }
             UiCommand::ReplaceTeam {
                 members,
                 default_target,
@@ -428,12 +446,17 @@ impl TeamRuntime {
             UiCommand::ResumeConversation { conversation } => {
                 self.handle_resume_conversation(conversation, &mut step)
             }
-            UiCommand::ImportTranscript { member, items } => {
-                self.handle_import_transcript(member, items, &mut step)
-            }
-            UiCommand::BindAttachedSession { member, session } => {
-                self.handle_bind_attached_session(member, session, &mut step)
-            }
+            // Transcript import is valid only through the transport's matching
+            // AttachFinished reservation. Keep the public legacy command from
+            // bypassing that trust boundary when the core is used directly.
+            UiCommand::ImportTranscript { .. } => step.events.push(RuntimeEvent::Notice(
+                "ignored direct transcript import without an attach reservation".to_string(),
+            )),
+            UiCommand::RequestAttach { member } => self.handle_request_attach(member, &mut step),
+            // The transport owns the attach reservation. A stray completion
+            // delivered directly to the synchronous core is intentionally a
+            // no-op.
+            UiCommand::AttachFinished { .. } => {}
             UiCommand::ContinueRun { run_id, note } => {
                 self.handle_continue_run(run_id, note, &mut step)
             }
@@ -475,6 +498,22 @@ impl TeamRuntime {
         step
     }
 
+    /// Import the transcript owned by a transport-validated attach completion.
+    /// The transport calls this only while the matching reservation is held.
+    pub(super) fn import_attached_transcript(
+        &mut self,
+        member: MemberId,
+        session: Option<AgentSessionId>,
+        items: Vec<ImportedMessage>,
+    ) -> RuntimeStep {
+        let mut step = RuntimeStep::default();
+        if let Some(session) = session {
+            self.record_member_session(&member, session, &mut step);
+        }
+        self.handle_import_transcript(member, items, &mut step);
+        step
+    }
+
     fn handle_active_user_message(
         &mut self,
         target: MessageTarget,
@@ -482,6 +521,16 @@ impl TeamRuntime {
         step: &mut RuntimeStep,
     ) {
         self.last_user = Some((target.clone(), body.clone()));
+        // A collaboration run owns its orchestration task, but an explicit
+        // member route is still a normal, one-to-one instruction.  Do not
+        // reinterpret it as a second mode task while the run is active.
+        if !matches!(self.active_mode, TerminalMode::Normal)
+            && matches!(target, MessageTarget::Member(_))
+            && !self.mode_sessions.is_empty()
+        {
+            self.handle_user_message(target, body, step);
+            return;
+        }
         let task = strip_routing_prefix(&body);
         match self.active_mode {
             TerminalMode::Normal => {
@@ -605,6 +654,30 @@ impl TeamRuntime {
     fn handle_cancel(&mut self, member: Option<MemberId>, step: &mut RuntimeStep) {
         let mut cancelled_approval_turns = Vec::new();
         let mut cancelled_route_turns = HashSet::new();
+        let native_approval_ids: Vec<ApprovalId> = self
+            .native_approvals
+            .iter()
+            .filter(|(_, held)| member.as_ref().is_none_or(|target| target == &held.member))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in native_approval_ids {
+            let Some(held) = self.native_approvals.remove(&id) else {
+                continue;
+            };
+            if let Err(err) = self.store.resolve_approval(id, ApprovalDecision::Reject) {
+                self.report_store_error("cancel a native approval", err, step);
+            }
+            step.events.push(RuntimeEvent::ApprovalResolved {
+                id,
+                decision: ApprovalDecision::Reject,
+            });
+            step.runner_controls
+                .push(RunnerControl::ResolveNativeApproval {
+                    member: held.member,
+                    request_id: held.request_id,
+                    decision: ApprovalDecision::Reject,
+                });
+        }
         let targets: Vec<MemberId> = match member {
             Some(m) => vec![m],
             None => {
@@ -625,6 +698,8 @@ impl TeamRuntime {
                     self.block_mode_run(run_id, "aborted by user", step);
                 }
                 cancelled_route_turns.extend(self.paused_routes.drain(..).map(|route| route.turn));
+                step.events
+                    .push(RuntimeEvent::RouteQueueUpdated { queued: 0 });
                 for (id, held) in std::mem::take(&mut self.held_approvals) {
                     cancelled_approval_turns.push(held.turn);
                     if let Err(err) = self.store.resolve_approval(id, ApprovalDecision::Reject) {
@@ -675,7 +750,7 @@ impl TeamRuntime {
     fn handle_new_session(&mut self, step: &mut RuntimeStep) {
         if self.has_active_work() {
             step.events.push(RuntimeEvent::Notice(
-                "cannot start a new chat while members or runs are active; use /abort first"
+                "cannot start a new chat while members or runs are active; press Esc to cancel work first"
                     .to_string(),
             ));
             return;
@@ -688,7 +763,14 @@ impl TeamRuntime {
         }
         // A fresh chat: a new conversation (so the transcript starts clean and
         // restart shows only this chat) plus new backend sessions for everyone.
-        match self.store.create_and_set_conversation() {
+        let mut snapshot_team = strip_team_protocols(self.config.clone());
+        for member in &mut snapshot_team.members {
+            member.session_id = None;
+        }
+        match self
+            .store
+            .create_fresh_conversation(&snapshot_team, TerminalMode::Normal)
+        {
             Ok(_) => {}
             Err(err) => {
                 step.events.push(RuntimeEvent::Notice(format!(
@@ -699,25 +781,20 @@ impl TeamRuntime {
         }
         let previous_mode = self.active_mode;
         self.active_mode = TerminalMode::Normal;
-        for id in self.config.all_member_ids() {
-            self.sessions.clear(&id);
-            if let Err(err) = self.store.delete_session(&id) {
-                self.report_store_error("clear a member session", err, step);
-            }
+        self.sessions = SessionRegistry::new();
+        for member in &mut self.config.members {
+            member.session_id = None;
         }
         // Drop any in-flight turn state from the previous chat.
         self.paused_routes.clear();
         self.held_approvals.clear();
-        self.persist_snapshot_or_notice("save the new chat", step);
+        self.last_user = None;
         if previous_mode != TerminalMode::Normal {
             step.events.push(RuntimeEvent::ModeChanged {
                 mode: TerminalMode::Normal,
             });
         }
         step.events.push(RuntimeEvent::SessionReset);
-        step.events.push(RuntimeEvent::Notice(
-            "started a new chat in normal mode — fresh session for all members".to_string(),
-        ));
     }
 
     fn handle_request_resume(&self, step: &mut RuntimeStep) {
@@ -735,7 +812,7 @@ impl TeamRuntime {
     fn handle_resume_conversation(&mut self, conversation: i64, step: &mut RuntimeStep) {
         if self.has_active_work() {
             step.events.push(RuntimeEvent::Notice(
-                "cannot resume another chat while members or runs are active; use /abort first"
+                "cannot resume another chat while members or runs are active; press Esc to cancel work first"
                     .to_string(),
             ));
             return;
@@ -855,12 +932,18 @@ impl TeamRuntime {
     }
 
     fn persist_conversation_snapshot(&self) -> crate::store::sqlite::Result<()> {
+        self.persist_conversation_snapshot_for(&self.config)
+    }
+
+    fn persist_conversation_snapshot_for(
+        &self,
+        config: &TeamConfig,
+    ) -> crate::store::sqlite::Result<()> {
         if self.store.active_conversation() <= 0 {
             return Ok(());
         }
-        let team = strip_team_protocols(self.config.clone());
-        let sessions = self
-            .config
+        let team = strip_team_protocols(config.clone());
+        let sessions = config
             .members
             .iter()
             .filter_map(|member| {
@@ -875,71 +958,6 @@ impl TeamRuntime {
             .collect::<Vec<_>>();
         self.store
             .save_conversation_snapshot(&team, &sessions, self.active_mode)
-    }
-
-    fn handle_bind_attached_session(
-        &mut self,
-        member: MemberId,
-        session: AgentSessionId,
-        step: &mut RuntimeStep,
-    ) {
-        if self.config.member(&member).is_none() {
-            step.events
-                .push(RuntimeEvent::Notice(format!("unknown member: {member}")));
-            return;
-        }
-        if self.members.get(&member).is_some_and(|state| {
-            state.status != MemberStatus::Idle || state.running.is_some() || !state.queue.is_empty()
-        }) {
-            step.events.push(RuntimeEvent::Notice(format!(
-                "cannot bind an attached session while {member} is active"
-            )));
-            return;
-        }
-        if session.0.is_empty()
-            || session.0.len() > 4_096
-            || session.0.chars().any(char::is_control)
-        {
-            step.events.push(RuntimeEvent::Notice(format!(
-                "invalid attached session id for {member}"
-            )));
-            return;
-        }
-        if self.sessions.get(&member).as_ref() == Some(&session) {
-            return;
-        }
-
-        let sessions = self
-            .config
-            .members
-            .iter()
-            .filter_map(|candidate| {
-                let session_id = if candidate.id == member {
-                    Some(session.0.clone())
-                } else {
-                    self.sessions.get(&candidate.id).map(|value| value.0)
-                }?;
-                Some(StoredConversationSession {
-                    member: candidate.id.clone(),
-                    backend: candidate.backend,
-                    session_id,
-                })
-            })
-            .collect::<Vec<_>>();
-        let raw_config = strip_team_protocols(self.config.clone());
-        if let Err(err) = self.store.replace_runtime_team_state(
-            &self.config,
-            &raw_config,
-            &sessions,
-            self.active_mode,
-            &[],
-        ) {
-            self.report_store_error("bind the attached session", err, step);
-            return;
-        }
-        self.sessions.set(member.clone(), session.clone());
-        step.events
-            .push(RuntimeEvent::SessionUpdated { member, session });
     }
 
     fn persist_snapshot_or_notice(&self, context: &str, step: &mut RuntimeStep) {
@@ -959,8 +977,27 @@ impl TeamRuntime {
             .any(|state| state.running.is_some() || !state.queue.is_empty())
             || !self.paused_routes.is_empty()
             || !self.held_approvals.is_empty()
+            || !self.native_approvals.is_empty()
             || !self.run_turns.is_empty()
             || !self.mode_sessions.is_empty()
+    }
+
+    fn handle_request_attach(&self, member: MemberId, step: &mut RuntimeStep) {
+        if self.config.member(&member).is_none() {
+            let reason = format!("cannot attach: unknown member {member}");
+            step.events
+                .push(RuntimeEvent::AttachDenied { member, reason });
+            return;
+        }
+        if self.has_active_work() {
+            step.events.push(RuntimeEvent::AttachDenied {
+                member,
+                reason: "cannot attach while member work, verification, routing, approval, or a run is active; press Esc to cancel it or resolve it first"
+                    .to_string(),
+            });
+            return;
+        }
+        step.events.push(RuntimeEvent::AttachGranted { member });
     }
 
     fn handle_replace_team(
@@ -1214,7 +1251,39 @@ impl TeamRuntime {
                 .push(RuntimeEvent::Notice(format!("unknown member: {member}")));
             return;
         };
-        if items.is_empty() {
+        let original_count = items.len();
+        let mut retained_bytes = 0_usize;
+        let mut truncated = false;
+        let mut oversized_items = 0_usize;
+        let mut retained = Vec::with_capacity(original_count.min(MAX_IMPORTED_ITEMS));
+        for (index, item) in items.into_iter().enumerate() {
+            if index == MAX_IMPORTED_ITEMS {
+                truncated = true;
+                break;
+            }
+            if item.text.len() > MAX_IMPORTED_ITEM_BYTES {
+                truncated = true;
+                oversized_items = oversized_items.saturating_add(1);
+                continue;
+            }
+            let remaining = MAX_IMPORTED_TOTAL_BYTES.saturating_sub(retained_bytes);
+            if remaining == 0 || item.text.len() > remaining {
+                truncated = true;
+                break;
+            }
+            retained_bytes = retained_bytes.saturating_add(item.text.len());
+            retained.push(item);
+            if retained_bytes == MAX_IMPORTED_TOTAL_BYTES {
+                truncated |= retained.len() < original_count;
+                break;
+            }
+        }
+        if retained.is_empty() {
+            if truncated {
+                step.events.push(RuntimeEvent::Notice(format!(
+                    "attached transcript from {id} exceeded import limits and contained no retainable messages (skipped {oversized_items} oversized message(s))"
+                )));
+            }
             return;
         }
         let turn = match self.store.create_turn() {
@@ -1227,9 +1296,9 @@ impl TeamRuntime {
         };
         let display = self.member_display(&id);
         let backend = self.member_backend(&id);
-        let count = items.len();
+        let count = retained.len();
         step.events.push(RuntimeEvent::TurnStarted { turn });
-        for item in items {
+        for item in retained {
             if item.from_user {
                 if let Err(err) =
                     self.store
@@ -1266,6 +1335,11 @@ impl TeamRuntime {
         step.events.push(RuntimeEvent::Notice(format!(
             "imported {count} message(s) from {id}'s attached session"
         )));
+        if truncated || count < original_count {
+            step.events.push(RuntimeEvent::Notice(format!(
+                "attached transcript from {id} was truncated to {count} message(s) and {retained_bytes} bytes; skipped {oversized_items} oversized message(s)"
+            )));
+        }
         step.events.push(RuntimeEvent::TurnFinished { turn });
     }
 
@@ -1275,6 +1349,33 @@ impl TeamRuntime {
         decision: ApprovalDecision,
         step: &mut RuntimeStep,
     ) {
+        if let Some(held) = self.native_approvals.remove(&id) {
+            match self.store.resolve_approval(id, decision) {
+                Ok(true) => step
+                    .events
+                    .push(RuntimeEvent::ApprovalResolved { id, decision }),
+                Ok(false) => {
+                    step.events
+                        .push(RuntimeEvent::Notice(format!("no pending approval {id}")));
+                    return;
+                }
+                Err(err) => {
+                    // Keep the in-memory request alive if its durable row
+                    // could not be updated. The runner remains paused, so the
+                    // user can safely retry rather than silently continuing.
+                    self.native_approvals.insert(id, held);
+                    self.report_store_error("resolve a native approval", err, step);
+                    return;
+                }
+            }
+            step.runner_controls
+                .push(RunnerControl::ResolveNativeApproval {
+                    member: held.member,
+                    request_id: held.request_id,
+                    decision,
+                });
+            return;
+        }
         if decision == ApprovalDecision::Approve
             && let Some(run_id) = self.held_approvals.get(&id).and_then(|held| held.mode_run)
         {
@@ -1400,9 +1501,14 @@ impl TeamRuntime {
     fn resolve_next_paused_route(&mut self, resume: bool, step: &mut RuntimeStep) {
         let Some(route) = self.paused_routes.pop_front() else {
             step.events
+                .push(RuntimeEvent::RouteQueueUpdated { queued: 0 });
+            step.events
                 .push(RuntimeEvent::Notice("no paused routes".to_string()));
             return;
         };
+        step.events.push(RuntimeEvent::RouteQueueUpdated {
+            queued: self.paused_routes.len(),
+        });
         if resume {
             step.events.push(RuntimeEvent::Notice(format!(
                 "resumed route {} -> {}",
@@ -1447,10 +1553,14 @@ impl TeamRuntime {
                     step.events.push(RuntimeEvent::MessageDelta { msg, text });
                 }
             }
-            AgentEvent::Reasoning(text) => step.events.push(RuntimeEvent::Reasoning {
-                member: member.clone(),
-                text: bounded_text(&text, MAX_MESSAGE_TEXT_BYTES),
-            }),
+            AgentEvent::Reasoning(text) => {
+                if let Some(text) = self.append_reasoning(member, &text) {
+                    step.events.push(RuntimeEvent::Reasoning {
+                        member: member.clone(),
+                        text,
+                    });
+                }
+            }
             AgentEvent::MessageCompleted(text) => self.complete_message(member, text, &mut step),
             AgentEvent::ToolStarted { id, name, summary } => {
                 if let Some(state) = self.members.get_mut(member) {
@@ -1526,35 +1636,83 @@ impl TeamRuntime {
                     output,
                 });
             }
-            AgentEvent::FileChange { files, ok: _ } => {
+            AgentEvent::FileChange { files, ok } => {
                 if let Some(turn) = self.running_turn(member)
-                    && let Err(err) = self.store.record_diff(turn, member, &files)
+                    && let Err(err) = self.store.record_diff(turn, member, &files, ok)
                 {
                     self.report_store_error("save a file change", err, &mut step);
                 }
                 step.events.push(RuntimeEvent::FileChange {
                     member: member.clone(),
                     files,
+                    ok,
                 });
             }
             AgentEvent::SessionDiscovered(session) => {
-                // Backends may report the session id more than once per turn;
-                // only persist and surface it when it actually changes.
-                if self.sessions.get(member).as_ref() != Some(&session) {
-                    let backend = self.member_backend(member);
-                    self.sessions.set(member.clone(), session.clone());
-                    if let Err(err) = self.store.upsert_session(member, backend, &session) {
-                        self.report_store_error("save a member session", err, &mut step);
+                self.record_member_session(member, session, &mut step);
+            }
+            AgentEvent::NativeApprovalRequested {
+                request_id,
+                action,
+                body,
+            } => {
+                let Some(turn) = self.running_turn(member) else {
+                    step.runner_controls
+                        .push(RunnerControl::ResolveNativeApproval {
+                            member: member.clone(),
+                            request_id,
+                            decision: ApprovalDecision::Reject,
+                        });
+                    return step;
+                };
+                match self
+                    .store
+                    .insert_approval(Some(turn), Some(member), &action, &body)
+                {
+                    Ok(id) => {
+                        self.native_approvals.insert(
+                            id,
+                            NativeApproval {
+                                member: member.clone(),
+                                request_id,
+                                turn,
+                            },
+                        );
+                        step.events.push(RuntimeEvent::ApprovalRequested {
+                            id,
+                            member: Some(member.clone()),
+                            action,
+                            body,
+                        });
                     }
-                    self.persist_snapshot_or_notice("save the chat session", &mut step);
-                    step.events.push(RuntimeEvent::SessionUpdated {
-                        member: member.clone(),
-                        session,
-                    });
+                    Err(err) => {
+                        self.report_store_error("save a native approval request", err, &mut step);
+                        step.runner_controls
+                            .push(RunnerControl::ResolveNativeApproval {
+                                member: member.clone(),
+                                request_id,
+                                decision: ApprovalDecision::Reject,
+                            });
+                    }
                 }
             }
             AgentEvent::Raw(line) => {
+                let persistence_disabled = self
+                    .members
+                    .get(member)
+                    .and_then(|state| state.running.as_ref())
+                    .is_some_and(|running| running.raw_persistence_failed);
+                if persistence_disabled {
+                    return step;
+                }
                 if let Err(err) = self.store.record_stream_event(member, &line) {
+                    if let Some(running) = self
+                        .members
+                        .get_mut(member)
+                        .and_then(|state| state.running.as_mut())
+                    {
+                        running.raw_persistence_failed = true;
+                    }
                     self.report_store_error("save a raw stream event", err, &mut step);
                 }
             }
@@ -1607,7 +1765,31 @@ impl TeamRuntime {
         step
     }
 
+    /// Persist and surface a backend session only when it changed. Both stream
+    /// events and a transcript-proven native attach use this path.
+    fn record_member_session(
+        &mut self,
+        member: &MemberId,
+        session: AgentSessionId,
+        step: &mut RuntimeStep,
+    ) {
+        if self.sessions.get(member).as_ref() == Some(&session) {
+            return;
+        }
+        let backend = self.member_backend(member);
+        self.sessions.set(member.clone(), session.clone());
+        if let Err(err) = self.store.upsert_session(member, backend, &session) {
+            self.report_store_error("save a member session", err, step);
+        }
+        self.persist_snapshot_or_notice("save the chat session", step);
+        step.events.push(RuntimeEvent::SessionUpdated {
+            member: member.clone(),
+            session,
+        });
+    }
+
     fn log(&self, _member: &MemberId, entry: LogEntry, step: &mut RuntimeStep) {
+        let entry = entry.bounded();
         if let Err(err) = self.store.record_log(&entry) {
             step.events.push(RuntimeEvent::Log(LogEntry::error(
                 "store",
@@ -1648,7 +1830,20 @@ impl TeamRuntime {
             return;
         };
 
-        let text = bounded_text(&text, MAX_MESSAGE_TEXT_BYTES);
+        let supplied_text = bounded_text(&text, MAX_MESSAGE_TEXT_BYTES);
+        // Deltas are the only final text supplied by some otherwise-valid
+        // streaming transports. Never replace a visible streamed answer with
+        // an empty terminal event just because that transport omits its
+        // canonical text field.
+        let text = if supplied_text.is_empty() {
+            self.members
+                .get(member)
+                .and_then(|state| state.running.as_ref())
+                .map(|running| running.text.clone())
+                .unwrap_or(supplied_text)
+        } else {
+            supplied_text
+        };
         let parsed = parse_agent_output(&text);
         for warning in &parsed.warnings {
             self.log(
@@ -1656,6 +1851,32 @@ impl TeamRuntime {
                 LogEntry::warn(member.as_str(), warning.clone()),
                 step,
             );
+        }
+
+        let has_controls = !parsed.messages.is_empty()
+            || !parsed.members.is_empty()
+            || !parsed.run_steps.is_empty()
+            || !parsed.reviews.is_empty()
+            || !parsed.brainstorm_votes.is_empty()
+            || !parsed.brainstorm_cards.is_empty();
+        if has_controls {
+            let raw_persistence_failed = self
+                .members
+                .get(member)
+                .and_then(|state| state.running.as_ref())
+                .is_some_and(|running| running.raw_persistence_failed);
+            if raw_persistence_failed {
+                step.events.push(RuntimeEvent::Notice(format!(
+                    "ignored controls from {member} because their raw source could not be saved"
+                )));
+                self.fail_completed_message(member, msg, step);
+                return;
+            }
+            if let Err(err) = self.store.record_agent_control_source(turn, member, &text) {
+                self.report_store_error("save an agent control source", err, step);
+                self.fail_completed_message(member, msg, step);
+                return;
+            }
         }
 
         let visible_text =
@@ -1668,20 +1889,10 @@ impl TeamRuntime {
                     .record_agent(turn, member, &display, backend, &visible_text)
             {
                 self.report_store_error("save an agent message", err, step);
-                if let Some(state) = self.members.get_mut(member)
-                    && let Some(running) = &mut state.running
-                {
-                    running.failed = true;
-                    running.message = None;
-                    running.text.clear();
-                }
                 // Streaming deltas are provisional until the canonical message
                 // is durable. Clear them and do not execute controls from an
                 // output that is absent from the audit trail.
-                step.events.push(RuntimeEvent::MessageCompleted {
-                    msg,
-                    text: String::new(),
-                });
+                self.fail_completed_message(member, msg, step);
                 return;
             }
         }
@@ -1708,6 +1919,25 @@ impl TeamRuntime {
         for tmsg in parsed.messages {
             self.route_team_message(member, turn, tmsg, step);
         }
+    }
+
+    fn fail_completed_message(
+        &mut self,
+        member: &MemberId,
+        msg: MessageId,
+        step: &mut RuntimeStep,
+    ) {
+        if let Some(state) = self.members.get_mut(member)
+            && let Some(running) = &mut state.running
+        {
+            running.failed = true;
+            running.message = None;
+            running.text.clear();
+        }
+        step.events.push(RuntimeEvent::MessageCompleted {
+            msg,
+            text: String::new(),
+        });
     }
 
     fn request_team_member_from_agent(
@@ -2194,7 +2424,9 @@ impl TeamRuntime {
                 turn,
                 message: None,
                 text: String::new(),
+                reasoning: String::new(),
                 failed: false,
+                raw_persistence_failed: false,
             });
             state.status = MemberStatus::Running;
             state.tools.clear();
@@ -2346,6 +2578,7 @@ impl TeamRuntime {
         in_members
             || self.paused_routes.iter().any(|r| r.turn == turn)
             || self.held_approvals.values().any(|h| h.turn == turn)
+            || self.native_approvals.values().any(|h| h.turn == turn)
     }
 
     // === small helpers ==================================================
@@ -2356,6 +2589,30 @@ impl TeamRuntime {
             .and_then(|state| state.running.as_mut())
             .and_then(|running| {
                 append_bounded_text(&mut running.text, text, MAX_MESSAGE_TEXT_BYTES)
+            })
+    }
+
+    fn append_reasoning(&mut self, member: &MemberId, text: &str) -> Option<String> {
+        let text = bounded_text(text, MAX_ACTIVE_REASONING_BYTES);
+        if text.is_empty() {
+            return None;
+        }
+        self.members
+            .get_mut(member)
+            .and_then(|state| state.running.as_mut())
+            .and_then(|running| {
+                if text.starts_with(running.reasoning.as_str()) {
+                    if text == running.reasoning {
+                        return None;
+                    }
+                    running.reasoning = text;
+                    return Some(running.reasoning.clone());
+                }
+                if running.reasoning.ends_with(&text) {
+                    return None;
+                }
+                append_bounded_text(&mut running.reasoning, &text, MAX_ACTIVE_REASONING_BYTES)
+                    .map(|_| running.reasoning.clone())
             })
     }
 
@@ -2431,15 +2688,10 @@ fn strip_routing_prefix(prompt: &str) -> String {
     prompt.to_string()
 }
 
-/// Asterline exposes a consistent `@member /skill` composer syntax. Codex's
-/// non-interactive skill invocation uses `$skill`; the other backends accept
-/// the slash form directly.
-fn normalize_backend_command(backend: BackendKind, prompt: String) -> String {
-    if backend == BackendKind::Codex
-        && let Some(command) = prompt.strip_prefix('/')
-    {
-        return format!("${command}");
-    }
+/// Do not rewrite a member's text based only on its first character. Native
+/// controls and skills have different grammars; the TUI inserts an exact skill
+/// invocation (for example `$review` for Codex) when it knows one.
+fn normalize_backend_command(_backend: BackendKind, prompt: String) -> String {
     prompt
 }
 

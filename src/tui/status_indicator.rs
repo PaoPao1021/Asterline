@@ -40,6 +40,7 @@ pub(crate) fn fmt_elapsed_compact(secs: u64) -> String {
 pub(crate) fn member_activity_text(
     status: MemberStatus,
     reasoning: Option<&str>,
+    show_reasoning: bool,
     elapsed_secs: Option<u64>,
     spin: &str,
     runtime_profile: Option<&str>,
@@ -47,6 +48,9 @@ pub(crate) fn member_activity_text(
     let runtime_profile = runtime_profile.filter(|text| !text.is_empty());
     if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
         let context = activity_context(elapsed_secs, runtime_profile);
+        if !show_reasoning {
+            return format!("{spin} Thinking{context} · Ctrl+T expand");
+        }
         return format!("{spin} Thinking{context}: {reasoning}");
     }
 
@@ -91,20 +95,34 @@ pub(crate) fn running_footer_text(
     names: &[String],
     spin: &str,
 ) -> Option<String> {
-    if running_count == 0 {
+    footer_text("Working", running_count, elapsed_secs, names, spin)
+}
+
+pub(crate) fn active_footer_text(
+    active_count: usize,
+    elapsed_secs: Option<u64>,
+    names: &[String],
+    spin: &str,
+) -> Option<String> {
+    footer_text("Active", active_count, elapsed_secs, names, spin)
+}
+
+fn footer_text(
+    label: &str,
+    count: usize,
+    elapsed_secs: Option<u64>,
+    names: &[String],
+    spin: &str,
+) -> Option<String> {
+    if count == 0 {
         return None;
     }
 
-    let noun = if running_count == 1 {
-        "member"
-    } else {
-        "members"
-    };
+    let noun = if count == 1 { "member" } else { "members" };
     let elapsed = elapsed_secs
         .map(fmt_elapsed_compact)
         .unwrap_or_else(|| "0s".to_string());
-    let mut text =
-        format!("{spin} Working {running_count} {noun} ({elapsed} • Esc/Ctrl+C to interrupt)");
+    let mut text = format!("{spin} {label} {count} {noun} ({elapsed} • Esc/Ctrl+C to interrupt)");
     if !names.is_empty() {
         text.push_str(" · ");
         text.push_str(&names.join(", "));
@@ -126,13 +144,14 @@ mod tests {
     #[test]
     fn activity_text_keeps_interrupt_hint_stable() {
         assert_eq!(
-            member_activity_text(MemberStatus::Running, None, Some(64), "⠋", None),
+            member_activity_text(MemberStatus::Running, None, true, Some(64), "⠋", None),
             "⠋ Working (1m 04s • Esc/Ctrl+C to interrupt)"
         );
         assert_eq!(
             member_activity_text(
                 MemberStatus::Running,
                 Some("reading files"),
+                true,
                 Some(64),
                 "⠋",
                 None
@@ -142,7 +161,19 @@ mod tests {
         assert_eq!(
             member_activity_text(
                 MemberStatus::Running,
+                Some("reading files"),
+                false,
+                Some(64),
+                "⠋",
+                None
+            ),
+            "⠋ Thinking (1m 04s) · Ctrl+T expand"
+        );
+        assert_eq!(
+            member_activity_text(
+                MemberStatus::Running,
                 None,
+                true,
                 Some(64),
                 "⠋",
                 Some("model: gpt-5-codex • effort: high")
@@ -166,6 +197,26 @@ mod tests {
             )
         );
         assert_eq!(running_footer_text(0, None, &[], "⠋"), None);
+    }
+
+    #[test]
+    fn active_footer_names_non_running_active_states() {
+        assert_eq!(
+            active_footer_text(
+                3,
+                Some(8),
+                &[
+                    "Builder queued".to_string(),
+                    "Reviewer waiting".to_string(),
+                    "QA approval".to_string(),
+                ],
+                "⠋"
+            ),
+            Some(
+                "⠋ Active 3 members (8s • Esc/Ctrl+C to interrupt) · Builder queued, Reviewer waiting, QA approval"
+                    .to_string()
+            )
+        );
     }
 
     #[test]

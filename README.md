@@ -39,14 +39,18 @@ reusing this same local runtime. See the [Desktop guide](docs/desktop.md).
 Asterline supports macOS, Linux, and Windows 10/11. At least one supported CLI
 must already be installed and authenticated.
 
-| Platform | Recommended installation                                                                      |
-| -------- | --------------------------------------------------------------------------------------------- |
-| macOS    | Download `asterline-<version>-macos-universal.dmg`, open it, and run `Install Asterline.pkg`. |
-| Windows  | Download and run `asterline-<version>-x86_64-windows-setup.exe`.                              |
-| Linux    | Download the archive for `x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu`.           |
+- **macOS:** Download `asterline-<version>-macos-universal.dmg`, open it, and
+  run `Install Asterline.pkg`.
+- **Windows:** Download and run `asterline-<version>-x86_64-windows-setup.exe`.
+- **Linux:** Choose `asterline-v<version>-Linux-x86_64` or
+  `asterline-v<version>-Linux-arm64` as a `.tar.gz`, `.deb`, or `.rpm`.
+- **Homebrew (macOS and Linux):** `brew install song0705/asterline/asterline`.
+
+Linux archives target GNU/glibc 2.28 or newer and embed SQLite; Alpine/musl is
+not a supported release target.
 
 The installers provide both `asterline` and the shorter `ast` command. See the
-[installation guide](docs/installation.md) for portable packages, source builds,
+[installation guide](docs/installation.md) for Homebrew, portable packages, source builds,
 release verification, updates, uninstallation, and troubleshooting.
 
 ## Get started
@@ -83,17 +87,17 @@ work.
 ### Live teams over native CLIs
 
 A team can mix providers or use the same backend more than once. Each member can
-have its own role, model, reasoning effort, working directory, system prompt,
+have its own role, model, supported reasoning setting, working directory, system prompt,
 sandbox, permission mode, tool allowlist, and session policy.
 
 ![Asterline Team editor](docs/assets/asterline-team.webp)
 
-| Backend | Integration                 | Session resume | Model discovery                |
-| ------- | --------------------------- | -------------- | ------------------------------ |
-| Codex   | `codex exec --json`         | Yes            | `codex debug models`           |
-| Claude  | Streaming JSON              | Yes            | CLI settings and aliases       |
-| Grok    | ACP over `grok agent stdio` | Yes            | `grok --no-auto-update models` |
-| Agy     | `stream-json` events        | Yes            | `agy models`                   |
+| Backend | Integration                                         | Session resume    | Model discovery                               |
+| ------- | --------------------------------------------------- | ----------------- | --------------------------------------------- |
+| Codex   | Persistent App Server                               | Yes               | App Server `model/list`                       |
+| Claude  | Streaming JSON                                      | Yes               | CLI settings and aliases                      |
+| Grok    | ACP over `grok agent stdio`                         | Yes               | `grok --no-auto-update models`                |
+| Agy     | `stream-json` events                                | Yes               | `agy models`                                  |
 
 Asterline does not replace provider authentication, billing, model access, or
 usage limits.
@@ -122,8 +126,10 @@ Runs remain actionable when work pauses:
 
 ### Local, resumable history
 
-`/new` starts a clean conversation. `/resume` restores a saved transcript,
-roster, backend sessions, mode, and Runs. Project state is stored by default in:
+Reopening Asterline resumes the last conversation by default. `/new` and
+`/clear` are equivalent: each starts a clean conversation. `/resume` restores a
+saved transcript, roster, backend sessions, mode, and Runs. Project state is
+stored by default in:
 
 ```text
 <workspace>/.asterline/
@@ -158,11 +164,10 @@ second process sandbox beyond the selected backend. Read
 | `/team`                | Edit the live roster                        |
 | `/resume`              | Restore a saved conversation                |
 | `/approve` / `/reject` | Resolve a pending approval                  |
-| `/abort`               | Cancel active work and verification         |
 | `/help`                | Open the command palette                    |
 
 See the [complete command and keyboard reference](docs/commands.md) for session
-attach, navigation, Run steps, Skills, logs, search, and diffs.
+attach, navigation, Run steps, targeted skills, logs, search, and diffs.
 
 ## Documentation
 
@@ -170,8 +175,10 @@ attach, navigation, Run steps, Skills, logs, search, and diffs.
 - [Commands and keyboard](docs/commands.md)
 - [Configuration and local data](docs/configuration.md)
 - [Approvals and tool control](docs/approvals.md)
-- [Release notes](docs/releases/v0.2.3.md)
+- [Real-backend smoke tests](docs/real-smoke.md)
+- [Release notes](docs/releases/v0.2.9.md)
 - [Maintainer release process](docs/releasing.md)
+- [Third-party package definitions](packaging/README.md)
 
 Built-in help is available through `/help` and `asterline --help`.
 
@@ -189,9 +196,12 @@ Run the local quality gate:
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked --no-fail-fast
+cargo audit
 ```
 
-Rust 1.85 or newer is required. Real-backend smoke tests are opt-in. Please use
+Rust 1.88 or newer and `cargo-audit` 0.22.2 are required for this complete gate.
+Real-backend smoke tests are opt-in; see the [controlled local and Actions
+entrypoints](docs/real-smoke.md). Please use
 [GitHub Issues](https://github.com/song0705/Asterline/issues) for reproducible
 bugs and focused proposals.
 

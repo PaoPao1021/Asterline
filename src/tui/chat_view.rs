@@ -9,9 +9,9 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 
-use crate::domain::event::{ChatItem, MemberStatus};
+use crate::domain::event::ChatItem;
 use crate::domain::team::{DefaultTarget, MemberId};
-use crate::tui::app_state::AppState;
+use crate::tui::app_state::{AppState, member_status_is_active};
 use crate::tui::completion::Completion;
 use crate::tui::drawer_view::render_drawer;
 use crate::tui::header::{render_footer, render_header};
@@ -32,6 +32,9 @@ pub struct ChatLayout {
     pub width: usize,
     /// Plain text of ALL flattened lines (unstyled).
     pub lines: Vec<String>,
+    /// Completion popup bounds when it is visible. This uses screen-space
+    /// selection because popup rows do not belong to chat history.
+    pub completion_area: Option<Rect>,
 }
 
 impl ChatLayout {
@@ -67,6 +70,37 @@ impl ChatLayout {
             && x < self.area.x.saturating_add(self.area.width)
             && y >= self.area.y
             && y < self.area.y.saturating_add(self.area.height)
+    }
+
+    /// Plain text covered by a drag selection, joined with newlines.
+    pub fn selected_text(&self, selection: crate::tui::app_state::ChatSelection) -> String {
+        if selection.is_empty() {
+            return String::new();
+        }
+        let (from, to) = selection.normalized();
+        let last = self.lines.len().saturating_sub(1);
+        let start_line = from.0.min(last);
+        let end_line = to.0.min(last);
+        let mut out = String::new();
+        for (index, line) in self
+            .lines
+            .iter()
+            .enumerate()
+            .take(end_line + 1)
+            .skip(start_line)
+        {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            let start_col = if index == start_line { from.1 } else { 0 };
+            let end_col = if index == end_line {
+                to.1.saturating_add(1)
+            } else {
+                theme::display_width(line)
+            };
+            out.push_str(&theme::slice_display_cols(line, start_col, end_col));
+        }
+        out
     }
 }
 
@@ -127,10 +161,11 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) -> Option<ChatLayout> {
         .split(frame.area());
 
     render_header(frame, chunks[0], state);
-    let layout = render_chat(frame, chunks[1], state);
+    let mut layout = render_chat(frame, chunks[1], state);
     render_composer(frame, chunks[2], state);
     if let Some(completion) = completion {
         render_popup(frame, chunks[3], &completion, state.popup_selected());
+        layout.completion_area = Some(chunks[3]);
     } else {
         render_footer(frame, chunks[3], state);
     }
@@ -177,44 +212,31 @@ fn render_popup(frame: &mut Frame<'_>, area: Rect, completion: &Completion, sele
         .map(|(i, item)| {
             let (name, description) = completion_parts(&item.label);
             let is_selected = i == selected;
-            let selected_name_style = theme::selection();
-            let selected_text_style = theme::selection();
             let name_style = if is_selected {
-                selected_name_style
-            } else {
                 theme::accent()
+            } else {
+                theme::emphasis()
             };
             let marker_style = if is_selected {
-                selected_name_style
+                theme::accent()
             } else {
                 Style::default()
             };
             let marker = if is_selected { "› " } else { "  " };
-            let mut used_width = theme::display_width(marker) + theme::display_width(name);
             let mut spans = vec![
                 Span::styled(marker, marker_style),
                 Span::styled(name.to_string(), name_style),
             ];
             if let Some(description) = description {
                 let padding = name_width.saturating_sub(theme::display_width(name)) + 2;
-                used_width += padding + theme::display_width(description);
-                let padding_style = if is_selected {
-                    selected_text_style
-                } else {
-                    Style::default()
-                };
-                let description_style = if is_selected {
-                    selected_text_style
-                } else {
-                    theme::muted()
-                };
-                spans.push(Span::styled(" ".repeat(padding), padding_style));
-                spans.push(Span::styled(description.to_string(), description_style));
-            }
-            if is_selected {
+                spans.push(Span::raw(" ".repeat(padding)));
                 spans.push(Span::styled(
-                    " ".repeat((area.width as usize).saturating_sub(used_width)),
-                    selected_text_style,
+                    description.to_string(),
+                    if is_selected {
+                        theme::accent()
+                    } else {
+                        theme::muted()
+                    },
                 ));
             }
             Line::from(spans)
@@ -244,81 +266,177 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) -> ChatLayou
         lines.push(Line::raw(""));
     }
 
-    render_chat_history(state, width, &mut lines);
+    render_chat_history(state, width, 0, &mut lines);
 
-    // Append live activity lines for members that are currently busy.
-    let active_members: Vec<_> = state
-        .members()
-        .iter()
-        .filter(|m| m.status != MemberStatus::Idle)
-        .collect();
-
-    let spin_char = status_indicator::spinner();
-    for member in active_members {
-        // A member that hasn't started its message yet gets a placeholder
-        // header; one that has only surfaces its live reasoning.
-        let show_placeholder = !state.has_active_message(&member.id);
-        let reasoning = state
-            .active_reasoning()
-            .get(&member.id)
-            .map(String::as_str)
-            .filter(|s| !s.is_empty());
-        if !show_placeholder && reasoning.is_none() {
-            continue;
-        }
-        if show_placeholder {
-            lines.push(agent_header_line(&member.display_name, member.backend));
-        }
-        let line_text = status_indicator::member_activity_text(
-            member.status,
-            reasoning,
-            state.member_elapsed_secs(&member.id),
-            spin_char,
-            Some(&member_runtime_profile(member)),
+    let omitted_active = state.omitted_active_output_count();
+    if omitted_active > 0 {
+        let text = format!(
+            "… {omitted_active} active output cell(s) omitted by the TUI memory limit; final results will appear on completion"
         );
-        for wrapped in markdown::wrap(&line_text, width.saturating_sub(2).max(1)) {
-            lines.push(Line::from(vec![
-                chat_rail(theme::backend_color(member.backend)),
-                Span::raw(" "),
-                Span::styled(wrapped, theme::muted_italic()),
-            ]));
+        for wrapped in markdown::wrap(&text, width.max(1)) {
+            lines.push(Line::from(Span::styled(wrapped, theme::warning_bold())));
         }
-        if show_placeholder {
-            lines.push(Line::raw(""));
-        }
+        lines.push(Line::raw(""));
     }
-
-    // Plain-text snapshot for content-anchored selection (O of existing work).
-    let plain: Vec<String> = lines
-        .iter()
-        .map(|line| {
-            line.spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-        })
-        .collect();
 
     let height = inner.height as usize;
     let total = lines.len();
     let max_start = total.saturating_sub(height);
     let start = max_start.saturating_sub(state.scroll());
-    let visible: Vec<Line> = lines.into_iter().skip(start).take(height).collect();
-
+    // Clone only the viewport for the widget. The remaining styled lines are
+    // consumed into the selection snapshot below instead of first duplicating
+    // the entire flattened transcript.
+    let mut visible: Vec<Line> = lines.iter().skip(start).take(height).cloned().collect();
+    if let Some(selection) = state.chat_selection() {
+        apply_selection_style(&mut visible, start, selection);
+    }
     frame.render_widget(Paragraph::new(visible), inner);
+
+    let plain: Vec<String> = lines
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .into_iter()
+                .map(|span| span.content.into_owned())
+                .collect::<String>()
+        })
+        .collect();
 
     ChatLayout {
         area: inner,
         first_line: start,
         width,
         lines: plain,
+        completion_area: None,
     }
 }
 
-fn render_chat_history(state: &AppState, width: usize, out: &mut Vec<Line<'static>>) {
+fn render_chat_history(state: &AppState, width: usize, start: usize, out: &mut Vec<Line<'static>>) {
+    render_chat_history_range(state, width, start, state.chat().len(), out);
+}
+
+fn apply_selection_style(
+    visible: &mut [Line<'_>],
+    first_line: usize,
+    selection: crate::tui::app_state::ChatSelection,
+) {
+    let (from, to) = selection.normalized();
+    for (offset, line) in visible.iter_mut().enumerate() {
+        let index = first_line + offset;
+        if index < from.0 || index > to.0 {
+            continue;
+        }
+        let start_col = if index == from.0 { from.1 } else { 0 };
+        let end_col = if index == to.0 {
+            to.1.saturating_add(1)
+        } else {
+            usize::MAX
+        };
+        *line = restyle_column_range(line, start_col, end_col);
+    }
+}
+
+fn restyle_column_range(line: &Line<'_>, start_col: usize, end_col: usize) -> Line<'static> {
+    let end_col = end_col.max(start_col);
+    let mut out = Vec::new();
+    let mut col = 0;
+    for span in &line.spans {
+        let mut unselected = String::new();
+        let mut selected = String::new();
+        for ch in span.content.chars() {
+            let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if col >= start_col && col < end_col {
+                if !unselected.is_empty() {
+                    out.push(Span::styled(std::mem::take(&mut unselected), span.style));
+                }
+                selected.push(ch);
+            } else {
+                if !selected.is_empty() {
+                    out.push(Span::styled(
+                        std::mem::take(&mut selected),
+                        theme::chat_selection(),
+                    ));
+                }
+                unselected.push(ch);
+            }
+            col += width;
+        }
+        if !unselected.is_empty() {
+            out.push(Span::styled(unselected, span.style));
+        }
+        if !selected.is_empty() {
+            out.push(Span::styled(selected, theme::chat_selection()));
+        }
+    }
+    Line::from(out)
+}
+
+/// Display order that keeps one member's work together only when a later
+/// prompt was sent while that member was already working. Sequential turns
+/// stay chronological.
+fn grouped_chat_indices(items: &[ChatItem], start: usize, end: usize) -> Vec<usize> {
+    let start = start.min(items.len());
+    let end = end.min(items.len()).max(start);
+    let mut used = vec![false; end];
+    let mut out = Vec::with_capacity(end.saturating_sub(start));
+    for i in start..end {
+        if used[i] {
+            continue;
+        }
+        used[i] = true;
+        out.push(i);
+        let Some(member) = item_member(&items[i]).cloned() else {
+            continue;
+        };
+        for j in (i + 1)..end {
+            if used[j] {
+                continue;
+            }
+            if user_breaks_member_region(&items[j], &member) {
+                break;
+            }
+            if item_member(&items[j]) == Some(&member) {
+                used[j] = true;
+                out.push(j);
+            }
+        }
+    }
+    out
+}
+
+fn user_breaks_member_region(item: &ChatItem, member: &MemberId) -> bool {
+    match item {
+        ChatItem::User {
+            targets,
+            interrupted,
+            ..
+        } => {
+            if targets.iter().any(|target| target == member) {
+                return true;
+            }
+            // A prompt sent while this member was already working should not
+            // split their later output into the other member's region.
+            !interrupted.iter().any(|busy| busy == member)
+        }
+        _ => false,
+    }
+}
+
+fn render_chat_history_range(
+    state: &AppState,
+    width: usize,
+    start: usize,
+    end: usize,
+    out: &mut Vec<Line<'static>>,
+) {
     let items = state.chat();
-    let mut saw_work_activity = false;
-    for (i, item) in items.iter().enumerate() {
+    let start = start.min(items.len());
+    let end = end.min(items.len()).max(start);
+    let order = grouped_chat_indices(items, start, end);
+    let mut saw_work_activity = start > 0 && items[..start].iter().any(is_work_activity);
+    let mut rendered_live = std::collections::HashSet::new();
+    for (pos, &i) in order.iter().enumerate() {
+        let item = &items[i];
         if matches!(item, ChatItem::User { .. }) && saw_work_activity {
             render_turn_separator(width, out);
             saw_work_activity = false;
@@ -327,12 +445,13 @@ fn render_chat_history(state: &AppState, width: usize, out: &mut Vec<Line<'stati
             saw_work_activity = true;
         }
         let before = out.len();
-        let previous_sender = if i == 0 {
-            None
-        } else {
-            items.get(i - 1).and_then(item_sender)
-        };
-        let show_sender_header = item_sender(item) != previous_sender;
+        let previous = pos.checked_sub(1).map(|p| &items[order[p]]);
+        let previous_sender = previous.and_then(item_sender);
+        // User and agent bubbles keep their own title so a member's later
+        // reply still reads as "member1: second message" in that member's
+        // region. Tools stay attached to the preceding speaker.
+        let show_sender_header = matches!(item, ChatItem::User { .. } | ChatItem::Agent { .. })
+            || item_sender(item) != previous_sender;
         let is_find_current = state.find_current_chat_index() == Some(i);
         render_item(item, width, state, out, show_sender_header);
         if is_find_current && let Some(line) = out.get_mut(before) {
@@ -341,10 +460,18 @@ fn render_chat_history(state: &AppState, width: usize, out: &mut Vec<Line<'stati
             spans.append(&mut line.spans);
             line.spans = spans;
         }
+        let next = order.get(pos + 1).map(|&j| &items[j]);
+        let member_block_ends = item_member(item)
+            .is_some_and(|member| next.and_then(item_member).is_none_or(|next| next != member));
+        if member_block_ends
+            && let Some(member) = item_member(item)
+            && render_live_member_activity(state, width, member, false, out)
+        {
+            rendered_live.insert(member.clone());
+        }
         // Keep one member's answer, tools, routes, diffs, and errors on the
         // same uninterrupted visual rail. Separate unrelated blocks.
         if out.len() > before {
-            let next = items.get(i + 1);
             let grouped = (is_compact(item) && next.is_some_and(is_compact))
                 || item_sender(item)
                     .is_some_and(|sender| next.and_then(item_sender).as_ref() == Some(&sender))
@@ -354,9 +481,62 @@ fn render_chat_history(state: &AppState, width: usize, out: &mut Vec<Line<'stati
             }
         }
     }
-    if saw_work_activity && state.running_count() == 0 {
+    if end == items.len() && saw_work_activity && state.running_count() == 0 {
         render_turn_separator(width, out);
     }
+    if end == items.len() {
+        for member in state.members() {
+            if member_status_is_active(member.status)
+                && !rendered_live.contains(&member.id)
+                && render_live_member_activity(state, width, &member.id, true, out)
+            {
+                out.push(Line::raw(""));
+            }
+        }
+    }
+}
+
+fn render_live_member_activity(
+    state: &AppState,
+    width: usize,
+    member_id: &MemberId,
+    show_placeholder_header: bool,
+    out: &mut Vec<Line<'static>>,
+) -> bool {
+    let Some(member) = state.members().iter().find(|m| &m.id == member_id) else {
+        return false;
+    };
+    if !member_status_is_active(member.status) {
+        return false;
+    }
+    let show_placeholder = show_placeholder_header && !state.has_active_message(&member.id);
+    let reasoning = state
+        .active_reasoning()
+        .get(&member.id)
+        .map(String::as_str)
+        .filter(|s| !s.is_empty());
+    if !show_placeholder && reasoning.is_none() {
+        return false;
+    }
+    if show_placeholder {
+        out.push(agent_header_line(&member.display_name, member.backend));
+    }
+    let line_text = status_indicator::member_activity_text(
+        member.status,
+        reasoning,
+        member.backend != crate::domain::team::BackendKind::Claude || state.tools_expanded(),
+        state.member_elapsed_secs(&member.id),
+        status_indicator::spinner(),
+        Some(&state.member_runtime_profile(member)),
+    );
+    for wrapped in markdown::wrap(&line_text, width.saturating_sub(2).max(1)) {
+        out.push(Line::from(vec![
+            chat_rail(theme::backend_color(member.backend)),
+            Span::raw(" "),
+            Span::styled(wrapped, theme::muted_italic()),
+        ]));
+    }
+    true
 }
 
 fn is_work_activity(item: &ChatItem) -> bool {
@@ -479,11 +659,33 @@ fn agent_header_line(
     ])
 }
 
-fn user_header_line() -> Line<'static> {
-    Line::from(vec![
+fn user_header_line(state: &AppState, targets: &[MemberId]) -> Line<'static> {
+    let mut spans = vec![
         Span::styled("◆ ", theme::bold(theme::user_color())),
         Span::styled("You", theme::bold(theme::user_color())),
-    ])
+    ];
+    if targets.is_empty() {
+        return Line::from(spans);
+    }
+    spans.push(Span::styled(" → ", theme::muted()));
+    let roster = state.members();
+    if roster.len() > 1
+        && targets.len() == roster.len()
+        && roster
+            .iter()
+            .all(|member| targets.iter().any(|target| target == &member.id))
+    {
+        spans.push(Span::styled("all", theme::emphasis()));
+        return Line::from(spans);
+    }
+    for (index, target) in targets.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(", ", theme::muted()));
+        }
+        let (name, backend) = state.member_meta(target);
+        spans.push(Span::styled(name, theme::backend_bold(backend)));
+    }
+    Line::from(spans)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -496,12 +698,10 @@ fn item_sender(item: &ChatItem) -> Option<ChatSender> {
     match item {
         ChatItem::User { .. } => Some(ChatSender::User),
         ChatItem::Agent { member, .. } => Some(ChatSender::Agent(member.clone())),
-        ChatItem::Tool { .. }
-        | ChatItem::Diff { .. }
-        | ChatItem::Route { .. }
-        | ChatItem::Notice { .. }
-        | ChatItem::Error { .. }
-        | ChatItem::Verdict { .. } => None,
+        // Tools, diffs, relays, and member-attributed failures belong to the
+        // same visible speaker block as the response they lead to. Treating
+        // them as anonymous made a tool appear before its member title.
+        _ => item_member(item).cloned().map(ChatSender::Agent),
     }
 }
 
@@ -512,10 +712,17 @@ fn render_item(
     out: &mut Vec<Line<'static>>,
     show_sender_header: bool,
 ) {
+    if show_sender_header
+        && !matches!(item, ChatItem::User { .. } | ChatItem::Agent { .. })
+        && let Some(member) = item_member(item)
+    {
+        let (display_name, backend) = state.member_meta(member);
+        out.push(agent_header_line(&display_name, backend));
+    }
     match item {
-        ChatItem::User { body } => {
+        ChatItem::User { body, targets, .. } => {
             if show_sender_header {
-                out.push(user_header_line());
+                out.push(user_header_line(state, targets));
             }
             for line in markdown::wrap(body, width.saturating_sub(2).max(1)) {
                 out.push(Line::from(vec![
@@ -605,11 +812,16 @@ fn render_item(
                 }
             }
         }
-        ChatItem::Diff { member, files } => {
+        ChatItem::Diff { member, files, ok } => {
             let rail_color = member_rail_color(state, member);
+            let (marker, title_style) = if *ok {
+                ("✎", theme::accent_bold())
+            } else {
+                ("✕", theme::error_bold())
+            };
             out.push(Line::from(vec![
                 chat_rail(rail_color),
-                Span::styled("   ✎ file changes", theme::accent_bold()),
+                Span::styled(format!("   {marker} file changes"), title_style),
             ]));
             for (path, kind) in files {
                 let (sign, color) = match kind.as_str() {
@@ -788,18 +1000,6 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     }
 }
 
-fn member_runtime_profile(member: &crate::tui::app_state::MemberView) -> String {
-    let model = member
-        .model
-        .clone()
-        .unwrap_or_else(|| "default".to_string());
-    let effort = member.effort.map_or_else(
-        || "default".to_string(),
-        |effort| effort.as_str().to_string(),
-    );
-    format!("model: {} • effort: {}", model, effort)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,6 +1013,7 @@ mod tests {
     use crate::tui::drawers::Drawer;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
 
     fn member_summary(
         id: &str,
@@ -937,7 +1138,7 @@ mod tests {
         eprintln!("\n{view}");
 
         assert!(view.contains("Asterline"));
-        assert!(view.contains("Builder"));
+        assert!(view.contains("Builder · codex"));
         assert!(view.contains("builder → reviewer"));
         // The running member surfaces a working indicator + interrupt hint.
         assert!(view.contains("Working"));
@@ -999,9 +1200,10 @@ mod tests {
         }
 
         let mut terminal = Terminal::new(TestBackend::new(70, 14)).unwrap();
+        let mut layout = None;
         terminal
             .draw(|frame| {
-                let _ = render(frame, &state);
+                layout = render(frame, &state);
             })
             .unwrap();
         let view = format!("{}", terminal.backend());
@@ -1009,9 +1211,48 @@ mod tests {
 
         assert!(view.contains("/ask"));
         assert!(view.contains("/all"));
+        assert!(view.contains("/attach"));
         assert!(!view.contains("╭"));
         assert!(!view.contains("@member to send"));
         assert!(view.contains("› /ask      send to one member"));
+        assert_eq!(
+            layout.and_then(|layout| layout.completion_area),
+            Some(Rect::new(0, 10, 70, 4))
+        );
+    }
+
+    #[test]
+    fn completion_popup_uses_text_only_selection() {
+        let completion = Completion {
+            title: "commands",
+            token_start: 0,
+            items: vec![
+                crate::tui::completion::CompletionItem {
+                    label: "/ask — send to one member".to_string(),
+                    insert: "/ask ".to_string(),
+                },
+                crate::tui::completion::CompletionItem {
+                    label: "/all — send to everyone".to_string(),
+                    insert: "/all ".to_string(),
+                },
+            ],
+        };
+        let mut terminal = Terminal::new(TestBackend::new(40, 2)).unwrap();
+        terminal
+            .draw(|frame| render_popup(frame, frame.area(), &completion, 0))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let selected_name = buffer.cell((2, 0)).unwrap();
+        let selected_hint = buffer.cell((8, 0)).unwrap();
+        let unselected_name = buffer.cell((2, 1)).unwrap();
+
+        assert_eq!(selected_name.fg, theme::accent_color());
+        assert_eq!(selected_name.bg, Color::Reset);
+        assert_eq!(selected_hint.fg, theme::accent_color());
+        assert_eq!(selected_hint.bg, Color::Reset);
+        assert_eq!(unselected_name.fg, theme::emphasis_color());
+        assert_eq!(unselected_name.bg, Color::Reset);
     }
 
     #[test]
@@ -1043,10 +1284,57 @@ mod tests {
         let view = format!("{}", terminal.backend());
         eprintln!("\n{view}");
 
-        // The activity line spells the profile out; the header chip abbreviates.
-        assert!(view.contains("model: gpt-5-codex"));
-        assert!(view.contains("effort: high"));
-        assert!(view.contains("·gpt-5-codex/high"));
+        // The activity line spells the profile out; the header stays compact.
+        assert!(view.contains("model: gpt-5-codex · high"));
+    }
+
+    #[test]
+    fn queued_waiting_and_approval_are_active_in_header_and_footer() {
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "t".to_string(),
+            workspace: String::new(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            runs: Vec::new(),
+            members: vec![
+                member_summary(
+                    "builder",
+                    "Builder",
+                    BackendKind::Codex,
+                    "impl",
+                    MemberStatus::Queued,
+                ),
+                member_summary(
+                    "reviewer",
+                    "Reviewer",
+                    BackendKind::Claude,
+                    "review",
+                    MemberStatus::Waiting,
+                ),
+                member_summary(
+                    "qa",
+                    "QA",
+                    BackendKind::Codex,
+                    "verify",
+                    MemberStatus::NeedsApproval,
+                ),
+            ],
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(150, 18)).unwrap();
+        terminal
+            .draw(|frame| {
+                let _ = render(frame, &state);
+            })
+            .unwrap();
+        let view = format!("{}", terminal.backend());
+
+        assert!(view.contains("Active 3 members"));
+        assert!(view.contains("Builder queued"));
+        assert!(view.contains("Reviewer waiting"));
+        assert!(view.contains("QA approval"));
+        assert!(!view.contains("○ Reviewer"));
+        assert!(!view.contains("@member first"));
     }
 
     #[test]
@@ -1054,6 +1342,8 @@ mod tests {
         let state = AppState::new(vec![
             ChatItem::User {
                 body: "explain this function".to_string(),
+                targets: vec![MemberId::new("builder")],
+                interrupted: Vec::new(),
             },
             ChatItem::Agent {
                 member: MemberId::new("builder"),
@@ -1064,11 +1354,11 @@ mod tests {
         ]);
         let mut lines = Vec::new();
 
-        render_chat_history(&state, 40, &mut lines);
+        render_chat_history(&state, 40, 0, &mut lines);
 
         let text = plain_text(&lines);
         assert!(!text.iter().any(|line| is_separator_text(line)));
-        assert!(text.iter().any(|line| line == "◆ You"));
+        assert!(text.iter().any(|line| line.contains("◆ You")));
         assert!(
             text.iter()
                 .any(|line| line.contains("explain this function"))
@@ -1076,7 +1366,7 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_agent_messages_suppress_repeated_header() {
+    fn consecutive_agent_messages_keep_a_title_on_each_reply() {
         let state = AppState::new(vec![
             ChatItem::Agent {
                 member: MemberId::new("builder"),
@@ -1099,7 +1389,7 @@ mod tests {
         ]);
         let mut lines = Vec::new();
 
-        render_chat_history(&state, 60, &mut lines);
+        render_chat_history(&state, 60, 0, &mut lines);
 
         let text = plain_text(&lines);
         let builder_headers = text
@@ -1110,7 +1400,7 @@ mod tests {
             .iter()
             .filter(|line| line.contains("Reviewer") && line.contains("claude"))
             .count();
-        assert_eq!(builder_headers, 1);
+        assert_eq!(builder_headers, 2);
         assert_eq!(reviewer_headers, 1);
         assert!(text.iter().any(|line| line.contains("first reply")));
         assert!(text.iter().any(|line| line.contains("second reply")));
@@ -1118,7 +1408,263 @@ mod tests {
             .iter()
             .position(|line| line.contains("first reply"))
             .unwrap();
-        assert!(text[first + 1].contains("second reply"));
+        let second = text
+            .iter()
+            .position(|line| line.contains("second reply"))
+            .unwrap();
+        assert!(first < second);
+    }
+
+    #[test]
+    fn concurrent_members_keep_each_members_work_together() {
+        use crate::domain::event::{MessageId, TurnId};
+
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "t".to_string(),
+            workspace: String::new(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            runs: Vec::new(),
+            members: vec![
+                member_summary(
+                    "builder",
+                    "Builder",
+                    BackendKind::Codex,
+                    "impl",
+                    MemberStatus::Idle,
+                ),
+                member_summary(
+                    "planer",
+                    "Planer",
+                    BackendKind::Claude,
+                    "plan",
+                    MemberStatus::Idle,
+                ),
+            ],
+        });
+        state.apply(RuntimeEvent::UserMessage {
+            turn: TurnId(1),
+            targets: vec![MemberId::new("builder")],
+            body: "fix the parser".to_string(),
+        });
+        state.apply(RuntimeEvent::MessageStarted {
+            msg: MessageId(1),
+            turn: TurnId(1),
+            member: MemberId::new("builder"),
+        });
+        state.apply(RuntimeEvent::MessageDelta {
+            msg: MessageId(1),
+            text: "builder started".to_string(),
+        });
+        state.apply(RuntimeEvent::MemberStatus {
+            member: MemberId::new("builder"),
+            status: MemberStatus::Running,
+        });
+        state.apply(RuntimeEvent::UserMessage {
+            turn: TurnId(2),
+            targets: vec![MemberId::new("planer")],
+            body: "draft the plan".to_string(),
+        });
+        state.apply(RuntimeEvent::MessageStarted {
+            msg: MessageId(2),
+            turn: TurnId(2),
+            member: MemberId::new("planer"),
+        });
+        state.apply(RuntimeEvent::MessageDelta {
+            msg: MessageId(2),
+            text: "planer started".to_string(),
+        });
+        state.apply(RuntimeEvent::ToolStarted {
+            member: MemberId::new("builder"),
+            tool_id: "b1".to_string(),
+            name: "shell".to_string(),
+            summary: "cargo test".to_string(),
+        });
+        state.apply(RuntimeEvent::ToolCompleted {
+            member: MemberId::new("builder"),
+            tool_id: "b1".to_string(),
+            ok: true,
+            output: "ok".to_string(),
+        });
+        state.apply(RuntimeEvent::MessageCompleted {
+            msg: MessageId(1),
+            text: "builder started\nbuilder done".to_string(),
+        });
+        state.apply(RuntimeEvent::ToolStarted {
+            member: MemberId::new("planer"),
+            tool_id: "p1".to_string(),
+            name: "read_file".to_string(),
+            summary: "docs".to_string(),
+        });
+        state.apply(RuntimeEvent::MessageCompleted {
+            msg: MessageId(2),
+            text: "planer started\nplaner done".to_string(),
+        });
+
+        let mut lines = Vec::new();
+        render_chat_history(&state, 80, 0, &mut lines);
+        let text = plain_text(&lines);
+        let joined = text.join("\n");
+        let builder_start = joined.find("builder started").expect(&joined);
+        let builder_tool = joined.find("cargo test").expect(&joined);
+        let plan_prompt = joined.find("draft the plan").expect(&joined);
+        let planer_start = joined.find("planer started").expect(&joined);
+        let planer_tool = joined.find("read_file").expect(&joined);
+        assert!(
+            joined.contains("You → Builder") && joined.contains("You → Planer"),
+            "{joined}"
+        );
+        assert!(
+            builder_start < builder_tool
+                && builder_tool < plan_prompt
+                && plan_prompt < planer_start
+                && planer_start < planer_tool,
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn sequential_turns_stay_chronological_when_nobody_else_is_working() {
+        use crate::domain::event::{MessageId, TurnId};
+
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "t".to_string(),
+            workspace: String::new(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            runs: Vec::new(),
+            members: vec![
+                member_summary(
+                    "builder",
+                    "Builder",
+                    BackendKind::Codex,
+                    "impl",
+                    MemberStatus::Idle,
+                ),
+                member_summary(
+                    "planer",
+                    "Planer",
+                    BackendKind::Claude,
+                    "plan",
+                    MemberStatus::Idle,
+                ),
+            ],
+        });
+        state.apply(RuntimeEvent::UserMessage {
+            turn: TurnId(1),
+            targets: vec![MemberId::new("builder")],
+            body: "first job".to_string(),
+        });
+        state.apply(RuntimeEvent::MessageStarted {
+            msg: MessageId(1),
+            turn: TurnId(1),
+            member: MemberId::new("builder"),
+        });
+        state.apply(RuntimeEvent::MessageCompleted {
+            msg: MessageId(1),
+            text: "builder finished first".to_string(),
+        });
+        state.apply(RuntimeEvent::MemberStatus {
+            member: MemberId::new("builder"),
+            status: MemberStatus::Idle,
+        });
+        state.apply(RuntimeEvent::UserMessage {
+            turn: TurnId(2),
+            targets: vec![MemberId::new("planer")],
+            body: "second job".to_string(),
+        });
+        state.apply(RuntimeEvent::MessageStarted {
+            msg: MessageId(2),
+            turn: TurnId(2),
+            member: MemberId::new("planer"),
+        });
+        state.apply(RuntimeEvent::MessageCompleted {
+            msg: MessageId(2),
+            text: "planer reply".to_string(),
+        });
+        state.apply(RuntimeEvent::MessageStarted {
+            msg: MessageId(3),
+            turn: TurnId(1),
+            member: MemberId::new("builder"),
+        });
+        state.apply(RuntimeEvent::MessageCompleted {
+            msg: MessageId(3),
+            text: "late builder note".to_string(),
+        });
+
+        let mut lines = Vec::new();
+        render_chat_history(&state, 80, 0, &mut lines);
+        let joined = plain_text(&lines).join("\n");
+        let first = joined.find("builder finished first").expect(&joined);
+        let second_prompt = joined.find("second job").expect(&joined);
+        let planer = joined.find("planer reply").expect(&joined);
+        let late = joined.find("late builder note").expect(&joined);
+        assert!(
+            first < second_prompt && second_prompt < planer && planer < late,
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn tool_block_introduces_its_member_before_the_tool_and_final_reply() {
+        let mut state = AppState::new(Vec::new());
+        state.apply(RuntimeEvent::Ready {
+            team: "t".to_string(),
+            workspace: String::new(),
+            default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
+            runs: Vec::new(),
+            members: vec![member_summary(
+                "builder",
+                "Builder",
+                BackendKind::Grok,
+                "implementation",
+                MemberStatus::Idle,
+            )],
+        });
+        state.apply(RuntimeEvent::ToolStarted {
+            member: MemberId::new("builder"),
+            tool_id: "read-1".to_string(),
+            name: "read_file".to_string(),
+            summary: "src/lib.rs".to_string(),
+        });
+        state.apply(RuntimeEvent::ToolCompleted {
+            member: MemberId::new("builder"),
+            tool_id: "read-1".to_string(),
+            ok: true,
+            output: "ok".to_string(),
+        });
+        state.apply(RuntimeEvent::MessageStarted {
+            msg: crate::domain::event::MessageId(1),
+            turn: crate::domain::event::TurnId(1),
+            member: MemberId::new("builder"),
+        });
+        state.apply(RuntimeEvent::MessageCompleted {
+            msg: crate::domain::event::MessageId(1),
+            text: "final reply".to_string(),
+        });
+
+        let mut lines = Vec::new();
+        render_chat_history(&state, 70, 0, &mut lines);
+        let text = plain_text(&lines);
+        let header = text
+            .iter()
+            .position(|line| line.contains("Builder") && line.contains("grok"))
+            .expect("member header");
+        let tool = text
+            .iter()
+            .position(|line| line.contains("read_file"))
+            .expect("tool line");
+        let reply = text
+            .iter()
+            .position(|line| line.contains("final reply"))
+            .expect("final reply");
+        assert!(header < tool && tool < reply, "{text:?}");
+        assert!(
+            text.iter()
+                .filter(|line| line.contains("Builder") && line.contains("grok"))
+                .count()
+                >= 1
+        );
     }
 
     #[test]
@@ -1141,6 +1687,7 @@ mod tests {
             ChatItem::Diff {
                 member: member.clone(),
                 files: vec![("src/lib.rs".to_string(), "modify".to_string())],
+                ok: true,
             },
             ChatItem::Error {
                 member: Some(member),
@@ -1149,7 +1696,7 @@ mod tests {
         ]);
         let mut lines = Vec::new();
 
-        render_chat_history(&state, 70, &mut lines);
+        render_chat_history(&state, 70, 0, &mut lines);
 
         let text = plain_text(&lines);
         let start = text
@@ -1184,6 +1731,24 @@ mod tests {
                 "rail cell at row {y} must have a full-cell background"
             );
         }
+    }
+
+    #[test]
+    fn failed_file_change_has_a_failure_marker() {
+        let state = AppState::new(vec![ChatItem::Diff {
+            member: MemberId::new("builder"),
+            files: vec![("src/lib.rs".to_string(), "update".to_string())],
+            ok: false,
+        }]);
+        let mut lines = Vec::new();
+
+        render_chat_history(&state, 70, 0, &mut lines);
+
+        assert!(
+            plain_text(&lines)
+                .iter()
+                .any(|line| line.contains("✕ file changes"))
+        );
     }
 
     #[test]
@@ -1254,7 +1819,7 @@ mod tests {
         });
         let mut lines = Vec::new();
 
-        render_chat_history(&state, 40, &mut lines);
+        render_chat_history(&state, 40, 0, &mut lines);
 
         let text = plain_text(&lines);
         let separators: Vec<_> = text
@@ -1302,7 +1867,7 @@ mod tests {
         }
         let mut lines = Vec::new();
 
-        render_chat_history(&state, 60, &mut lines);
+        render_chat_history(&state, 60, 0, &mut lines);
 
         let text = plain_text(&lines);
         let build_idx = text
@@ -1385,7 +1950,7 @@ mod tests {
             ok: true,
             output: "matches found".to_string(),
         });
-        let mut terminal = Terminal::new(TestBackend::new(72, 14)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(72, 18)).unwrap();
         terminal
             .draw(|frame| {
                 let _ = render(frame, &state);
@@ -1413,7 +1978,7 @@ mod tests {
         }]);
         let mut lines = Vec::new();
 
-        render_chat_history(&state, 70, &mut lines);
+        render_chat_history(&state, 70, 0, &mut lines);
 
         let text = plain_text(&lines);
         assert!(
@@ -1439,7 +2004,7 @@ mod tests {
         }]);
         let mut lines = Vec::new();
 
-        render_chat_history(&state, 70, &mut lines);
+        render_chat_history(&state, 70, 0, &mut lines);
 
         let text = plain_text(&lines).join("\n");
         assert!(text.contains("✕ shell"));
@@ -1463,7 +2028,7 @@ mod tests {
             },
         ]);
         let mut lines = Vec::new();
-        render_chat_history(&state, 70, &mut lines);
+        render_chat_history(&state, 70, 0, &mut lines);
         let text = plain_text(&lines).join("\n");
         assert!(
             text.contains("✓ review approved"),
@@ -1481,6 +2046,36 @@ mod tests {
             text.contains("Needs a regression test."),
             "missing reject summary: {text}"
         );
+    }
+
+    #[test]
+    fn drag_selection_only_restyles_the_covered_columns() {
+        let line = Line::from(vec![
+            Span::styled("hello ", theme::text()),
+            Span::styled("world", theme::emphasis()),
+        ]);
+        let styled = restyle_column_range(&line, 6, 11);
+        assert_eq!(styled.spans.len(), 2);
+        assert_eq!(styled.spans[0].content, "hello ");
+        assert_eq!(styled.spans[0].style, theme::text());
+        assert_eq!(styled.spans[1].content, "world");
+        assert_eq!(styled.spans[1].style, theme::chat_selection());
+    }
+
+    #[test]
+    fn selected_text_joins_visible_chat_lines() {
+        let layout = ChatLayout {
+            area: Rect::new(0, 0, 20, 4),
+            first_line: 0,
+            width: 20,
+            lines: vec!["hello world".into(), "second line".into()],
+            completion_area: None,
+        };
+        let text = layout.selected_text(crate::tui::app_state::ChatSelection {
+            start: (0, 0),
+            end: (1, 5),
+        });
+        assert_eq!(text, "hello world\nsecond");
     }
 
     #[test]
@@ -1865,6 +2460,7 @@ mod tests {
                 "fourth line here".into(),
                 "fifth".into(),
             ],
+            completion_area: None,
         };
         // Top-left of area → first_line, col 0.
         assert_eq!(
@@ -1883,6 +2479,30 @@ mod tests {
         assert_eq!(
             layout.screen_to_content(layout.area.x + 50, layout.area.y),
             Some((1, theme::display_width("second line") - 1))
+        );
+    }
+
+    #[test]
+    fn large_chat_is_trimmed_before_frame_flattening() {
+        let chat = (0..5_000)
+            .map(|index| ChatItem::Notice {
+                text: format!("notice {index}"),
+            })
+            .collect();
+        let state = AppState::new(chat);
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        let mut flattened = 0;
+
+        terminal
+            .draw(|frame| {
+                flattened = render(frame, &state).unwrap().lines.len();
+            })
+            .unwrap();
+
+        assert!(state.chat().len() <= super::super::app_state::MAX_CHAT_ITEMS);
+        assert!(
+            flattened < 10_000,
+            "frame work must be bounded: {flattened}"
         );
     }
 }

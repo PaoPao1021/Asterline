@@ -3,12 +3,20 @@
 
 use crate::domain::event::{ApprovalDecision, MessageTarget, RunId, RunStepStatus, UiCommand};
 use crate::domain::mode::TerminalMode;
-use crate::domain::team::{Effort, MemberId};
+use crate::domain::team::MemberId;
 use crate::tui::drawers::Drawer;
 
 /// What submitting the composer should do.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Submission {
+    /// Exit the Asterline TUI and begin normal runtime shutdown.
+    Exit,
+    /// Open one member's native interactive CLI session.
+    Attach { member: MemberId },
+    /// A targeted slash invocation resolved only against the target backend's
+    /// discovered prompt-invocable skills before any prompt is sent to a
+    /// noninteractive backend runner.
+    TargetedSlash { member: MemberId, body: String },
     /// Send a command to the runtime.
     Runtime(UiCommand),
     /// Open a drawer (a local UI action).
@@ -42,6 +50,9 @@ pub fn parse(input: &str) -> Submission {
         if member.is_empty() || body.is_empty() {
             return Submission::Empty;
         }
+        if let Some(submission) = parse_targeted_slash(member, body) {
+            return submission;
+        }
         let target = if member == "all" {
             MessageTarget::All
         } else {
@@ -63,6 +74,8 @@ fn parse_slash(rest: &str) -> Submission {
             let (member, body) = split_first_word(arg);
             if member.is_empty() || body.is_empty() {
                 Submission::Help
+            } else if let Some(submission) = parse_targeted_slash(member, body) {
+                submission
             } else {
                 let target = if member == "all" {
                     MessageTarget::All
@@ -78,6 +91,10 @@ fn parse_slash(rest: &str) -> Submission {
         "all" => {
             if arg.is_empty() {
                 Submission::Help
+            } else if arg.trim_start().starts_with('/') {
+                Submission::Invalid(
+                    "slash commands need one member; use @member /command (draft kept)".to_string(),
+                )
             } else {
                 Submission::Runtime(UiCommand::UserMessage {
                     target: MessageTarget::All,
@@ -89,23 +106,29 @@ fn parse_slash(rest: &str) -> Submission {
         "runs" if arg.is_empty() => Submission::Drawer(Drawer::Runs),
         "logs" if arg.is_empty() => Submission::Drawer(Drawer::Logs),
         "diff" if arg.is_empty() => Submission::Drawer(Drawer::Diff),
-        "skills" if arg.is_empty() => Submission::Drawer(Drawer::Skills),
-        "new" if arg.is_empty() => Submission::Runtime(UiCommand::NewSession),
+        "attach" => {
+            let (member, extra) = split_first_word(arg);
+            if member.is_empty() {
+                Submission::Help
+            } else if member == "all" {
+                Submission::Invalid("/attach needs one member; use /attach <member>".to_string())
+            } else if !extra.is_empty() {
+                Submission::Invalid("/attach does not accept arguments; draft kept".to_string())
+            } else {
+                Submission::Attach {
+                    member: MemberId::new(member),
+                }
+            }
+        }
+        // Both spellings intentionally perform the same durable reset. Keep
+        // `/new` for muscle memory and accept `/clear` when it is submitted
+        // directly (rather than only after completion rewrites it).
+        "new" | "clear" if arg.is_empty() => Submission::Runtime(UiCommand::NewSession),
         "resume" if arg.is_empty() => Submission::Runtime(UiCommand::RequestResume),
-        "abort" if arg.is_empty() => Submission::Runtime(UiCommand::Cancel { member: None }),
+        "exit" if arg.is_empty() => Submission::Exit,
         "retry" if arg.is_empty() => Submission::Runtime(UiCommand::Retry),
         "approve" if arg.is_empty() => Submission::ApproveFirst(ApprovalDecision::Approve),
         "reject" if arg.is_empty() => Submission::ApproveFirst(ApprovalDecision::Reject),
-        "effort" => {
-            let (member, level) = split_first_word(arg);
-            match Effort::parse(level) {
-                Some(effort) if !member.is_empty() => Submission::Runtime(UiCommand::SetEffort {
-                    member: MemberId::new(member),
-                    effort,
-                }),
-                _ => Submission::Help,
-            }
-        }
         "mode" => parse_mode_selector(arg),
         "find" => Submission::FindInChat(arg.to_string()),
         "continue" => {
@@ -160,20 +183,65 @@ fn parse_slash(rest: &str) -> Submission {
         }
         "step" => parse_step_command(arg),
         "focus" => {
-            let (member, _) = split_first_word(arg);
+            let (member, extra) = split_first_word(arg);
             if member.is_empty() {
                 Submission::Help
+            } else if !extra.is_empty() {
+                Submission::Invalid(
+                    "/focus accepts exactly one member; trailing arguments were not used; draft kept"
+                        .to_string(),
+                )
             } else {
                 Submission::Drawer(Drawer::MemberLogs(MemberId::new(member)))
             }
         }
         "help" if arg.is_empty() => Submission::Help,
-        "team" | "runs" | "logs" | "diff" | "skills" | "new" | "resume" | "abort" | "retry"
+        "team" | "runs" | "logs" | "diff" | "new" | "clear" | "resume" | "exit" | "retry"
         | "approve" | "reject" | "help" => {
             Submission::Invalid(format!("/{cmd} does not accept arguments; draft kept"))
         }
         _ => Submission::Help,
     }
+}
+
+/// Parse a slash command aimed at one explicit member. Returning `None` means
+/// `body` is ordinary prompt text, not a slash command. Both `@member …` and
+/// `/ask member …` use this path so the latter cannot bypass the native-session
+/// and discovered-skill safeguards.
+fn parse_targeted_slash(member: &str, body: &str) -> Option<Submission> {
+    if !body.trim_start().starts_with('/') {
+        return None;
+    }
+    if let Some(rest) = targeted_command_rest(body, "attach") {
+        return Some(match (member, rest.is_empty()) {
+            ("all", _) => {
+                Submission::Invalid("/attach needs one member; use @member /attach".to_string())
+            }
+            (_, true) => Submission::Attach {
+                member: MemberId::new(member),
+            },
+            _ => Submission::Invalid("/attach does not accept arguments; draft kept".to_string()),
+        });
+    }
+    Some(if member == "all" {
+        Submission::Invalid(
+            "slash commands need one member; use @member /<discovered-skill> or /attach <member> (draft kept)"
+                .to_string(),
+        )
+    } else {
+        Submission::TargetedSlash {
+            member: MemberId::new(member),
+            body: body.to_string(),
+        }
+    })
+}
+
+fn targeted_command_rest<'a>(body: &'a str, command: &str) -> Option<&'a str> {
+    let rest = body.strip_prefix('/')?.strip_prefix(command)?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some(rest.trim())
 }
 
 fn parse_mode_selector(arg: &str) -> Submission {
@@ -255,18 +323,23 @@ fn parse_step_command(arg: &str) -> Submission {
         }
         "remove" | "delete" | "drop" => {
             let (first, rest_after_first) = split_first_word(rest);
-            let (run_id, number_text) = if let Some(run_id) = parse_run_id(first) {
-                let (number, _) = split_first_word(rest_after_first);
-                (Some(run_id), number)
+            let (run_id, number_text, extra) = if let Some(run_id) = parse_run_id(first) {
+                let (number, extra) = split_first_word(rest_after_first);
+                (Some(run_id), number, extra)
             } else {
-                let (number, _) = split_first_word(rest);
-                (None, number)
+                let (number, extra) = split_first_word(rest);
+                (None, number, extra)
             };
             let Ok(step) = number_text.parse::<u32>() else {
                 return Submission::Help;
             };
             if step == 0 {
                 return Submission::Help;
+            }
+            if !extra.is_empty() {
+                return Submission::Invalid(format!(
+                    "/step {action} does not accept trailing arguments; draft kept"
+                ));
             }
             Submission::Runtime(UiCommand::RemoveRunStep { run_id, step })
         }
@@ -296,18 +369,23 @@ fn parse_step_command(arg: &str) -> Submission {
         }
         "unassign" | "clear-owner" | "clear_owner" => {
             let (first, rest_after_first) = split_first_word(rest);
-            let (run_id, number_text) = if let Some(run_id) = parse_run_id(first) {
-                let (number, _) = split_first_word(rest_after_first);
-                (Some(run_id), number)
+            let (run_id, number_text, extra) = if let Some(run_id) = parse_run_id(first) {
+                let (number, extra) = split_first_word(rest_after_first);
+                (Some(run_id), number, extra)
             } else {
-                let (number, _) = split_first_word(rest);
-                (None, number)
+                let (number, extra) = split_first_word(rest);
+                (None, number, extra)
             };
             let Ok(step) = number_text.parse::<u32>() else {
                 return Submission::Help;
             };
             if step == 0 {
                 return Submission::Help;
+            }
+            if !extra.is_empty() {
+                return Submission::Invalid(format!(
+                    "/step {action} does not accept trailing arguments; draft kept"
+                ));
             }
             Submission::Runtime(UiCommand::AssignRunStep {
                 run_id,
@@ -424,11 +502,9 @@ mod tests {
         assert_eq!(parse("/logs"), Submission::Drawer(Drawer::Logs));
         assert_eq!(parse("/runs"), Submission::Drawer(Drawer::Runs));
         assert_eq!(parse("/team"), Submission::Drawer(Drawer::Team));
+        assert_eq!(parse("/team "), Submission::Drawer(Drawer::Team));
         assert_eq!(parse("/diff"), Submission::Drawer(Drawer::Diff));
-        assert_eq!(
-            parse("/abort"),
-            Submission::Runtime(UiCommand::Cancel { member: None })
-        );
+        assert_eq!(parse("/exit"), Submission::Exit);
         assert_eq!(parse("/retry"), Submission::Runtime(UiCommand::Retry));
         assert_eq!(
             parse("/approve"),
@@ -443,10 +519,10 @@ mod tests {
             "/runs extra",
             "/logs extra",
             "/diff extra",
-            "/skills extra",
             "/new extra",
+            "/clear extra",
             "/resume extra",
-            "/abort extra",
+            "/exit extra",
             "/retry extra",
             "/approve extra",
             "/reject extra",
@@ -460,6 +536,23 @@ mod tests {
     }
 
     #[test]
+    fn fixed_arity_commands_reject_unused_trailing_text() {
+        for command in [
+            "/focus reviewer accidental",
+            "/step remove 2 accidental",
+            "/step remove run-12 2 accidental",
+            "/step delete 2 accidental",
+            "/step unassign 3 accidental",
+            "/step clear-owner run-12 3 accidental",
+        ] {
+            assert!(
+                matches!(parse(command), Submission::Invalid(message) if message.contains("trailing")),
+                "{command} must not silently discard input"
+            );
+        }
+    }
+
+    #[test]
     fn blank_is_empty_and_unknown_slash_is_help() {
         assert_eq!(parse("   "), Submission::Empty);
         assert_eq!(parse("/wat"), Submission::Help);
@@ -467,16 +560,71 @@ mod tests {
     }
 
     #[test]
-    fn effort_command_sets_member_effort() {
+    fn model_is_not_a_composer_control() {
+        assert_eq!(parse("/model"), Submission::Help);
+        assert_eq!(parse("/model builder gpt-5.6-sol"), Submission::Help);
         assert_eq!(
-            parse("/effort builder high"),
-            Submission::Runtime(UiCommand::SetEffort {
+            parse("@builder /model gpt-5.6-sol"),
+            Submission::TargetedSlash {
                 member: MemberId::new("builder"),
-                effort: Effort::High,
-            })
+                body: "/model gpt-5.6-sol".to_string(),
+            }
         );
-        assert_eq!(parse("/effort builder"), Submission::Help);
-        assert_eq!(parse("/effort builder bogus"), Submission::Help);
+    }
+
+    #[test]
+    fn targeted_slashes_are_resolved_before_reaching_a_backend_prompt() {
+        assert_eq!(
+            parse("@builder /attach"),
+            Submission::Attach {
+                member: MemberId::new("builder"),
+            }
+        );
+        assert_eq!(
+            parse("/attach builder"),
+            Submission::Attach {
+                member: MemberId::new("builder"),
+            }
+        );
+        assert_eq!(
+            parse("@builder /unrecognized with args"),
+            Submission::TargetedSlash {
+                member: MemberId::new("builder"),
+                body: "/unrecognized with args".to_string(),
+            }
+        );
+        assert_eq!(
+            parse("/ask builder /fast"),
+            Submission::TargetedSlash {
+                member: MemberId::new("builder"),
+                body: "/fast".to_string(),
+            }
+        );
+        assert_eq!(
+            parse("/ask builder /attach"),
+            Submission::Attach {
+                member: MemberId::new("builder"),
+            }
+        );
+        for input in ["@all /attach", "/ask all /fast", "/all /fast"] {
+            assert!(
+                matches!(parse(input), Submission::Invalid(message) if message.contains("one member")),
+                "{input} must not broadcast a native-looking slash command"
+            );
+        }
+    }
+
+    #[test]
+    fn attach_rejects_missing_or_extra_arguments() {
+        assert!(matches!(parse("/attach"), Submission::Help));
+        assert!(matches!(
+            parse("/attach builder extra"),
+            Submission::Invalid(_)
+        ));
+        assert!(matches!(
+            parse("@builder /attach extra"),
+            Submission::Invalid(_)
+        ));
     }
 
     #[test]
@@ -658,9 +806,9 @@ mod tests {
     }
 
     #[test]
-    fn new_session_command() {
+    fn new_and_clear_both_start_a_fresh_session() {
         assert_eq!(parse("/new"), Submission::Runtime(UiCommand::NewSession));
-        assert_eq!(parse("/clear"), Submission::Help);
+        assert_eq!(parse("/clear"), Submission::Runtime(UiCommand::NewSession));
     }
 
     #[test]
@@ -691,8 +839,14 @@ mod tests {
     }
 
     #[test]
-    fn skills_command_opens_picker() {
-        assert_eq!(parse("/skills"), Submission::Drawer(Drawer::Skills));
+    fn removed_skills_command_falls_back_to_help() {
+        assert_eq!(parse("/skills"), Submission::Help);
         assert_eq!(parse("/skill"), Submission::Help);
+    }
+
+    #[test]
+    fn removed_abort_command_falls_back_to_help() {
+        assert_eq!(parse("/abort"), Submission::Help);
+        assert_eq!(parse("/abort extra"), Submission::Help);
     }
 }

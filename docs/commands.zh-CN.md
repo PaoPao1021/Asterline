@@ -104,6 +104,35 @@ asterline --fake
 asterline --banner
 ```
 
+### `update`
+
+按当前正在运行的二进制所属安装方式执行显式更新：
+
+- Windows Setup 管理的安装保留原有的校验安装器流程：检查最新稳定 Release，使用
+  同一 Release 的 `SHA256SUMS` 校验 Setup，安排在 Asterline 退出后运行，然后退出。
+- macOS 或 Linux 上的 Homebrew 安装会先执行 `brew update`，再执行
+  `brew upgrade song0705/asterline/asterline`。Asterline 会先确认自己的可执行文件
+  确实位于该 Formula 的安装前缀内。
+
+便携归档、直接安装的 `.deb`/`.rpm`、macOS 安装包和源码构建版不会被猜测覆盖；
+命令会明确提示对应的手动更新路径。
+
+```bash
+ast update
+```
+
+`ast --update` 继续作为向后兼容别名。
+
+### `--no-auto-update`
+
+本次启动跳过 Windows Setup 管理版本每 24 小时一次的后台更新检查。它不会永久
+关闭更新，也不会阻止显式 `--update`；对于本就不会自动更新的平台和安装方式没有
+效果。
+
+```powershell
+ast --no-auto-update
+```
+
 ### `-h`、`--help`
 
 打印命令行帮助并退出。它与产品内的 `/help` 不是同一个功能。
@@ -142,9 +171,12 @@ asterline --help
 @builder /asterline-team 检查当前运行
 ```
 
-对于 Codex，Asterline 会转换成原生 `$skill` 语法；Claude、Grok 和 Agy 保持
-`/skill`。单独输入 `/skill` 不是 Asterline 命令，前面必须有明确的成员目标。
-原生模型选择器等交互式后端命令只能通过[接入原生会话](#接入原生会话)使用。
+定向补全会填入该成员实际发现的原生调用语法：Codex 使用 `$skill`，Claude 插件 Skill
+保留 `/插件名:skill` 命名空间。为兼容手动输入，只有精确匹配已发现
+Codex Skill 的 `@<Codex 成员> /skill` 才会转换。`@member /` 会列出真正的 `/attach`，
+以及仅属于该成员的已发现 Skill。`/attach` 会打开[原生会话](#接入原生会话)，在其中可以使用
+后端自己的交互式斜杠命令菜单。除非精确匹配已发现的 Skill，未知定向 slash 命令不会进入
+非交互 runner。Slash 控制命令必须指定一个成员；Asterline 会拒绝 `@all /…`，不会把它广播出去。
 
 ## 消息与对话命令
 
@@ -182,10 +214,10 @@ asterline --help
 
 保存当前对话，创建一个新对话，清空当前显示的聊天记录和运行列表，为所有后端
 创建新的会话 ID，并把终端模式重置为 `normal`。如果仍有成员、协作运行或验证
-处于活动状态，`/new` 会被拒绝；请先执行 `/abort` 并等待取消完成。
+处于活动状态，`/new` 会被拒绝；请按 `Esc` 并等待取消完成。
 
-`/clear` 有意不作为独立命令存在。输入 `/cl` 或 `/clear` 时，补全列表会显示
-`/new`；接受补全后执行的是完整的新建对话操作，而不是仅隐藏屏幕历史。
+`/clear` 是 `/new` 的直接别名；两者都会执行完整的新建对话操作，而不是仅隐藏
+屏幕历史。正常重新打开会复用当前选中的对话，不会清空它。
 
 ### `/resume`
 
@@ -198,7 +230,7 @@ asterline --help
 取消。
 
 `/resume` 不接受 ID 或其他参数。当成员或验证任务仍在运行时不能切换，应先使用
-`/abort`。
+`Esc` 取消。
 
 ### `/retry`
 
@@ -210,15 +242,28 @@ asterline --help
 处理暂停的审批路由；这两种情况分别使用 `/continue` 和 `/approve`。如果当前
 对话没有历史用户请求，则不会发送任何内容。
 
-### `/abort`
+### `/attach`
 
 ```text
-/abort
+/attach <member>
+@member /attach
 ```
 
-取消所有正在工作的成员、排队中的派发、活动验证和暂停路由。活动中的协作或团队
-运行会以“用户中止”为原因标记为 blocked。工作仍在进行而需要 `/resume` 时，应
-先执行本命令。
+暂时挂起 Asterline，打开该成员真正的原生交互式 CLI；存在会话时会恢复该后端会话。
+使用该原生 CLI 支持的退出方式（通常是它自己的 `/exit`）后，Asterline 会自动恢复。
+新的 Claude 接入会由 Asterline 通过 `claude --session-id` 指定 UUID，因此返回后会自动导入
+记录并绑定到该成员。Codex 只导入能安全识别的已绑定会话；Claude fork 只有在既有记录能
+唯一证明谱系时才会导入。存在歧义的原生会话绝不靠猜测导入。Grok 和 Agy 可以恢复会话，
+但目前尚不会导入接入期间的消息。
+
+### `/exit`
+
+```text
+/exit
+```
+
+立即退出 Asterline。正常退出路径会取消正在执行的后端工作并恢复终端。它仅是
+Asterline 的命令；接入原生后端 CLI 时，那个 CLI 自己的 `/exit` 会返回 Asterline。
 
 ### `/approve`
 
@@ -236,7 +281,7 @@ asterline --help
 
 拒绝最早的一条待处理 Asterline 审批请求。没有待审批项时会给出提示。
 
-## 团队、模型与诊断命令
+## 团队与诊断命令
 
 ### `/team`
 
@@ -245,41 +290,13 @@ asterline --help
 ```
 
 打开实时 Team 编辑器。打开时会刷新系统中可用的 Codex、Claude、Grok、Agy
-可执行文件，并自动发现每个已安装后端支持的模型和 reasoning effort。缺失的 CLI
-仍会显示以便诊断，但不能被选中。
+可执行文件。模型目录会在 `ast` 启动时异步加载一次，因此编辑器不会卡住且会显示
+实际检测到的模型。在该成员的 `model` 字段按 `t` 可随时重新拉取；同一后端和
+工作目录的成员会共享结果。缺失的 CLI 仍会显示以便诊断，但不能被选中。
 
-可编辑成员列表、后端、角色、模型、effort、工作目录、原生 session ID、审批行为
+可编辑成员列表、后端、角色、模型、effort、原生 session ID、审批行为
 和默认目标。修改先保存在草稿中，按 `s` 才会应用并保存。完整按键见
 [Team 编辑器](#team-编辑器)。
-
-### `/effort`
-
-```text
-/effort <member> <level>
-```
-
-设置指定成员的推理强度，并随当前对话保存。可用级别取决于模型：
-
-- 通用候选值：`low`、`medium`、`high`、`xhigh`、`max`。
-- Agy 仅接受 `low`、`medium`、`high`。
-- 所选 Codex 模型声明支持时，还可使用 `ultra`。
-
-```text
-/effort builder high
-```
-
-优先使用 `/team` 的模型列表：它会同时应用模型和该模型实际发现的 effort。
-不支持的级别或不存在的成员会被拒绝。
-
-### `/skills`
-
-```text
-/skills
-```
-
-重新扫描工作区和用户 Skill 目录，然后打开 Skill 选择器。按 `Enter` 或 `Tab`
-只会把所选 Skill 调用填入输入框，并使用默认目标（没有时使用第一个成员）；再次
-提交后才真正执行。
 
 ### `/focus`
 
@@ -449,7 +466,7 @@ Coordinator 修复，直到达到配置的迭代上限。
 /block [run-<id>] <reason>
 ```
 
-把所选运行标记为 blocked 并记录原因。正在验证的运行必须先 `/abort`，才能手动
+把所选运行标记为 blocked 并记录原因。正在验证的运行必须先按 `Esc`，才能手动
 标记 blocked。
 
 ```text
@@ -548,7 +565,7 @@ Coordinator 修复，直到达到配置的迭代上限。
 | 鼠标拖动                       | 选择并复制聊天、状态栏或抽屉文字                            |
 | 鼠标滚轮                       | 滚动聊天或当前抽屉                                          |
 | `Esc`                          | 关闭浮层、清除搜索或取消运行中的工作                        |
-| `Ctrl+O` / `Ctrl+G` / `Ctrl+T` | 展开或折叠成功的工具输出                                    |
+| `Ctrl+O` / `Ctrl+G` / `Ctrl+T` | 展开或折叠详细输出（工具输出和 Claude 思考）                |
 | `Ctrl+L`                       | 打开日志                                                    |
 | `Ctrl+P`                       | 打开命令面板                                                |
 | `Ctrl+N` / `Ctrl+B`            | 聚焦下一/上一个成员                                         |
@@ -572,15 +589,16 @@ Team 编辑器包含“选择成员”和“选择字段”两层。
 | `Enter`   | 打开成员字段                     | 编辑或打开 Agent/模型/会话列表   |
 | `Esc`     | 关闭 Team                        | 返回成员选择                     |
 | `a` / `d` | 添加/删除成员                    | —                                |
-| `t`       | 把成员设为默认目标               | —                                |
+| `t`       | 把成员设为默认目标               | 重试失败的模型目录               |
 | `*`       | 把全体成员设为默认目标           | —                                |
 | `s`       | 应用并保存                       | 应用并保存                       |
 | `e`       | —                                | 手动输入模型或 session ID        |
 
 文本字段会打开专用输入框；`Enter` 提交，`Esc` 取消。模型列表用 `↑`、`↓`
-选择模型，用 `←`、`→` 选择该模型的 effort，按 `Enter` 同时应用。发现结果
-非空时，初始项是 CLI 标记的默认模型，否则取第一个发现的模型；只有没有发现任何
-模型时才显示 `default`。
+选择模型，用 `←`、`→` 选择该模型的 effort，按 `Enter` 同时应用。发现到模型时，
+会直接选中 CLI 报告的实际默认模型；只有空目录才显示通用的 `default` 项。
+只用 `↑`、`↓` 浏览不会改动已有的 effort 覆盖值；若新模型没有公布该覆盖值，
+按 `Enter` 会保留当前设置，必须用 `←`、`→` 明确选择它公布的值，绝不会猜测替换。
 
 在 `session id` 字段按 `Enter` 会打开 Asterline 原生会话表。它读取本地 Codex、
 Claude 或 Grok 历史，显示标题、项目、更新时间和原生 ID，并只保留属于该成员
@@ -601,7 +619,7 @@ Claude 或 Grok 历史，显示标题、项目、更新时间和原生 ID，并�
 | `Esc`                 | 关闭抽屉                                                    |
 
 `Enter` 和 `Tab` 只会把文字放入输入框，不会立即执行。切换运行会清除当前步骤
-选择。
+选择。要取消活动工作，先按 `Esc` 关闭抽屉，再按一次 `Esc`。
 
 ## 其他抽屉
 
@@ -611,9 +629,10 @@ Claude 或 Grok 历史，显示标题、项目、更新时间和原生 ID，并�
 ## 接入原生会话
 
 按 `Ctrl+N` 或 `Ctrl+B` 聚焦顶部成员栏，用 `←`、`→` 移动，再按 `Enter`。
-Asterline 会暂时挂起 TUI，打开所选成员的原生交互式 CLI。通过 `/exit` 或
-Unix 上的 `Ctrl+D` 退出后返回；Windows 上请使用 `/exit`，或按 `Ctrl+Z` 后再按
-`Enter`。
+也可以使用 `/attach <member>` 或 `@member /attach`。Asterline 会暂时挂起 TUI，打开
+所选成员的原生交互式 CLI。请使用该 CLI 支持的退出方式（通常是 `/exit`）；只有后端接受
+EOF 时，EOF 才会返回 Asterline。
 
-接入 Codex 或 Claude 时产生的消息会导回 Asterline 聊天记录。Grok 和 Agy
-可以恢复原生会话，但目前不会导入接入期间的消息。
+新的 Claude 接入会由 Asterline 通过 `claude --session-id` 指定 UUID，返回后会自动导入并绑定。
+Codex 只导入能安全识别的已绑定会话；Claude fork 只有在既有记录能唯一证明谱系时才会导入。
+存在歧义的原生会话绝不靠猜测导入。Grok 和 Agy 可以恢复原生会话，但目前不会导入接入期间的消息。
