@@ -55,6 +55,7 @@ export function Sidebar({
       <div className="brand-row">
         <img className="brand-mark" src="/asterline-mark.svg" alt="" />
         <div className="brand-copy">
+          <span className="brand-overline" aria-hidden="true">COLLECTIVE / 01</span>
           <strong>{t("appName")}</strong>
           <small>{t("desktop")}</small>
         </div>
@@ -66,7 +67,7 @@ export function Sidebar({
       <button className="new-chat-button" onClick={onNew}>
         <PlusIcon size={17} />
         <span>{t("newChat")}</span>
-        <kbd>⌘ N</kbd>
+        <kbd>CTRL N</kbd>
       </button>
 
       <div className="workspace-card">
@@ -117,7 +118,7 @@ export function Sidebar({
           <SettingsIcon size={17} />
           <span>{t("settings")}</span>
         </button>
-        <div className="profile-dot">A</div>
+        <div className="profile-status"><span className="profile-dot">A</span><small>LOCAL / READY</small></div>
       </div>
     </aside>
   );

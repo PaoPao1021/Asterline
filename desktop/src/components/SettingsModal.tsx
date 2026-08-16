@@ -9,7 +9,7 @@ import type {
   TeamSettingsV1,
 } from "../bridge/types";
 import type { Translate } from "../i18n";
-import { AlertIcon, CheckIcon, PlusIcon, SettingsIcon, UsersIcon, XIcon } from "./Icons";
+import { AlertIcon, ApprovalIcon, CheckIcon, ModeIcon, PlusIcon, SettingsIcon, UsersIcon, XIcon } from "./Icons";
 
 type SettingsTab = "general" | "members" | "approvals" | "modes";
 
@@ -266,7 +266,7 @@ export function SettingsModal({ settings, busy, t, onClose, onSave }: SettingsMo
         <header className="settings-header"><div><span className="settings-header-icon"><SettingsIcon /></span><div><h2 id="settings-title">{t("settings")}</h2><p>{draft.name}</p></div></div><button className="icon-button" onClick={onClose} disabled={busy} aria-label={t("close")}><XIcon /></button></header>
         <div className="settings-body">
           <nav className="settings-nav" aria-label={t("settings")}>
-            {(["general", "members", "approvals", "modes"] as SettingsTab[]).map((value) => <button key={value} className={tab === value ? "active" : ""} onClick={() => setTab(value)}>{value === "members" ? <UsersIcon size={16} /> : value === "approvals" ? <AlertIcon size={16} /> : <SettingsIcon size={16} />}{t(value === "members" ? "memberSettings" : value)}</button>)}
+            {(["general", "members", "approvals", "modes"] as SettingsTab[]).map((value) => <button key={value} className={tab === value ? "active" : ""} onClick={() => setTab(value)}>{value === "members" ? <UsersIcon size={16} /> : value === "approvals" ? <ApprovalIcon size={16} /> : value === "modes" ? <ModeIcon size={16} /> : <SettingsIcon size={16} />}{t(value === "members" ? "memberSettings" : value)}</button>)}
           </nav>
           <main className="settings-content">
             {tab === "general" && <GeneralSettings draft={draft} setDraft={setDraft} t={t} />}

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { getDesktopClient } from "./bridge/client";
 import type { DesktopCommandV1, DesktopEventV1, TeamSettingsV1, TerminalMode } from "./bridge/types";
 import { parseComposerInput } from "./commands";
@@ -75,6 +75,8 @@ export function App() {
   const [toast, setToast] = useState<{ id: number; text: string; tone?: "error" | "success" } | null>(null);
   const pendingEvents = useRef<DesktopEventV1[]>([]);
   const hasSnapshot = useRef(false);
+  const shell = useRef<HTMLDivElement>(null);
+  const pointerFrame = useRef<number | null>(null);
   const timelineScroll = useRef<HTMLDivElement>(null);
   const pendingTeamSettings = useRef<string | null>(null);
   const t = useMemo(() => createTranslator(locale), [locale]);
@@ -139,6 +141,10 @@ export function App() {
     document.documentElement.lang = locale;
     localStorage.setItem("asterline.locale", locale);
   }, [locale]);
+
+  useEffect(() => () => {
+    if (pointerFrame.current !== null) cancelAnimationFrame(pointerFrame.current);
+  }, []);
 
   useEffect(() => {
     let sidebarIsCompact = window.innerWidth <= SIDEBAR_BREAKPOINT;
@@ -284,6 +290,18 @@ export function App() {
     });
   };
 
+  const moveArtField = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const x = event.clientX;
+    const y = event.clientY;
+    if (pointerFrame.current !== null) cancelAnimationFrame(pointerFrame.current);
+    pointerFrame.current = requestAnimationFrame(() => {
+      shell.current?.style.setProperty("--pointer-x", `${x}px`);
+      shell.current?.style.setProperty("--pointer-y", `${y}px`);
+      shell.current?.style.setProperty("--pointer-tilt-x", `${(x / window.innerWidth - 0.5) * 2}`);
+      shell.current?.style.setProperty("--pointer-tilt-y", `${(y / window.innerHeight - 0.5) * 2}`);
+    });
+  };
+
   const membersBusy = snapshot?.members.some(({ status }) => status === "running" || status === "queued") ?? false;
 
   if (state.loading && !snapshot) {
@@ -297,7 +315,14 @@ export function App() {
 
   const teamSettings = snapshot?.team ?? fallbackTeam(snapshot?.workspace ?? "");
   return (
-    <div className="app-shell">
+    <div className="app-shell" ref={shell} onPointerMove={moveArtField}>
+      <div className="art-canvas" aria-hidden="true">
+        <span className="art-orbit art-orbit-one" />
+        <span className="art-orbit art-orbit-two" />
+        <span className="art-flare art-flare-one" />
+        <span className="art-flare art-flare-two" />
+        <span className="art-grid" />
+      </div>
       <Sidebar
         open={sidebarOpen}
         locale={locale}
@@ -316,9 +341,13 @@ export function App() {
       />
 
       <main className="workspace-main">
+        <div className="stage-wordmark" aria-hidden="true">
+          <span>ASTERLINE</span>
+          <small>ORCHESTRATED INTELLIGENCE / LIVE SYSTEM</small>
+        </div>
         <header className="topbar">
           {!sidebarOpen && <button className="icon-button mobile-panel-button" onClick={toggleSidebar} aria-label={t("expand")}><PanelLeftIcon /></button>}
-          <div className="topbar-title"><span className="topbar-folder"><FolderIcon size={16} /></span><div><strong>{snapshot?.team?.name || snapshot?.workspace?.split(/[\\/]/).at(-1) || t("workspace")}</strong><small><i className={snapshot?.phase === "ready" ? "online" : ""} />{snapshot?.phase === "ready" ? t("connected") : t("starting")}</small></div></div>
+          <div className="topbar-title"><span className="topbar-folder"><FolderIcon size={16} /></span><div><span className="topbar-kicker">LIVE WORKSPACE / 01</span><strong>{snapshot?.team?.name || snapshot?.workspace?.split(/[\\/]/).at(-1) || t("workspace")}</strong><small><i className={snapshot?.phase === "ready" ? "online" : ""} />{snapshot?.phase === "ready" ? t("connected") : t("starting")}</small></div></div>
           <div className="topbar-actions">
             {client.kind === "mock" && <span className="demo-pill">{t("demo")}</span>}
             <button className="icon-button" aria-label={t("language")} title={t("language")} onClick={() => setLocale((value) => value === "zh-CN" ? "en-US" : "zh-CN")}><GlobeIcon /><small>{locale === "zh-CN" ? "中" : "EN"}</small></button>
