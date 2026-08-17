@@ -285,6 +285,30 @@ pub fn validate_mode_overrides(config: &TeamConfig, overrides: &ModesConfig) -> 
     Ok(())
 }
 
+/// Validate the mode sections stored directly on a team configuration.
+///
+/// Only explicitly configured modes are checked. Unconfigured modes keep
+/// their runtime-derived defaults, so a normal one-member chat team remains
+/// valid without having to satisfy every collaboration mode's roster rules.
+pub fn validate_configured_modes(config: &TeamConfig) -> Result<(), String> {
+    if config.modes.review.is_some() {
+        resolve_mode_roles(config, CollabMode::Review)?;
+    }
+    if config.modes.plan.is_some() {
+        resolve_mode_roles(config, CollabMode::Plan)?;
+        resolve_plan_builder(config)?;
+        resolve_plan_reviewer(config)?;
+    }
+    if config.modes.brainstorm.is_some() {
+        resolve_mode_roles(config, CollabMode::Brainstorm)?;
+    }
+    if config.modes.team.is_some() {
+        resolve_team_coordinator(config)?;
+        resolve_team_limits(config)?;
+    }
+    Ok(())
+}
+
 pub fn validate_terminal_mode(config: &TeamConfig, mode: TerminalMode) -> Result<(), String> {
     match mode {
         TerminalMode::Normal => Ok(()),

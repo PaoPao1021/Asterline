@@ -119,8 +119,9 @@ impl SqliteStore {
                 ),
             )));
         }
-        self.conn
-            .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+        self.conn.execute_batch(
+            "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;",
+        )?;
         if version < SQLITE_SCHEMA_VERSION {
             self.migrate(version)?;
             self.conn

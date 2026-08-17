@@ -259,6 +259,20 @@ published with the release. The Windows installer embeds Microsoft's signed
 Evergreen WebView2 bootstrapper, installs the runtime when absent, and the
 release job launches the installed application before publishing it.
 
+Windows Desktop releases fail closed unless these repository secrets are
+present:
+
+- `WINDOWS_SIGNING_CERTIFICATE_PFX_BASE64`
+- `WINDOWS_SIGNING_CERTIFICATE_PASSWORD`
+- `WINDOWS_SIGNING_CERTIFICATE_SUBJECT` (the certificate's complete subject,
+  for example `CN=Example, O=Example Corp, C=US`)
+
+The workflow signs and verifies both `asterline-desktop.exe` and the final Inno
+Setup executable with SHA-256 and an RFC 3161 timestamp before publishing. The
+PFX must contain a publicly trusted code-signing certificate for the intended
+Asterline publisher. The workflow fails if the verified signer subject does not
+exactly match `WINDOWS_SIGNING_CERTIFICATE_SUBJECT` (case-insensitive).
+
 macOS artifacts require the same certificate secrets as the CLI release plus
 the App Store Connect API-key secrets documented above. The Desktop release
 workflow fails closed when they are absent so an unsigned DMG cannot be

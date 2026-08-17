@@ -54,7 +54,9 @@ supported compatibility window.
 
 Recent-project metadata and UI preferences are app-local. Project prompts,
 responses, tool output, approvals, and provider session identifiers stay in the
-workspace's `.asterline` directory. Desktop V1 sends no telemetry.
+workspace's `.asterline` directory. Desktop V1 sends no telemetry. It keeps a
+bounded local diagnostic log, records an unclean-exit marker, and lets the user
+export a diagnostic text report from the Logs drawer.
 
 ## Run from source
 
@@ -80,6 +82,7 @@ Quality checks:
 cd desktop
 pnpm lint
 pnpm test
+pnpm test:e2e
 pnpm build
 cargo test --manifest-path src-tauri/Cargo.toml --locked
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
@@ -98,14 +101,16 @@ existing `v<version>` form.
 Release artifacts are produced for Windows x64, macOS Intel and Apple silicon,
 and Linux x64 and ARM64:
 
-- Windows: per-user Inno Setup installer (including the signed Evergreen
-  WebView2 bootstrapper) and portable ZIP.
+- Windows: Authenticode-signed per-user Inno Setup installer and portable
+  executable (including the signed Evergreen WebView2 bootstrapper).
 - macOS: Developer ID signed and notarized DMG and portable app archive for
   each architecture. The release fails when signing credentials are absent.
 - Linux: AppImage built natively on each architecture.
 
-The app's manual update check only considers `desktop-v*` releases and never
-installs an update automatically.
+The app's manual update check only considers `desktop-v*` releases. When an
+update exists, it shows both versions and can open only the official Asterline
+GitHub Release page in the system browser. It never installs an update
+automatically.
 
 Use the Windows installer on systems that may not already have WebView2. The
 portable ZIP does not install operating-system prerequisites.

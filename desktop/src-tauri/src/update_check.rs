@@ -1,3 +1,4 @@
+use std::process::Command;
 use std::time::Duration;
 
 use semver::Version;
@@ -7,6 +8,39 @@ const RELEASES_API: &str = "https://api.github.com/repos/song0705/Asterline/rele
 const RELEASE_URL_PREFIX: &str = "https://github.com/song0705/Asterline/releases/";
 const DESKTOP_TAG_PREFIX: &str = "desktop-v";
 const RESPONSE_LIMIT: u64 = 2 * 1024 * 1024;
+
+fn trusted_release_url(url: &str) -> bool {
+    url.strip_prefix(RELEASE_URL_PREFIX).is_some_and(|suffix| {
+        !suffix.is_empty()
+            && !suffix
+                .chars()
+                .any(|ch| ch.is_control() || ch.is_whitespace())
+    })
+}
+
+pub fn open_release(url: &str) -> Result<(), String> {
+    if !trusted_release_url(url) {
+        return Err("refusing to open an untrusted update URL".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    let status = Command::new("rundll32.exe")
+        .arg("url.dll,FileProtocolHandler")
+        .arg(url)
+        .status();
+
+    #[cfg(target_os = "macos")]
+    let status = Command::new("open").arg(url).status();
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let status = Command::new("xdg-open").arg(url).status();
+
+    let status = status.map_err(|error| format!("could not open the update page: {error}"))?;
+    if !status.success() {
+        return Err(format!("the system browser exited with status {status}"));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DesktopUpdateV1 {
@@ -130,5 +164,18 @@ mod tests {
         ];
         let (version, _) = latest_desktop_release(releases).unwrap();
         assert_eq!(version, Version::new(2, 0, 0));
+    }
+
+    #[test]
+    fn only_official_release_urls_can_be_opened() {
+        assert!(trusted_release_url(
+            "https://github.com/song0705/Asterline/releases/tag/desktop-v1.0.0"
+        ));
+        assert!(!trusted_release_url(
+            "https://github.com.example/song0705/Asterline/releases/tag/desktop-v1.0.0"
+        ));
+        assert!(!trusted_release_url(
+            "https://github.com/song0705/Asterline/releases/\nmalicious"
+        ));
     }
 }

@@ -291,6 +291,11 @@ export interface DesktopUpdateV1 {
   error?: string | null;
 }
 
+export interface DiagnosticsStatusV1 {
+  previous_unclean_exit: boolean;
+  log_path: string;
+}
+
 export interface AttachCapabilitiesV1 {
   supported: boolean;
   terminal?: string | null;
@@ -316,6 +321,9 @@ export interface DesktopClient {
   listRecentWorkspaces(): Promise<RecentWorkspaceV1[]>;
   forgetRecentWorkspace(workspace: string): Promise<void>;
   checkDesktopUpdate(): Promise<DesktopUpdateV1>;
+  openDesktopUpdate(url: string): Promise<void>;
+  getDesktopDiagnosticsStatus(): Promise<DiagnosticsStatusV1>;
+  exportDesktopDiagnostics(): Promise<string>;
   getAttachCapabilities(): Promise<AttachCapabilitiesV1>;
   openNativeSession(member: string): Promise<ExternalAttachLaunchV1>;
 }

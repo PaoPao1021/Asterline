@@ -49,6 +49,10 @@ jobs:
         run: pnpm --dir desktop test
       - name: Build web assets
         run: pnpm --dir desktop build
+      - name: Install Playwright browser
+        run: pnpm --dir desktop exec playwright install --with-deps chromium
+      - name: Run critical Desktop UI flows
+        run: pnpm --dir desktop test:e2e
 
   native:
     name: Desktop native · ${{ matrix.name }}

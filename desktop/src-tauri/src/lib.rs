@@ -1,5 +1,6 @@
 mod attach;
 mod bridge;
+mod diagnostics;
 mod platform_env;
 mod recent;
 mod session_adapter;
@@ -17,9 +18,10 @@ use tauri::{AppHandle, Emitter, Manager, Runtime, State, WindowEvent};
 use attach::{AttachCapabilitiesV1, ExternalAttachLaunchV1};
 use bridge::{
     DESKTOP_EVENT_CHANNEL, DesktopCommandV1, DesktopEventV1, DesktopModel, DesktopPhase,
-    DesktopRuntimeEventV1, DesktopSnapshotV1, DiffResultV1, LogEntryV1, LogLevelV1,
-    RunStatusV1, SkillSummaryV1, envelope,
+    DesktopRuntimeEventV1, DesktopSnapshotV1, DiffResultV1, LogEntryV1, LogLevelV1, RunStatusV1,
+    SkillSummaryV1, envelope,
 };
+use diagnostics::{Diagnostics, DiagnosticsStatusV1};
 use recent::RecentWorkspaceV1;
 use session_adapter::{ActiveSession, BootstrapAdapterOutcome, PendingTeamSetup, PreparedSession};
 use update_check::DesktopUpdateV1;
@@ -390,6 +392,26 @@ async fn check_desktop_update() -> DesktopUpdateV1 {
 }
 
 #[tauri::command]
+fn get_desktop_diagnostics_status(
+    diagnostics: State<'_, Diagnostics>,
+) -> Result<DiagnosticsStatusV1, String> {
+    diagnostics.status()
+}
+
+#[tauri::command]
+fn export_desktop_diagnostics(
+    app: AppHandle,
+    diagnostics: State<'_, Diagnostics>,
+) -> Result<String, String> {
+    diagnostics.export(&app)
+}
+
+#[tauri::command]
+fn open_desktop_update(url: String) -> Result<(), String> {
+    update_check::open_release(&url)
+}
+
+#[tauri::command]
 fn get_attach_capabilities() -> AttachCapabilitiesV1 {
     attach::capabilities()
 }
@@ -662,6 +684,15 @@ fn emit_locked<R: Runtime>(
         snapshot.sequence = sequence;
     }
     let event = envelope(sequence, event);
+    if let DesktopRuntimeEventV1::RuntimeLog {
+        level,
+        source,
+        message,
+    } = &event.event
+        && let Some(diagnostics) = app.try_state::<Diagnostics>()
+    {
+        diagnostics.write(level, source, message);
+    }
     let _ = app.emit(DESKTOP_EVENT_CHANNEL, &event);
     event
 }
@@ -720,6 +751,13 @@ pub fn run() {
     platform_env::restore_desktop_path();
     tauri::Builder::default()
         .manage(DesktopHost::default())
+        .setup(|app| {
+            let diagnostics =
+                Diagnostics::initialize(app.handle()).map_err(std::io::Error::other)?;
+            diagnostics.install_panic_hook();
+            app.manage(diagnostics);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             bootstrap_desktop,
             get_desktop_snapshot,
@@ -728,6 +766,9 @@ pub fn run() {
             list_recent_workspaces,
             forget_recent_workspace,
             check_desktop_update,
+            open_desktop_update,
+            get_desktop_diagnostics_status,
+            export_desktop_diagnostics,
             get_attach_capabilities,
             open_native_session,
         ])
@@ -744,7 +785,12 @@ pub fn run() {
                     if let Some(active) = active {
                         api.prevent_close();
                         active.shutdown();
+                        if let Some(diagnostics) = window.try_state::<Diagnostics>() {
+                            diagnostics.mark_clean();
+                        }
                         window.app_handle().exit(0);
+                    } else if let Some(diagnostics) = window.try_state::<Diagnostics>() {
+                        diagnostics.mark_clean();
                     }
                 }
                 WindowEvent::Destroyed => {

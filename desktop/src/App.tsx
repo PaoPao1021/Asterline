@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { getDesktopClient } from "./bridge/client";
-import type { BackendKind, DesktopCommandV1, DesktopEventV1, LogEntryV1, TeamSettingsV1, TerminalMode } from "./bridge/types";
+import type { BackendKind, DesktopCommandV1, DesktopEventV1, DesktopUpdateV1, LogEntryV1, TeamSettingsV1, TerminalMode } from "./bridge/types";
 import { parseComposerInput } from "./commands";
 import { ApprovalQueue } from "./components/ApprovalQueue";
 import { Composer } from "./components/Composer";
-import { FolderIcon, GlobeIcon, MoonIcon, PanelLeftIcon, PanelRightIcon, RefreshIcon, SettingsIcon, SunIcon, XIcon } from "./components/Icons";
+import { ChevronIcon, FolderIcon, GlobeIcon, MoonIcon, PanelLeftIcon, PanelRightIcon, RefreshIcon, SettingsIcon, SunIcon, XIcon } from "./components/Icons";
 import { Inspector } from "./components/Inspector";
 import { ProjectPicker } from "./components/ProjectPicker";
 import { SettingsModal } from "./components/SettingsModal";
@@ -68,6 +68,7 @@ export function App() {
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [projectBusy, setProjectBusy] = useState(false);
   const [updateBusy, setUpdateBusy] = useState(false);
+  const [availableUpdate, setAvailableUpdate] = useState<DesktopUpdateV1 | null>(null);
   const [approvalBusy, setApprovalBusy] = useState<number | null>(null);
   const [resolvingRoute, setResolvingRoute] = useState<string | null>(null);
   const [resolvedRoutes, setResolvedRoutes] = useState<Set<string>>(() => new Set());
@@ -83,6 +84,7 @@ export function App() {
   const pointerFrame = useRef<number | null>(null);
   const timelineScroll = useRef<HTMLDivElement>(null);
   const pendingTeamSettings = useRef<string | null>(null);
+  const diagnosticsChecked = useRef(false);
   const t = useMemo(() => createTranslator(locale), [locale]);
   const snapshot = state.snapshot;
 
@@ -112,6 +114,13 @@ export function App() {
         catch (error) { notify(errorMessage(error), "error"); }
       }
       await refreshRecents();
+      if (!diagnosticsChecked.current) {
+        diagnosticsChecked.current = true;
+        try {
+          const diagnostics = await client.getDesktopDiagnosticsStatus();
+          if (diagnostics.previous_unclean_exit) notify(t("uncleanExit"), "error");
+        } catch { /* Diagnostics are best-effort and never block workspace startup. */ }
+      }
     } catch (error) {
       reduce({ type: "error", error: errorMessage(error) });
     }
@@ -266,10 +275,30 @@ export function App() {
     try {
       const result = await client.checkDesktopUpdate();
       if (result.error) notify(result.error, "error");
-      else if (result.update_available) notify(t("updateAvailable", { version: result.available_version ?? "" }), "success");
+      else if (result.update_available && result.release_url) setAvailableUpdate(result);
       else notify(t("noUpdate"), "success");
     } catch (error) { notify(errorMessage(error), "error"); }
     finally { setUpdateBusy(false); }
+  };
+
+  const openUpdate = async () => {
+    const url = availableUpdate?.release_url;
+    if (!url) return;
+    try {
+      await client.openDesktopUpdate(url);
+      setAvailableUpdate(null);
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    }
+  };
+
+  const exportDiagnostics = async () => {
+    try {
+      const path = await client.exportDesktopDiagnostics();
+      notify(t("diagnosticsExported", { path }), "success");
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    }
   };
 
   const resolvePausedRoute = async (itemId: string, resume: boolean) => {
@@ -414,10 +443,30 @@ export function App() {
 
       <Inspector open={inspectorOpen} members={snapshot?.members ?? []} runs={snapshot?.runs ?? []} locale={locale} t={t} onToggle={toggleInspector} dispatch={dispatch} onAttach={attach} />
 
-      {utilityKind && <UtilityDrawer kind={utilityKind} locale={locale} t={t} logs={state.utility.logs} diff={state.utility.diff} skills={state.utility.skills} timelineText={(snapshot?.timeline ?? []).map((item) => ({ id: item.id, title: item.title || item.kind, text: item.text || item.detail || "" }))} initialQuery={utilityQuery} onClose={() => setUtilityKind(null)} onOpen={openUtility} onRefresh={(kind, filters) => void requestUtility(kind, filters)} />}
+      {utilityKind && <UtilityDrawer kind={utilityKind} locale={locale} t={t} logs={state.utility.logs} diff={state.utility.diff} skills={state.utility.skills} timelineText={(snapshot?.timeline ?? []).map((item) => ({ id: item.id, title: item.title || item.kind, text: item.text || item.detail || "" }))} initialQuery={utilityQuery} onClose={() => setUtilityKind(null)} onOpen={openUtility} onRefresh={(kind, filters) => void requestUtility(kind, filters)} onExportDiagnostics={exportDiagnostics} />}
 
       {projectPicker && <ProjectPicker recents={recents} canClose={Boolean(snapshot?.workspace)} initialPath={snapshot?.workspace ?? ""} busy={projectBusy} t={t} onClose={() => setProjectPicker(false)} onOpen={openWorkspace} />}
       {settingsOpen && <SettingsModal settings={teamSettings} busy={settingsBusy} t={t} onClose={() => setSettingsOpen(false)} onSave={saveSettings} />}
+      {availableUpdate && (
+        <div className="modal-backdrop update-backdrop" role="presentation">
+          <section className="update-modal" role="dialog" aria-modal="true" aria-labelledby="update-title">
+            <header>
+              <span className="update-modal-icon"><RefreshIcon /></span>
+              <div><h2 id="update-title">{t("updateTitle")}</h2><p>{t("updateBody")}</p></div>
+              <button className="icon-button" onClick={() => setAvailableUpdate(null)} aria-label={t("close")}><XIcon /></button>
+            </header>
+            <div className="update-version-grid">
+              <div><small>{t("currentVersion")}</small><strong>{availableUpdate.current_version}</strong></div>
+              <span><ChevronIcon /></span>
+              <div><small>{t("availableVersion")}</small><strong>{availableUpdate.available_version}</strong></div>
+            </div>
+            <footer>
+              <button className="secondary-button" onClick={() => setAvailableUpdate(null)}>{t("later")}</button>
+              <button className="primary-button" onClick={() => void openUpdate()}>{t("downloadUpdate")}</button>
+            </footer>
+          </section>
+        </div>
+      )}
       {toast && <div className={`toast ${toast.tone ?? ""}`} role="status"><span>{toast.text}</span><button onClick={() => setToast(null)} aria-label={t("close")}><XIcon size={14} /></button></div>}
     </div>
   );

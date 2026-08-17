@@ -697,6 +697,7 @@ impl DesktopModel {
                 default_target: _,
                 members,
                 runs,
+                ..
             } => {
                 self.snapshot.phase = DesktopPhase::Ready;
                 self.snapshot.workspace = Some(workspace);
@@ -707,6 +708,9 @@ impl DesktopModel {
                     snapshot: self.snapshot(),
                 }
             }
+            ModesUpdated { .. } => DesktopRuntimeEventV1::Notice {
+                message: "collaboration mode settings updated".to_string(),
+            },
             ModeChanged { mode } => {
                 let mode = terminal_mode(mode.as_str());
                 self.snapshot.mode = mode;
@@ -744,6 +748,12 @@ impl DesktopModel {
                     }
                 }
             }
+            QueueUpdated { member, prompts } => DesktopRuntimeEventV1::Notice {
+                message: format!("{} queued prompt(s) for {member}", prompts.len()),
+            },
+            QueuedPromptReturned { member, body } => DesktopRuntimeEventV1::Notice {
+                message: format!("queued prompt returned for {member}: {body}"),
+            },
             MessageStarted { msg, turn, member } => {
                 let member_id = member.to_string();
                 let (display_name, backend) = self.member_identity(&member_id);
@@ -782,6 +792,11 @@ impl DesktopModel {
                 item.text = Some(text);
                 self.add_timeline(item)
             }
+            ReasoningCompleted { member } => DesktopRuntimeEventV1::RuntimeLog {
+                level: "debug".to_string(),
+                source: member.to_string(),
+                message: "reasoning completed".to_string(),
+            },
             ToolStarted {
                 member,
                 tool_id,
@@ -832,7 +847,12 @@ impl DesktopModel {
                 item.member = Some(member_id);
                 item.display_name = display_name;
                 item.backend = backend;
-                item.files = Some(files);
+                item.files = Some(
+                    files
+                        .into_iter()
+                        .map(|file| (file.path, file.kind))
+                        .collect(),
+                );
                 item.ok = Some(ok);
                 self.add_timeline(item)
             }
@@ -1252,6 +1272,20 @@ fn timeline_from_chat(id: String, item: ChatItem) -> TimelineItemV1 {
             item.text = Some(text);
             item
         }
+        ChatItem::Thinking {
+            member,
+            display_name,
+            backend,
+            text,
+            ..
+        } => {
+            let mut item = TimelineItemV1::new(id, TimelineKindV1::Reasoning);
+            item.member = Some(member.to_string());
+            item.display_name = Some(display_name);
+            item.backend = Some(backend_kind(backend.as_str()));
+            item.text = Some(text);
+            item
+        }
         ChatItem::Tool {
             member,
             name,
@@ -1270,7 +1304,12 @@ fn timeline_from_chat(id: String, item: ChatItem) -> TimelineItemV1 {
         ChatItem::Diff { member, files, .. } => {
             let mut item = TimelineItemV1::new(id, TimelineKindV1::Diff);
             item.member = Some(member.to_string());
-            item.files = Some(files);
+            item.files = Some(
+                files
+                    .into_iter()
+                    .map(|file| (file.path, file.kind))
+                    .collect(),
+            );
             item
         }
         ChatItem::Route { from, to, body } => {

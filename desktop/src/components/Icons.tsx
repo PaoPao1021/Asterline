@@ -9,6 +9,7 @@ import {
   Command,
   Copy,
   Cpu,
+  Download,
   Ellipsis,
   FileCode2,
   Flame,
@@ -91,6 +92,7 @@ export const BotIcon = withDefaults(Bot);
 export const CodeIcon = withDefaults(Code2);
 export const CommandIcon = withDefaults(Command);
 export const CopyIcon = withDefaults(Copy);
+export const DownloadIcon = withDefaults(Download);
 export const CpuIcon = withDefaults(Cpu);
 export const FlameIcon = withDefaults(Flame);
 export const LayersIcon = withDefaults(Layers);

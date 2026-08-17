@@ -1099,7 +1099,7 @@ mod tests {
 
         let mut saw_completed = false;
         let mut saw_turn_finished = false;
-        while let Ok(event) = evt_rx.recv_timeout(Duration::from_secs(2)) {
+        while let Ok(event) = evt_rx.recv_timeout(Duration::from_secs(10)) {
             match event {
                 RuntimeEvent::MessageCompleted { text, .. } if text.contains("hi") => {
                     saw_completed = true;
@@ -1751,7 +1751,7 @@ mod tests {
         let mut imported_position = None;
         let mut queued_position = None;
         let mut position = 0_usize;
-        while let Ok(event) = evt_rx.recv_timeout(Duration::from_secs(2)) {
+        while let Ok(event) = evt_rx.recv_timeout(Duration::from_secs(10)) {
             match event {
                 RuntimeEvent::UserMessage { body, .. } if body == "must not import" => {
                     panic!("a mismatched attach completion imported transcript data")

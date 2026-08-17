@@ -65,6 +65,27 @@ describe("Asterline desktop workspace", () => {
     expect(await screen.findByText("Asterline Desktop is up to date.")).toBeInTheDocument();
   });
 
+  it("opens only the trusted release returned by the native update check", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(client, "checkDesktopUpdate").mockResolvedValue({
+      current_version: "0.2.0",
+      available_version: "0.3.0",
+      release_url: "https://github.com/song0705/Asterline/releases/tag/desktop-v0.3.0",
+      update_available: true,
+    });
+    const openSpy = vi.spyOn(client, "openDesktopUpdate");
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Check for updates" }));
+    expect(await screen.findByRole("dialog", { name: "Asterline update available" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Open official download" }));
+
+    await waitFor(() => expect(openSpy).toHaveBeenCalledWith(
+      "https://github.com/song0705/Asterline/releases/tag/desktop-v0.3.0",
+    ));
+    expect(screen.queryByRole("dialog", { name: "Asterline update available" })).not.toBeInTheDocument();
+  });
+
   it("starts narrow layouts with closed, mutually exclusive side drawers", async () => {
     Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: 860 });
     const user = userEvent.setup();
@@ -114,5 +135,15 @@ describe("Asterline desktop workspace", () => {
     expect(await screen.findByText("Desktop demo log stream is ready.")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Diff" }));
     expect(await screen.findByText(/utility drawer enabled/)).toBeInTheDocument();
+  });
+
+  it("exports a local diagnostics report from the logs drawer", async () => {
+    const user = userEvent.setup();
+    const exportSpy = vi.spyOn(client, "exportDesktopDiagnostics");
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "Logs" }));
+    await user.click(await screen.findByRole("button", { name: "Export diagnostics" }));
+    await waitFor(() => expect(exportSpy).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(/Diagnostics exported to/)).toBeInTheDocument();
   });
 });

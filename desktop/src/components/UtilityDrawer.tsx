@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import type { BackendKind, DiffResultV1, LogEntryV1, SkillSummaryV1 } from "../bridge/types";
 import type { Locale, Translate } from "../i18n";
 import type { UtilityResource } from "../state";
-import { CheckIcon, CopyIcon, FileIcon, RefreshIcon, SearchIcon, XIcon } from "./Icons";
+import { CheckIcon, CopyIcon, DownloadIcon, FileIcon, RefreshIcon, SearchIcon, XIcon } from "./Icons";
 
 export type UtilityKind = "logs" | "diff" | "skills" | "find";
 
@@ -17,6 +17,7 @@ interface UtilityDrawerProps {
   onClose: () => void;
   onOpen: (kind: UtilityKind, query?: string) => void;
   onRefresh: (kind: Exclude<UtilityKind, "find">, filters?: { query?: string; level?: LogEntryV1["level"]; backend?: BackendKind }) => void;
+  onExportDiagnostics: () => Promise<void>;
   initialQuery?: string;
 }
 
@@ -34,7 +35,7 @@ function CopyButton({ value, label, t }: { value: string; label: string; t: Tran
   return <button className="utility-copy" onClick={() => void copy()} aria-label={label} title={label}>{copied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}<span>{copied ? t("copied") : label}</span></button>;
 }
 
-export function UtilityDrawer({ kind, locale, t, logs, diff, skills, timelineText, onClose, onOpen, onRefresh, initialQuery }: UtilityDrawerProps) {
+export function UtilityDrawer({ kind, locale, t, logs, diff, skills, timelineText, onClose, onOpen, onRefresh, onExportDiagnostics, initialQuery }: UtilityDrawerProps) {
   const [query, setQuery] = useState(initialQuery ?? "");
   const [level, setLevel] = useState<LogEntryV1["level"] | "all">("all");
   const [backend, setBackend] = useState<BackendKind | "all">("all");
@@ -58,7 +59,7 @@ export function UtilityDrawer({ kind, locale, t, logs, diff, skills, timelineTex
     </div>
     {kind === "logs" && <>
       <div className="utility-filters"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("filterLogs")} aria-label={t("filterLogs")} /><select value={level} onChange={(event) => setLevel(event.target.value as typeof level)} aria-label={t("logLevel")}><option value="all">{t("allLevels")}</option>{["debug", "info", "warn", "error"].map((item) => <option key={item} value={item}>{item}</option>)}</select><button onClick={refresh} aria-label={t("refreshUtility")}><RefreshIcon size={15} /></button></div>
-      <div className="utility-meta">{logs.value.length} · {logs.truncated ? t("truncated") : t("complete")}</div>
+      <div className="utility-toolbar"><span>{logs.value.length} · {logs.truncated ? t("truncated") : t("complete")}</span><button onClick={() => void onExportDiagnostics()}><DownloadIcon size={14} />{t("exportDiagnostics")}</button></div>
       <div className="utility-scroll">{logs.value.length ? logs.value.map((entry, index) => <article className={`log-row log-${entry.level}`} key={`${entry.source}-${index}`}><span>{entry.level}</span><strong>{entry.source}</strong><p>{entry.message}</p></article>) : <div className="utility-empty">{logs.status === "loading" ? t("loading") : t("noLogs")}</div>}</div>
     </>}
     {kind === "diff" && <>

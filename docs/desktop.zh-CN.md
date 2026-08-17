@@ -47,7 +47,8 @@ Asterline runtime
 Desktop V1 的项目状态格式为 `1`，兼容窗口为当前及上一个 Desktop 次版本。
 
 最近项目和界面偏好保存在应用本地；项目提示、回答、工具输出、审批与 provider
-会话标识继续保存在工作区的 `.asterline` 中。Desktop V1 不发送遥测。
+会话标识继续保存在工作区的 `.asterline` 中。Desktop V1 不发送遥测。应用会保存有上限的
+本地诊断日志和异常退出标记，并允许用户从日志抽屉导出诊断文本。
 
 ## 从源码运行
 
@@ -72,6 +73,7 @@ pnpm tauri dev
 cd desktop
 pnpm lint
 pnpm test
+pnpm test:e2e
 pnpm build
 cargo test --manifest-path src-tauri/Cargo.toml --locked
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
@@ -87,13 +89,14 @@ CLI 继续使用原有的 `v<version>` 标签。
 
 发布覆盖 Windows x64、macOS Intel / Apple silicon、Linux x64 / ARM64：
 
-- Windows：当前用户 Inno Setup 安装包（内置微软签名的 Evergreen WebView2
-  引导程序）和便携 ZIP。
+- Windows：经过 Authenticode 签名的当前用户 Inno Setup 安装包和便携 EXE（安装包内置
+  微软签名的 Evergreen WebView2 引导程序）。
 - macOS：每种架构的 DMG 和便携 app 压缩包，必须使用 Developer ID 签名并完成
   公证；缺少签名凭据时发布会直接失败。
 - Linux：在对应原生架构上构建 AppImage。
 
-应用内只提供手动更新检查，只识别 `desktop-v*` 发布，不会自动安装更新。
+应用内只提供手动更新检查，只识别 `desktop-v*` 发布。发现更新后会展示当前与可用版本，
+并且只允许在系统浏览器中打开 Asterline 官方 GitHub Release 页面；不会自动安装更新。
 
 如果 Windows 系统可能尚未安装 WebView2，请使用安装包。便携 ZIP 不会安装系统
 依赖。

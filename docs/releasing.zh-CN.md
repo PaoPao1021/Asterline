@@ -196,6 +196,24 @@ SHA 旁保留人类可读 Action 版本注释。Rust toolchain 和 manylinux dig
 不要移动或复用**已发布**版本的 tag。修复问题后提升版本并发布新 tag。Release 以前的失败
 workflow 可以在 tag 不变时重跑；不得通过新 tag 来绕过一个尚未发布的失败 job。
 
+## Desktop 发布
+
+Asterline Desktop 使用独立版本线，`desktop/package.json`、
+`desktop/src-tauri/Cargo.toml` 与 `desktop/src-tauri/tauri.conf.json` 的版本必须一致。
+提交并等待 Desktop CI 通过后，创建带注释的 `desktop-v<version>` tag。
+
+Windows Desktop 正式发布必须配置以下仓库 secrets，否则 workflow 会直接失败：
+
+- `WINDOWS_SIGNING_CERTIFICATE_PFX_BASE64`
+- `WINDOWS_SIGNING_CERTIFICATE_PASSWORD`
+- `WINDOWS_SIGNING_CERTIFICATE_SUBJECT`（证书的完整 Subject，例如
+  `CN=Example, O=Example Corp, C=CN`）
+
+证书必须是面向预期 Asterline 发布者的公开可信代码签名证书，并且验证后的签名者 Subject
+必须与 `WINDOWS_SIGNING_CERTIFICATE_SUBJECT` 完整匹配（忽略大小写）。workflow 会使用 SHA-256 和
+RFC 3161 时间戳签署并验证 `asterline-desktop.exe`，随后再次签署并验证最终 Inno Setup
+安装包。macOS Desktop 同样强制使用前文所列 Developer ID 与公证凭据。
+
 ## 历史 provenance 说明：v0.2.2
 
 成功的 [v0.2.2 release workflow

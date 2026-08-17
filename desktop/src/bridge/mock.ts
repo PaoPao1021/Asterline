@@ -339,6 +339,16 @@ class MockDesktopClient implements DesktopClient {
     return { current_version: "0.1.0", available_version: null, release_url: null, update_available: false };
   }
 
+  async openDesktopUpdate(_url: string): Promise<void> {}
+
+  async getDesktopDiagnosticsStatus() {
+    return { previous_unclean_exit: false, log_path: "mock/asterline-desktop.log" };
+  }
+
+  async exportDesktopDiagnostics(): Promise<string> {
+    return "Downloads/asterline-desktop-diagnostics-demo.txt";
+  }
+
   async getAttachCapabilities() {
     return {
       supported: true,

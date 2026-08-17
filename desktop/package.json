@@ -13,6 +13,8 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
     "lint": "tsc -b --pretty false"
   },
   "dependencies": {
@@ -22,6 +24,7 @@
     "react-dom": "19.1.1"
   },
   "devDependencies": {
+    "@playwright/test": "1.55.0",
     "@tauri-apps/cli": "^2.11.4",
     "@testing-library/jest-dom": "6.8.0",
     "@testing-library/react": "16.3.0",

@@ -2,6 +2,7 @@ import type {
   AttachCapabilitiesV1,
   DesktopClient,
   DesktopCommandV1,
+  DiagnosticsStatusV1,
   DesktopEventV1,
   ExternalAttachLaunchV1,
   DesktopSnapshotV1,
@@ -57,6 +58,18 @@ class TauriDesktopClient implements DesktopClient {
 
   checkDesktopUpdate(): Promise<DesktopUpdateV1> {
     return this.invoke("check_desktop_update");
+  }
+
+  openDesktopUpdate(url: string): Promise<void> {
+    return this.invoke("open_desktop_update", { url });
+  }
+
+  getDesktopDiagnosticsStatus(): Promise<DiagnosticsStatusV1> {
+    return this.invoke("get_desktop_diagnostics_status");
+  }
+
+  exportDesktopDiagnostics(): Promise<string> {
+    return this.invoke("export_desktop_diagnostics");
   }
 
   getAttachCapabilities(): Promise<AttachCapabilitiesV1> {
