@@ -8,6 +8,7 @@ use crate::tui::drawers::Drawer;
 
 /// What submitting the composer should do.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)] // Runtime commands stay unboxed at the UI boundary.
 pub enum Submission {
     /// Exit the Asterline TUI and begin normal runtime shutdown.
     Exit,
@@ -65,6 +66,36 @@ pub fn parse(input: &str) -> Submission {
     }
 
     Submission::NeedsTarget
+}
+
+/// `@member` / `@all` / `/ask member` / `/all` typed with no message body.
+/// Lets an image-only send keep an explicit target.
+pub fn parse_target_only(input: &str) -> Option<MessageTarget> {
+    let trimmed = input.trim();
+    if let Some(rest) = trimmed.strip_prefix('@') {
+        let (member, body) = split_first_word(rest);
+        if !member.is_empty() && body.is_empty() {
+            return Some(target_from_member_token(member));
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("/ask") {
+        let (member, body) = split_first_word(rest);
+        if !member.is_empty() && body.is_empty() {
+            return Some(target_from_member_token(member));
+        }
+    }
+    if trimmed == "/all" {
+        return Some(MessageTarget::All);
+    }
+    None
+}
+
+fn target_from_member_token(member: &str) -> MessageTarget {
+    if member == "all" {
+        MessageTarget::All
+    } else {
+        MessageTarget::Member(MemberId::new(member))
+    }
 }
 
 fn parse_slash(rest: &str) -> Submission {
@@ -129,6 +160,7 @@ fn parse_slash(rest: &str) -> Submission {
         "retry" if arg.is_empty() => Submission::Runtime(UiCommand::Retry),
         "approve" if arg.is_empty() => Submission::ApproveFirst(ApprovalDecision::Approve),
         "reject" if arg.is_empty() => Submission::ApproveFirst(ApprovalDecision::Reject),
+        "mode" if arg.is_empty() => Submission::Drawer(Drawer::Mode),
         "mode" => parse_mode_selector(arg),
         "find" => Submission::FindInChat(arg.to_string()),
         "continue" => {
@@ -195,6 +227,35 @@ fn parse_slash(rest: &str) -> Submission {
                 Submission::Drawer(Drawer::MemberLogs(MemberId::new(member)))
             }
         }
+        "import" => {
+            let (first, rest) = split_first_word(arg);
+            if first.is_empty() {
+                Submission::Help
+            } else if rest.is_empty() {
+                Submission::Runtime(UiCommand::ImportSession {
+                    member: None,
+                    session_id: first.to_string(),
+                })
+            } else {
+                Submission::Runtime(UiCommand::ImportSession {
+                    member: Some(MemberId::new(first)),
+                    session_id: rest.to_string(),
+                })
+            }
+        }
+        "export" => {
+            let (first, extra) = split_first_word(arg);
+            if !extra.is_empty() {
+                Submission::Invalid(
+                    "/export accepts at most one format argument (e.g. `/export claude`); draft kept"
+                        .to_string(),
+                )
+            } else {
+                Submission::Runtime(UiCommand::ExportSession {
+                    format: (!first.is_empty()).then(|| first.to_string()),
+                })
+            }
+        }
         "help" if arg.is_empty() => Submission::Help,
         "team" | "runs" | "logs" | "diff" | "new" | "clear" | "resume" | "exit" | "retry"
         | "approve" | "reject" | "help" => {
@@ -221,6 +282,20 @@ fn parse_targeted_slash(member: &str, body: &str) -> Option<Submission> {
                 member: MemberId::new(member),
             },
             _ => Submission::Invalid("/attach does not accept arguments; draft kept".to_string()),
+        });
+    }
+    if let Some(rest) = targeted_command_rest(body, "import") {
+        return Some(match (member, rest.is_empty()) {
+            ("all", _) => Submission::Invalid(
+                "/import needs one member; use @member /import <session_id>".to_string(),
+            ),
+            (_, true) => {
+                Submission::Invalid("use `@member /import <session_id>` (draft kept)".to_string())
+            }
+            _ => Submission::Runtime(UiCommand::ImportSession {
+                member: Some(MemberId::new(member)),
+                session_id: rest.to_string(),
+            }),
         });
     }
     Some(if member == "all" {
@@ -451,6 +526,22 @@ mod tests {
     #[test]
     fn plain_text_requires_an_explicit_target_prefix() {
         assert_eq!(parse("build the parser"), Submission::NeedsTarget);
+    }
+
+    #[test]
+    fn target_only_accepts_member_or_all_without_a_body() {
+        assert_eq!(
+            parse_target_only("@builder"),
+            Some(MessageTarget::Member(MemberId::new("builder")))
+        );
+        assert_eq!(parse_target_only("@all"), Some(MessageTarget::All));
+        assert_eq!(
+            parse_target_only("/ask reviewer"),
+            Some(MessageTarget::Member(MemberId::new("reviewer")))
+        );
+        assert_eq!(parse_target_only("/all"), Some(MessageTarget::All));
+        assert_eq!(parse_target_only("@builder look"), None);
+        assert_eq!(parse_target_only(""), None);
     }
 
     #[test]
@@ -834,7 +925,7 @@ mod tests {
                 Submission::Runtime(UiCommand::SetMode { mode })
             );
         }
-        assert_eq!(parse("/mode"), Submission::Help);
+        assert_eq!(parse("/mode"), Submission::Drawer(Drawer::Mode));
         assert_eq!(parse("/mode review fix parser"), Submission::Help);
     }
 
@@ -848,5 +939,42 @@ mod tests {
     fn removed_abort_command_falls_back_to_help() {
         assert_eq!(parse("/abort"), Submission::Help);
         assert_eq!(parse("/abort extra"), Submission::Help);
+    }
+
+    #[test]
+    fn import_and_export_commands_parse_correctly() {
+        assert_eq!(
+            parse("/import sess-1234"),
+            Submission::Runtime(UiCommand::ImportSession {
+                member: None,
+                session_id: "sess-1234".to_string(),
+            })
+        );
+        assert_eq!(
+            parse("/import builder sess-1234"),
+            Submission::Runtime(UiCommand::ImportSession {
+                member: Some(MemberId::new("builder")),
+                session_id: "sess-1234".to_string(),
+            })
+        );
+        assert_eq!(
+            parse("@builder /import sess-1234"),
+            Submission::Runtime(UiCommand::ImportSession {
+                member: Some(MemberId::new("builder")),
+                session_id: "sess-1234".to_string(),
+            })
+        );
+        assert_eq!(parse("/import"), Submission::Help);
+
+        assert_eq!(
+            parse("/export"),
+            Submission::Runtime(UiCommand::ExportSession { format: None })
+        );
+        assert_eq!(
+            parse("/export claude"),
+            Submission::Runtime(UiCommand::ExportSession {
+                format: Some("claude".to_string())
+            })
+        );
     }
 }

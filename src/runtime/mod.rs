@@ -155,6 +155,7 @@ const RUNTIME_INPUT_QUEUE_CAPACITY: usize = 256;
 const RUNTIME_UI_QUEUE_CAPACITY: usize = 256;
 const RUNTIME_CONTROL_QUEUE_CAPACITY: usize = 32;
 const RUNTIME_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const SHUTDOWN_WORKER_TIMEOUT: Duration = Duration::from_millis(500);
 
 enum RuntimeEventSender {
     Unbounded(Sender<RuntimeEvent>),
@@ -387,7 +388,7 @@ fn run_loop(
     loop {
         if !flush_runtime_events(&events, &mut pending_events) {
             let _ = prepare_shutdown(&mut runtime, &mut active_verifications, &mut agent_workers);
-            join_workers_bounded(&mut agent_workers, Duration::from_secs(5));
+            join_workers_bounded(&mut agent_workers, SHUTDOWN_WORKER_TIMEOUT);
             return;
         }
         if pending_events.is_empty() {
@@ -595,7 +596,7 @@ fn run_loop(
             )));
             step.events.extend(cleanup.events);
             let _ = enqueue_runtime_events(&events, &mut pending_events, step.events);
-            join_workers_bounded(&mut agent_workers, Duration::from_secs(5));
+            join_workers_bounded(&mut agent_workers, SHUTDOWN_WORKER_TIMEOUT);
             return;
         }
 
@@ -644,7 +645,7 @@ fn run_loop(
 
         if !enqueue_runtime_events(&events, &mut pending_events, step.events) {
             let _ = prepare_shutdown(&mut runtime, &mut active_verifications, &mut agent_workers);
-            join_workers_bounded(&mut agent_workers, Duration::from_secs(5));
+            join_workers_bounded(&mut agent_workers, SHUTDOWN_WORKER_TIMEOUT);
             return;
         }
         if release_attach_after_step {
@@ -691,7 +692,7 @@ fn run_loop(
         }
 
         if shutdown {
-            join_workers_bounded(&mut agent_workers, Duration::from_secs(5));
+            join_workers_bounded(&mut agent_workers, SHUTDOWN_WORKER_TIMEOUT);
             break;
         }
         reap_finished_workers(&mut agent_workers);
@@ -2520,7 +2521,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let store = SqliteStore::open(&path).unwrap();
         let external = rusqlite::Connection::open(&path).unwrap();
-        let (evt_tx, _evt_rx) = mpsc::sync_channel(1);
+        let (evt_tx, evt_rx) = mpsc::sync_channel(1);
+        let event_sink = evt_tx.clone();
         let (ui_tx, ui_rx) = mpsc::sync_channel(64);
         let (control_tx, control_rx) = mpsc::sync_channel(4);
         let (worker_tx, worker_rx) = mpsc::sync_channel(64);
@@ -2545,13 +2547,22 @@ mod tests {
             );
         });
 
+        // Wait until startup has emitted Ready, then put it back to keep the
+        // sole output slot full. This avoids counting Windows thread startup
+        // time against the command-processing assertion below.
+        let ready = evt_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("runtime must emit Ready");
+        assert!(matches!(ready, RuntimeEvent::Ready { .. }));
+        event_sink.send(ready).unwrap();
+
         ui_tx
             .send(UiCommand::UserMessage {
                 target: MessageTarget::Default,
                 body: "hold canonical events".to_string(),
             })
             .unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             let users: i64 = external
                 .query_row(
@@ -2589,7 +2600,7 @@ mod tests {
 
         control_tx.send(UiCommand::Cancel { member: None }).unwrap();
         control_tx.send(UiCommand::Shutdown).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !join.is_finished() && std::time::Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }

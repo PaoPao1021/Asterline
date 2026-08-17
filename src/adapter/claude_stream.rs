@@ -110,7 +110,9 @@ impl StreamAdapter for ClaudeStreamAdapter {
             // Claude officially accepts print-mode prompts on stdin. Keeping
             // user text out of argv prevents prompts such as `--version` from
             // being reinterpreted as CLI options.
-            stdin: Some(prompt.to_string()),
+            stdin: Some(crate::adapter::prompt_images::prompt_with_image_paths(
+                prompt,
+            )),
         }
     }
 
@@ -127,10 +129,6 @@ fn native_session_name(display_name: &str) -> String {
 #[derive(Default)]
 pub struct ClaudeLineParser {
     text_acc: String,
-    /// A Claude assistant message can contain an explanatory text block and
-    /// then request tools. That text is progress for the still-running turn,
-    /// not its final answer, so it must not be committed ahead of the tools.
-    message_has_tool: bool,
     message_emitted: bool,
     tool_blocks: HashMap<u64, String>,
     tool_input_started: HashSet<u64>,
@@ -139,12 +137,8 @@ pub struct ClaudeLineParser {
 
 impl ClaudeLineParser {
     fn flush_message(&mut self, out: &mut Vec<AgentEvent>) {
-        if self.message_has_tool {
-            self.text_acc.clear();
-            return;
-        }
         let text = std::mem::take(&mut self.text_acc);
-        if !text.is_empty() {
+        if !text.trim().is_empty() {
             self.message_emitted = true;
             out.push(AgentEvent::MessageCompleted(text));
         }
@@ -154,13 +148,12 @@ impl ClaudeLineParser {
         match str_field(event, "type") {
             Some("message_start") => {
                 self.text_acc.clear();
-                self.message_has_tool = false;
                 self.message_emitted = false;
             }
             Some("content_block_start") => {
                 let block = &event["content_block"];
                 if str_field(block, "type") == Some("tool_use") {
-                    self.message_has_tool = true;
+                    self.flush_message(out);
                     let id = str_field(block, "id").unwrap_or_default().to_string();
                     let name = str_field(block, "name").unwrap_or("tool").to_string();
                     let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
@@ -430,6 +423,19 @@ mod tests {
         assert!(!command.args.iter().any(|arg| arg == "--allowed-tools"));
         assert_eq!(command.stdin.as_deref(), Some("hello"));
         assert!(!command.args.iter().any(|arg| arg == "hello"));
+        let img_dir =
+            std::env::temp_dir().join(format!("asterline-claude-img-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&img_dir);
+        let img = img_dir.join("shot.png");
+        std::fs::write(&img, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let with_image = adapter.build_command(
+            &format!("hello\n[asterline-image]: {}", img.display()),
+            None,
+            None,
+        );
+        let expected = format!("hello\n(attached image: {})", img.display());
+        assert_eq!(with_image.stdin.as_deref(), Some(expected.as_str()));
+        let _ = std::fs::remove_dir_all(&img_dir);
         // The product path never disables session persistence.
         assert!(!command.args.iter().any(|a| a == "--no-session-persistence"));
     }
@@ -500,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_progress_is_not_committed_as_a_reply_before_the_final_message() {
+    fn tool_call_progress_emits_explanatory_text_ahead_of_the_tool() {
         let events = parse_all(&[
             r#"{"type":"stream_event","event":{"type":"message_start","message":{}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"I will inspect it."}}}"#,
@@ -513,6 +519,12 @@ mod tests {
             r#"{"type":"result","subtype":"success","is_error":false,"result":"Done."}"#,
         ]);
 
+        let intermediate_msg = events
+            .iter()
+            .position(
+                |event| matches!(event, AgentEvent::MessageCompleted(text) if text.contains("inspect")),
+            )
+            .expect("intermediate assistant message before tool");
         let tool_started = events
             .iter()
             .position(
@@ -531,10 +543,11 @@ mod tests {
                 |event| matches!(event, AgentEvent::MessageCompleted(text) if text == "Done."),
             )
             .expect("final assistant message");
-        assert!(tool_started < tool_completed && tool_completed < final_message);
-        assert!(!events.iter().any(
-            |event| matches!(event, AgentEvent::MessageCompleted(text) if text.contains("inspect"))
-        ));
+        assert!(
+            intermediate_msg < tool_started
+                && tool_started < tool_completed
+                && tool_completed < final_message
+        );
     }
 
     #[test]

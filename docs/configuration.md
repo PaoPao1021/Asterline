@@ -101,8 +101,10 @@ terminal.
     },
     "plan": {
       "leader": "builder",
+      "builder": "builder",
       "reviewer": "reviewer",
       "max_iterations": 3,
+      "auto_execute": true,
       "auto_verify": true
     },
     "brainstorm": {
@@ -141,13 +143,17 @@ targets (case-insensitive).
 
 ### Collaboration modes (`modes`)
 
-Optional bindings for `/mode review`, `/mode plan`, `/mode brainstorm`, and `/mode team`. When a
-field is omitted, Asterline derives it from member roles and `default_target`
-(builder ≈ default target or first non-reviewer; reviewer ≈ role contains
-"review"; leader ≈ role contains "plan" or "lead", else first
-participant; participants = full roster). Defaults for budgets:
+Optional bindings for `/mode review`, `/mode plan`, `/mode brainstorm`, and `/mode team`. Most
+omitted role fields are derived from member roles and `default_target`
+(the Review-mode builder ≈ default target or first non-reviewer; reviewer ≈
+role contains "review"; leader ≈ role contains "plan" or "lead", else first
+participant; participants = full roster). The Plan-mode `builder` is deliberately
+different: it is required and has no derived fallback. The Plan `reviewer` is optional:
+when omitted, a complete checklist proceeds directly to the Builder. `auto_execute` defaults
+to `true`; set it to `false` to require `/approve` before the Builder receives the finalized
+checklist. Defaults for budgets:
 `max_iterations = 3`, `generation_rounds = 3`, `ideas_per_round = 4`,
-`auto_verify = true`.
+`auto_execute = true`, `auto_verify = true`.
 Brainstorm requires at least two distinct resolved participants; repeating an
 ID or referring to the same member once by ID and once by display name is
 rejected.
@@ -164,19 +170,25 @@ Markdown numbering.
 
 | Field               | Mode             | Meaning                                                     |
 | ------------------- | ---------------- | ----------------------------------------------------------- |
-| `builder`           | review           | Member who implements changes                               |
-| `reviewer`          | review/plan      | Member who emits `@@review` verdicts                        |
-| `leader`            | plan             | Member who writes the owned checklist                       |
+| `builder`           | review/plan      | Review: implements. Plan: required checklist executor.      |
+| `reviewer`          | review/plan      | Emits verdicts; optional Plan-only checklist audit.         |
+| `leader`            | plan             | Member who writes and revises the checklist                 |
 | `participants`      | brainstorm       | Roster for all generation waves                             |
 | `generation_rounds` | brainstorm       | Seed/build/stretch wave budget (default 3, minimum 2)       |
 | `ideas_per_round`   | brainstorm       | Requested idea cards per member/wave (default 4, minimum 3) |
 | `coordinator`       | team             | Member who coordinates the whole-team run                   |
 | `max_iterations`    | review/plan/team | Loop budget before blocking or failing verify (def 3)       |
-| `auto_verify`       | review/plan/team | Run verification after approval/finish (default true)       |
+| `auto_execute`      | plan             | Auto-dispatch final plan (default); false needs `/approve`  |
+| `auto_verify`       | review/plan/team | Runs after Review approval or Plan Builder completion.      |
 | `verify_command`    | review/plan/team | Explicit auto-verify shell command (else heuristic)         |
 
 Each mode has its own configuration shape; unrelated fields are rejected by
 Serde instead of being silently accepted and ignored.
+
+The `/mode` panel can change these knobs without editing the file by hand:
+`s` selects the current mode and applies its pending overrides to this
+conversation, while `w` writes the current mode's conversation overrides into
+`team.json`.
 
 ### Approvals (`approvals`)
 
@@ -217,6 +229,10 @@ to backend-native sandbox and permission enforcement.
 | `session_policy`  | No                          | `resume` (default) or `fresh`                           |
 | `session_id`      | No                          | Native CLI session/conversation ID to resume            |
 
+On startup, a `resume` member with a bound session is scanned for native
+transcript rows written while Asterline was closed (Grok CLI, Codex, or
+Claude). Only unseen messages are imported into the current chat.
+
 In `/team`, a `resume` member displays its bound native session ID directly.
 Without one, it says `select a session` to make the required picker/manual-ID
 choice explicit; a `fresh` member says `not set (fresh)`. The UI never calls an
@@ -246,9 +262,12 @@ at `<workspace>/.asterline/team.json` is also bound to that containing
 workspace: on a project move, Asterline corrects a stale serialized workspace
 before launching members, so new native transcripts remain associated with the
 project you opened. Native session pickers filter by working directory. Claude
-print-mode sessions are resumable with `claude --resume <id>`, but some Claude
-Code versions intentionally omit print-mode sessions from their interactive
-picker.
+Code intentionally omits sessions created by `claude -p` or the Agent SDK from
+its interactive picker. Asterline's Team editor does not apply that filter:
+select the member's **session id** field and press `Enter` to choose one of
+those transcripts, then press `s` to bind it. Asterline resumes the selection
+directly with `claude --resume <id>`; `/attach <member>` uses the same direct-ID
+path.
 
 Permission modes, sandbox mappings, and allowed-tool behavior depend on the
 backend. Do not assume a field has the same effect across all four CLIs.
@@ -394,6 +413,7 @@ The default workspace state is:
 ```text
 <workspace>/.asterline/
 ├── team.json
+├── roster.md
 └── asterline.sqlite3
 ```
 
@@ -457,9 +477,13 @@ limits what the underlying process can access.
 ## Agent-to-agent coordination
 
 Asterline creates `.agents/skills/asterline-team/SKILL.md` when it is missing
-and injects a compact skill hint into each member's system instructions. The
-full protocol remains in the workspace instead of being repeated in every
-prompt.
+and tells each member that this team skill is available at that path. The full
+protocol remains in the workspace instead of being repeated in every ordinary
+chat turn; this reminder deliberately does not invoke `$asterline-team`, so it
+does not force Codex to expand the whole skill. Live roster identity and member
+status are rewritten to `.asterline/roster.md` whenever the team or a member's
+status changes. The team skill tells agents to read that file; it is not copied
+into each prompt.
 
 It also creates `.agents/skills/asterline-brainstorm/SKILL.md` when missing.
 Brainstorm mode loads that file for every generation, vote, and synthesis

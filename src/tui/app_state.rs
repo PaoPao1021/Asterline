@@ -11,13 +11,16 @@ use std::time::Instant;
 use crossterm::event::{KeyCode, KeyModifiers};
 use sha2::{Digest, Sha256};
 
-use crate::adapter::parser::{append_bounded_text, bounded_text};
+use crate::adapter::parser::{append_bounded_text, bounded_text, summarize};
+use crate::adapter::prompt_images::{
+    MAX_IMAGE_BYTES, MAX_PROMPT_IMAGES, PromptImage, image_placeholder, mime_from_bytes,
+};
 use crate::domain::config::{DetectedBackends, detect_backends};
 use crate::domain::event::{
     AgentSessionId, ApprovalId, ChatItem, ConversationSummary, LogEntry, MemberStatus, MessageId,
     MessageTarget, RunId, RunStatus, RunStepStatus, RunSummary, RuntimeEvent, UiCommand,
 };
-use crate::domain::mode::TerminalMode;
+use crate::domain::mode::{ModesConfig, TerminalMode};
 use crate::domain::team::{
     BackendKind, DefaultTarget, Effort, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
     TeamMember,
@@ -27,6 +30,7 @@ use crate::tui::attach::AttachRequest;
 use crate::tui::completion::{self, AgentSkill, Completion};
 use crate::tui::composer::{Composer, MAX_COMPOSER_BYTES};
 use crate::tui::drawers::Drawer;
+use crate::tui::mode_editor::{ModeEditor, ModeEditorOutcome};
 use crate::tui::skills::SkillInfo;
 use crate::tui::team_builder::ModelCatalog;
 use crate::tui::team_editor::{TeamEditor, TeamEditorOutcome};
@@ -34,8 +38,7 @@ use uuid::Uuid;
 
 const MAX_LOGS: usize = 4_000;
 const MAX_LOG_BYTES: usize = 2 * 1024 * 1024;
-pub(crate) const MAX_CHAT_ITEMS: usize = 1_000;
-pub(crate) const MAX_CHAT_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_CHAT_ITEMS: usize = 5_000;
 pub(crate) const MAX_CHAT_ITEM_BYTES: usize = 256 * 1024;
 const MAX_PROMPT_HISTORY_ITEMS: usize = 1_000;
 const MAX_PROMPT_HISTORY_BYTES: usize = 1024 * 1024;
@@ -43,8 +46,7 @@ const MIN_BOUNDED_CHAT_TEXT_BYTES: usize = 64;
 const MAX_ACTIVE_TOOL_ID_BYTES: usize = 4 * 1024;
 const MAX_ACTIVE_TOOL_NAME_BYTES: usize = 4 * 1024;
 const MAX_ACTIVE_TOOL_SUMMARY_BYTES: usize = 16 * 1024;
-const MAX_ACTIVE_REASONING_BYTES: usize = 8 * 1024;
-const EARLIER_HISTORY_OMITTED: &str = "Earlier history omitted by TUI memory limit.";
+const MAX_REASONING_STATUS_HEADER_CHARS: usize = 160;
 const ACTIVE_MESSAGE_OUTPUT_OMITTED: &str =
     "[asterline: live response preview omitted by TUI memory limit]";
 const ACTIVE_TOOL_OUTPUT_OMITTED: &str =
@@ -63,6 +65,34 @@ pub(crate) fn member_status_is_active(status: MemberStatus) -> bool {
             | MemberStatus::Waiting
             | MemberStatus::NeedsApproval
     )
+}
+
+fn reasoning_status_header(text: &str) -> Option<String> {
+    if let Some((_, after_start)) = text.split_once("**")
+        && let Some((header, _)) = after_start.split_once("**")
+    {
+        let header = summarize(header.trim(), MAX_REASONING_STATUS_HEADER_CHARS);
+        if !header.is_empty() {
+            return Some(header);
+        }
+    }
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let first_line = trimmed
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?
+        .trim_start_matches(['#', '*', '-', '`', ' ', '\t']);
+    let header = summarize(first_line, MAX_REASONING_STATUS_HEADER_CHARS);
+    (!header.is_empty()).then_some(header)
+}
+
+fn literal_char_range(text: &str, literal: &str) -> Option<(usize, usize)> {
+    let start_byte = text.find(literal)?;
+    let start = text[..start_byte].chars().count();
+    Some((start, start + literal.chars().count()))
 }
 
 #[derive(Clone, Debug)]
@@ -149,6 +179,9 @@ pub struct AppState {
     workspace: String,
     default_target: Option<DefaultTarget>,
     active_mode: TerminalMode,
+    modes: ModesConfig,
+    mode_overrides: ModesConfig,
+    suggested_verify: Option<String>,
     members: Vec<MemberView>,
     chat: Vec<ChatItem>,
     message_index: HashMap<MessageId, ActiveMessageCell>,
@@ -162,15 +195,23 @@ pub struct AppState {
     pending_approvals: Vec<PendingApproval>,
     paused_routes: usize,
     composer: Composer,
+    pending_images: Vec<PromptImage>,
     drawer: Option<Drawer>,
     scroll: usize,
+    chat_page_rows: usize,
     popup_selected: usize,
     popup_dismissed: bool,
     should_quit: bool,
     quit_armed: bool,
     runtime_available: bool,
+    thinking_expanded: bool,
+    diffs_expanded: bool,
     tools_expanded: bool,
     active_reasoning: HashMap<MemberId, String>,
+    reasoning_buffers: HashMap<MemberId, String>,
+    /// Legacy/imported thinking cells that still need an elapsed-time closeout.
+    open_thinking: HashMap<MemberId, usize>,
+    thinking_started: HashMap<MemberId, Instant>,
     last_message_target: Option<MessageTarget>,
     header_selected: Option<usize>,
     attach_pending: Option<MemberId>,
@@ -198,6 +239,8 @@ pub struct AppState {
     diff_text: Option<String>,
     /// Editable draft shown by the `/team` drawer.
     team_editor: Option<TeamEditor>,
+    /// Overlay for `/mode`.
+    mode_editor: Option<ModeEditor>,
     /// Cross-drawer cache for asynchronously discovered backend models. The
     /// transient editor borrows it by ownership while open, then returns it on
     /// close so reopening `/team` does not rerun CLI discovery every time.
@@ -214,6 +257,14 @@ pub struct AppState {
     selected_resume: usize,
     /// Drag-select range in flattened chat-line coordinates, if any.
     chat_selection: Option<ChatSelection>,
+    composer_dragging: bool,
+    queued_prompts: HashMap<MemberId, Vec<String>>,
+    /// Bumped whenever transcript text changes so the chat painter can reuse
+    /// last frame's flatten instead of re-parsing Markdown on every spinner tick.
+    chat_fingerprint: u64,
+    /// Bumped when a `Ready` event replaces roster data used by the empty-chat
+    /// welcome page.
+    roster_revision: u64,
 }
 
 impl AppState {
@@ -236,6 +287,9 @@ impl AppState {
             workspace: String::new(),
             default_target: None,
             active_mode: TerminalMode::Normal,
+            modes: ModesConfig::default(),
+            mode_overrides: ModesConfig::default(),
+            suggested_verify: None,
             members: Vec::new(),
             chat,
             message_index: HashMap::new(),
@@ -249,15 +303,22 @@ impl AppState {
             pending_approvals: Vec::new(),
             paused_routes: 0,
             composer: Composer::new(),
+            pending_images: Vec::new(),
             drawer: None,
             scroll: 0,
+            chat_page_rows: 10,
             popup_selected: 0,
             popup_dismissed: false,
             should_quit: false,
             quit_armed: false,
             runtime_available: true,
+            thinking_expanded: false,
+            diffs_expanded: true,
             tools_expanded: false,
             active_reasoning: HashMap::new(),
+            reasoning_buffers: HashMap::new(),
+            open_thinking: HashMap::new(),
+            thinking_started: HashMap::new(),
             last_message_target: None,
             header_selected: None,
             attach_pending: None,
@@ -272,6 +333,7 @@ impl AppState {
             drawer_scroll: 0,
             diff_text: None,
             team_editor: None,
+            mode_editor: None,
             model_catalog: ModelCatalog::default(),
             model_catalog_detection: None,
             model_catalog_warmed: false,
@@ -279,6 +341,10 @@ impl AppState {
             resume_choices: Vec::new(),
             selected_resume: 0,
             chat_selection: None,
+            composer_dragging: false,
+            queued_prompts: HashMap::new(),
+            chat_fingerprint: 0,
+            roster_revision: 0,
         }
     }
 
@@ -297,6 +363,9 @@ impl AppState {
     pub fn apply(&mut self, event: RuntimeEvent) {
         match event {
             RuntimeEvent::Ready {
+                modes,
+                mode_overrides,
+                suggested_verify,
                 team,
                 workspace,
                 default_target,
@@ -310,6 +379,9 @@ impl AppState {
                 self.skills = crate::tui::skills::discover(Path::new(&workspace));
                 self.workspace = workspace;
                 self.default_target = default_target;
+                self.modes = modes;
+                self.mode_overrides = mode_overrides;
+                self.suggested_verify = suggested_verify;
                 self.runs = runs;
                 self.ensure_selected_run();
                 self.ensure_selected_run_step();
@@ -351,12 +423,42 @@ impl AppState {
                 if self.drawer == Some(Drawer::Team) {
                     self.open_team_editor();
                 }
+                if self.drawer == Some(Drawer::Mode) {
+                    self.open_mode_editor();
+                }
+                self.roster_revision = self.roster_revision.wrapping_add(1);
+            }
+            RuntimeEvent::ModesUpdated {
+                defaults,
+                overrides,
+            } => {
+                self.modes = defaults.clone();
+                self.mode_overrides = overrides.clone();
+                if let Some(editor) = self.mode_editor.as_mut() {
+                    editor.sync_from_runtime(defaults, overrides);
+                }
+            }
+            RuntimeEvent::ModeChanged { mode } => {
+                self.active_mode = mode;
+                if let Some(editor) = self.mode_editor.as_mut() {
+                    editor.set_active_mode(mode);
+                }
+            }
+            RuntimeEvent::TurnStarted { .. } => {}
+            RuntimeEvent::TurnFinished { .. } => {
+                if crate::tui::claude_export::is_sync_enabled() {
+                    let workspace = std::path::Path::new(&self.workspace);
+                    let session_id = self.members.iter().find_map(|m| m.session.as_deref());
+                    if let Some(session_id) = session_id {
+                        let _ = crate::tui::claude_export::export_chat_items_to_claude_jsonl(
+                            workspace, session_id, &self.chat,
+                        );
+                    }
+                }
             }
             // Complete settings are consumed by richer UI shells. The TUI's
             // existing roster editor is refreshed by the adjacent Ready event.
             RuntimeEvent::TeamSettingsUpdated { .. } => {}
-            RuntimeEvent::ModeChanged { mode } => self.active_mode = mode,
-            RuntimeEvent::TurnStarted { .. } | RuntimeEvent::TurnFinished { .. } => {}
             RuntimeEvent::UserMessage { body, targets, .. } => {
                 let interrupted = self
                     .members
@@ -373,6 +475,21 @@ impl AppState {
                     interrupted,
                 });
             }
+            RuntimeEvent::QueueUpdated { member, prompts } => {
+                if prompts.is_empty() {
+                    self.queued_prompts.remove(&member);
+                } else {
+                    self.queued_prompts.insert(member, prompts);
+                }
+            }
+            RuntimeEvent::QueuedPromptReturned { body, .. } => {
+                if !self.composer.is_empty() {
+                    self.history_draft = self.composer.text();
+                }
+                let _ = self.composer.set_text(&body);
+                self.composer.home();
+                self.reconcile_pending_images();
+            }
             RuntimeEvent::MemberStatus { member, status } => {
                 if !member_status_is_active(status) {
                     self.finish_incomplete_cells_for_member(&member);
@@ -380,6 +497,7 @@ impl AppState {
                 self.set_status(&member, status);
             }
             RuntimeEvent::MessageStarted { msg, member, .. } => {
+                self.close_thinking(&member);
                 if self.message_index.contains_key(&msg) {
                     self.finish_incomplete_message(msg);
                 } else if self.message_index.len() >= MAX_CHAT_ITEMS
@@ -424,6 +542,20 @@ impl AppState {
             }
             RuntimeEvent::MessageCompleted { msg, text } => {
                 if let Some(cell) = self.message_index.remove(&msg) {
+                    self.close_thinking(&cell.member);
+                    let streamed = cell.index.and_then(|idx| match self.chat.get(idx) {
+                        Some(ChatItem::Agent { text, member, .. })
+                            if member == &cell.member && !text.is_empty() =>
+                        {
+                            Some(text.clone())
+                        }
+                        _ => None,
+                    });
+                    let text = if !text.is_empty() {
+                        text
+                    } else {
+                        streamed.unwrap_or_default()
+                    };
                     let completed_text =
                         active_completion_text(ACTIVE_MESSAGE_OUTPUT_OMITTED, &text, cell.omitted);
                     let mut updated_index = None;
@@ -434,7 +566,9 @@ impl AppState {
                         }) = self.chat.get_mut(idx)
                         && member == &cell.member
                     {
-                        *body = completed_text.clone();
+                        if !completed_text.is_empty() || body.is_empty() {
+                            *body = completed_text.clone();
+                        }
                         updated_index = Some(idx);
                     }
                     if let Some(idx) = updated_index {
@@ -453,7 +587,10 @@ impl AppState {
                 self.trim_chat_for(0, 0);
             }
             RuntimeEvent::Reasoning { member, text } => {
-                self.append_reasoning(member, &text);
+                self.update_reasoning_status(member, &text);
+            }
+            RuntimeEvent::ReasoningCompleted { member } => {
+                self.close_thinking(&member);
             }
             RuntimeEvent::ToolStarted {
                 member,
@@ -461,6 +598,7 @@ impl AppState {
                 name,
                 summary,
             } => {
+                self.close_thinking(&member);
                 let key = (member.clone(), active_tool_key(&tool_id));
                 if self.tool_index.contains_key(&key) {
                     self.finish_incomplete_tool(&key);
@@ -721,10 +859,16 @@ impl AppState {
                 // but keep members, logs, and prompt history. Runs belong to
                 // the previous conversation and remain reachable via /resume.
                 self.active_mode = TerminalMode::Normal;
+                self.mode_overrides = ModesConfig::default();
+                self.mode_editor = None;
                 self.chat.clear();
+                self.touch_chat();
                 self.message_index.clear();
                 self.tool_index.clear();
                 self.active_reasoning.clear();
+                self.reasoning_buffers.clear();
+                self.open_thinking.clear();
+                self.thinking_started.clear();
                 self.pending_approvals.clear();
                 self.paused_routes = 0;
                 self.last_message_target = None;
@@ -740,7 +884,13 @@ impl AppState {
                 self.drawer = None;
                 self.drawer_scroll = 0;
                 self.chat_selection = None;
+                self.queued_prompts.clear();
                 self.stash_team_editor_catalog();
+                for member in &mut self.members {
+                    member.session = None;
+                    member.session_policy = SessionPolicy::Fresh;
+                    member.status = MemberStatus::Idle;
+                }
             }
             RuntimeEvent::ResumeChoices { conversations } => {
                 self.resume_choices = conversations;
@@ -752,9 +902,13 @@ impl AppState {
             RuntimeEvent::ConversationResumed { chat, .. } => {
                 self.chat = chat;
                 trim_initial_chat(&mut self.chat);
+                self.touch_chat();
                 self.message_index.clear();
                 self.tool_index.clear();
                 self.active_reasoning.clear();
+                self.reasoning_buffers.clear();
+                self.open_thinking.clear();
+                self.thinking_started.clear();
                 self.pending_approvals.clear();
                 self.paused_routes = 0;
                 self.last_message_target = None;
@@ -766,6 +920,7 @@ impl AppState {
                 self.drawer = None;
                 self.drawer_scroll = 0;
                 self.chat_selection = None;
+                self.queued_prompts.clear();
                 self.stash_team_editor_catalog();
             }
         }
@@ -784,6 +939,7 @@ impl AppState {
             self.scroll = self.scroll.saturating_add(est_lines);
         }
         self.chat.push(item);
+        self.touch_chat();
         self.chat.len() - 1
     }
 
@@ -810,6 +966,7 @@ impl AppState {
         };
         let item = std::mem::replace(slot, chat_truncation_notice());
         *slot = bound_chat_item(item);
+        self.touch_chat();
     }
 
     /// A cancelled or failed backend can exit without emitting the matching
@@ -920,113 +1077,37 @@ impl AppState {
         }
     }
 
-    fn trim_chat_for(&mut self, incoming_items: usize, incoming_bytes: usize) {
-        let mut bytes = self.chat.iter().map(chat_item_bytes).sum::<usize>();
-        let protected = self
-            .message_index
-            .values()
-            .filter_map(|cell| cell.index)
-            .chain(self.tool_index.values().filter_map(|cell| cell.index))
-            .collect::<HashSet<_>>();
-        let mut remove = vec![false; self.chat.len()];
-        let mut retained = self.chat.len();
-        for (index, item) in self.chat.iter().enumerate() {
-            if chat_budget_fits(retained, bytes, incoming_items, incoming_bytes) {
-                break;
-            }
-            if protected.contains(&index) {
+    fn trim_chat_for(&mut self, _incoming_items: usize, _incoming_bytes: usize) {
+        // Keep every item in the current conversation so the user can scroll
+        // back to its first message. Only compact a live cell that itself
+        // exceeded the per-item cap.
+        for index in 0..self.chat.len() {
+            let before = chat_item_bytes(&self.chat[index]);
+            if before <= MAX_CHAT_ITEM_BYTES {
                 continue;
             }
-            remove[index] = true;
-            retained -= 1;
-            bytes = bytes.saturating_sub(chat_item_bytes(item));
-        }
-        // Keep an explicit, attributed placeholder for active output before
-        // evicting its cell. Completion can then replace it, while the live
-        // transcript still explains why the preview disappeared.
-        if !chat_budget_fits(retained, bytes, incoming_items, incoming_bytes) {
-            for (index, removed) in remove.iter().enumerate() {
-                if chat_budget_fits(retained, bytes, incoming_items, incoming_bytes) {
-                    break;
-                }
-                if *removed || !protected.contains(&index) {
-                    continue;
-                }
-                let before = chat_item_bytes(&self.chat[index]);
-                if compact_active_chat_item(&mut self.chat[index]) {
-                    let after = chat_item_bytes(&self.chat[index]);
-                    bytes = bytes.saturating_sub(before).saturating_add(after);
-                    for cell in self.message_index.values_mut() {
-                        if cell.index == Some(index) {
-                            cell.omitted = true;
-                        }
+            if compact_active_chat_item(&mut self.chat[index]) {
+                self.touch_chat();
+                for cell in self.message_index.values_mut() {
+                    if cell.index == Some(index) {
+                        cell.omitted = true;
                     }
-                    for cell in self.tool_index.values_mut() {
-                        if cell.index == Some(index) {
-                            cell.omitted = true;
-                        }
+                }
+                for cell in self.tool_index.values_mut() {
+                    if cell.index == Some(index) {
+                        cell.omitted = true;
                     }
                 }
             }
         }
-        // Active message/tool cells are preferred, not exempt: otherwise many
-        // simultaneous streams can bypass the hard TUI memory ceiling.
-        if !chat_budget_fits(retained, bytes, incoming_items, incoming_bytes) {
-            for (index, item) in self.chat.iter().enumerate() {
-                if chat_budget_fits(retained, bytes, incoming_items, incoming_bytes) {
-                    break;
-                }
-                if remove[index] {
-                    continue;
-                }
-                remove[index] = true;
-                retained -= 1;
-                bytes = bytes.saturating_sub(chat_item_bytes(item));
-            }
-        }
-        if !remove.iter().any(|removed| *removed) {
-            return;
-        }
-        let removed_before = removed_prefix_counts(&remove);
-        let mut index = 0;
-        self.chat.retain(|_| {
-            let keep = !remove[index];
-            index += 1;
-            keep
-        });
-        for cell in self.message_index.values_mut() {
-            cell.index = cell
-                .index
-                .and_then(|index| remap_index(index, &remove, &removed_before));
-            if cell.index.is_none() {
-                cell.omitted = true;
-            }
-        }
-        for cell in self.tool_index.values_mut() {
-            cell.index = cell
-                .index
-                .and_then(|index| remap_index(index, &remove, &removed_before));
-            if cell.index.is_none() {
-                cell.omitted = true;
-            }
-        }
-        if let Some(find) = self.find.as_mut() {
-            find.matches = find
-                .matches
-                .iter()
-                .filter_map(|&index| remap_index(index, &remove, &removed_before))
-                .collect();
-            find.current = find.current.min(find.matches.len().saturating_sub(1));
-        }
-        self.chat_selection = None;
     }
 
     fn set_status(&mut self, member: &MemberId, status: MemberStatus) {
         if let Some(view) = self.members.iter_mut().find(|m| &m.id == member) {
             view.status = status;
         }
-        // Queued means a run is still active and another prompt is waiting;
-        // keep the original elapsed timer until the runtime explicitly idles.
+        // Every active state keeps the original elapsed timer until the runtime
+        // explicitly idles. Queue depth is tracked separately from member status.
         if member_status_is_active(status) {
             self.running_since
                 .entry(member.clone())
@@ -1038,29 +1119,119 @@ impl AppState {
             || status == MemberStatus::Failed
             || status == MemberStatus::NeedsApproval
         {
-            self.active_reasoning.remove(member);
+            self.close_thinking(member);
         }
     }
 
-    fn append_reasoning(&mut self, member: MemberId, delta: &str) {
-        let delta = bounded_text(delta, MAX_ACTIVE_REASONING_BYTES);
+    fn close_thinking(&mut self, member: &MemberId) {
+        self.reasoning_buffers.remove(member);
+        let started = self.thinking_started.remove(member);
+        if let Some(idx) = self.open_thinking.remove(member)
+            && let Some(ChatItem::Thinking { elapsed_secs, .. }) = self.chat.get_mut(idx)
+        {
+            *elapsed_secs = started.map(|t| t.elapsed().as_secs());
+            self.touch_chat();
+        }
+        self.active_reasoning.remove(member);
+    }
+
+    fn update_reasoning_status(&mut self, member: MemberId, delta: &str) {
+        let delta = bounded_text(delta, MAX_CHAT_ITEM_BYTES);
         if delta.is_empty() {
             return;
         }
-        let reasoning = self.active_reasoning.entry(member).or_default();
-        if delta.starts_with(reasoning.as_str()) {
-            *reasoning = delta;
-        } else if !reasoning.ends_with(&delta) {
-            let _ = append_bounded_text(reasoning, &delta, MAX_ACTIVE_REASONING_BYTES);
+        self.thinking_started
+            .entry(member.clone())
+            .or_insert_with(Instant::now);
+        let current_text = {
+            let buffer = self.reasoning_buffers.entry(member.clone()).or_default();
+            if delta.starts_with(buffer.as_str()) {
+                *buffer = delta;
+            } else if !buffer.ends_with(&delta) {
+                let _ = append_bounded_text(buffer, &delta, MAX_CHAT_ITEM_BYTES);
+            }
+            if let Some(header) = reasoning_status_header(buffer) {
+                self.active_reasoning.insert(member.clone(), header);
+            }
+            buffer.clone()
+        };
+        let (display_name, backend) = self.member_meta(&member);
+        if backend != BackendKind::Codex {
+            if let Some(&idx) = self.open_thinking.get(&member) {
+                if let Some(ChatItem::Thinking { text, .. }) = self.chat.get_mut(idx) {
+                    *text = current_text;
+                    self.touch_chat();
+                }
+            } else {
+                let idx = self.chat.len();
+                self.chat.push(ChatItem::Thinking {
+                    member: member.clone(),
+                    display_name,
+                    backend,
+                    text: current_text,
+                    elapsed_secs: None,
+                });
+                self.open_thinking.insert(member, idx);
+                self.touch_chat();
+            }
         }
     }
 
     pub(crate) fn member_meta(&self, member: &MemberId) -> (String, BackendKind) {
-        self.members
+        if let Some(member) = self
+            .members
             .iter()
-            .find(|m| &m.id == member)
-            .map(|m| (m.display_name.clone(), m.backend))
+            .find(|candidate| &candidate.id == member)
+        {
+            return (member.display_name.clone(), member.backend);
+        }
+        self.chat
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                ChatItem::Agent {
+                    member: candidate,
+                    display_name,
+                    backend,
+                    ..
+                } if candidate == member => Some((display_name.clone(), *backend)),
+                ChatItem::Thinking {
+                    member: candidate,
+                    backend,
+                    ..
+                } if candidate == member => Some((member.to_string(), *backend)),
+                _ => None,
+            })
             .unwrap_or_else(|| (member.to_string(), BackendKind::Codex))
+    }
+
+    pub fn member_color_index(&self, member: &MemberId) -> usize {
+        let Some(index) = self
+            .members
+            .iter()
+            .position(|candidate| &candidate.id == member)
+        else {
+            return 0;
+        };
+        let backend = self.members[index].backend;
+        self.members[..index]
+            .iter()
+            .filter(|candidate| candidate.backend == backend)
+            .count()
+    }
+
+    pub fn member_color(&self, member: &MemberId) -> ratatui::style::Color {
+        let backend = self
+            .members
+            .iter()
+            .find(|candidate| &candidate.id == member)
+            .map(|candidate| candidate.backend)
+            .unwrap_or_else(|| self.member_meta(member).1);
+        crate::tui::theme::backend_color_shaded(backend, self.member_color_index(member))
+    }
+
+    pub fn member_color_bold(&self, member: &MemberId) -> ratatui::style::Style {
+        crate::tui::theme::bold(self.member_color(member))
     }
 
     pub fn member_display(&self, member: &MemberId) -> String {
@@ -1094,15 +1265,21 @@ impl AppState {
     }
 
     pub fn inherited_user_message(&self, text: &str) -> Option<(MessageTarget, String)> {
-        let target = self.last_message_target.clone()?;
-        if self.resolve_local_targets(&target).is_empty() {
-            return None;
-        }
+        let target = self.last_resolvable_message_target()?;
         let body = text.trim();
         if body.is_empty() {
             return None;
         }
         Some((target.clone(), format_inherited_user_body(&target, body)))
+    }
+
+    pub fn last_resolvable_message_target(&self) -> Option<MessageTarget> {
+        let target = self.last_message_target.clone()?;
+        if self.resolve_local_targets(&target).is_empty() {
+            None
+        } else {
+            Some(target)
+        }
     }
 
     pub fn clear_last_message_target(&mut self) {
@@ -1213,6 +1390,15 @@ impl AppState {
     pub fn active_mode(&self) -> TerminalMode {
         self.active_mode
     }
+    pub fn modes(&self) -> &ModesConfig {
+        &self.modes
+    }
+    pub fn mode_overrides(&self) -> &ModesConfig {
+        &self.mode_overrides
+    }
+    pub fn suggested_verify(&self) -> Option<&str> {
+        self.suggested_verify.as_deref()
+    }
     pub fn workspace(&self) -> &str {
         &self.workspace
     }
@@ -1305,6 +1491,8 @@ impl AppState {
 
     pub fn begin_chat_selection(&mut self, pos: (usize, usize)) {
         self.disarm_quit();
+        self.composer.clear_selection();
+        self.composer_dragging = false;
         self.chat_selection = Some(ChatSelection {
             start: pos,
             end: pos,
@@ -1319,6 +1507,48 @@ impl AppState {
 
     pub fn clear_chat_selection(&mut self) {
         self.chat_selection = None;
+        self.composer_dragging = false;
+    }
+
+    pub fn begin_composer_selection(&mut self, index: usize) {
+        self.disarm_quit();
+        self.chat_selection = None;
+        self.composer_dragging = true;
+        let index = self.image_placeholder_boundary(index, None);
+        self.composer.begin_selection_at(index);
+    }
+
+    pub fn update_composer_selection(&mut self, index: usize) {
+        if self.composer_dragging {
+            let index = self.image_placeholder_boundary(index, None);
+            self.composer.extend_selection_to(index);
+        }
+    }
+
+    pub fn finish_composer_selection(&mut self) -> String {
+        self.composer_dragging = false;
+        self.composer.selected_text()
+    }
+
+    pub fn queued_prompt_count(&self) -> usize {
+        self.queued_prompts.values().map(Vec::len).sum()
+    }
+
+    pub fn queued_prompts_for(&self, member: &MemberId) -> &[String] {
+        self.queued_prompts
+            .get(member)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    pub fn clamp_scroll(&mut self, max: usize) {
+        if self.scroll > max {
+            self.scroll = max;
+        }
+    }
+
+    pub fn set_chat_page_rows(&mut self, rows: usize) {
+        self.chat_page_rows = rows.max(1);
     }
     pub fn composer(&self) -> &Composer {
         &self.composer
@@ -1350,6 +1580,9 @@ impl AppState {
         self.paused_routes = 0;
         self.pending_approvals.clear();
         self.active_reasoning.clear();
+        self.reasoning_buffers.clear();
+        self.open_thinking.clear();
+        self.thinking_started.clear();
         self.running_since.clear();
         for member in &mut self.members {
             if member_status_is_active(member.status) {
@@ -1367,6 +1600,19 @@ impl AppState {
             .iter()
             .filter(|m| member_status_is_active(m.status))
             .count()
+    }
+
+    /// True when the next frame must paint even without input (spinner / elapsed).
+    pub fn needs_animated_frame(&self) -> bool {
+        self.running_count() > 0 || self.verification_active()
+    }
+
+    fn touch_chat(&mut self) {
+        self.chat_fingerprint = self.chat_fingerprint.wrapping_add(1);
+    }
+
+    pub(crate) fn roster_revision(&self) -> u64 {
+        self.roster_revision
     }
 
     pub fn verification_active(&self) -> bool {
@@ -1523,9 +1769,128 @@ impl AppState {
         self.disarm_quit();
         self.header_selected = None;
         self.composer.insert(ch);
+        self.reconcile_pending_images();
         self.history_cursor = None;
         self.reset_popup();
     }
+    pub fn pending_images(&self) -> &[PromptImage] {
+        &self.pending_images
+    }
+
+    fn image_placeholder_boundary(&self, index: usize, prefer_end: Option<bool>) -> usize {
+        let text = self.composer.text();
+        for number in 1..=self.pending_images.len() {
+            let placeholder = image_placeholder(number);
+            let Some((start, end)) = literal_char_range(&text, &placeholder) else {
+                continue;
+            };
+            if start < index && index < end {
+                return match prefer_end {
+                    Some(true) => end,
+                    Some(false) => start,
+                    None if index - start < end - index => start,
+                    None => end,
+                };
+            }
+        }
+        index
+    }
+
+    fn snap_cursor_around_image(&mut self, prefer_end: Option<bool>) {
+        let index = self.image_placeholder_boundary(self.composer.cursor(), prefer_end);
+        self.composer.set_cursor_index(index);
+    }
+
+    fn reconcile_pending_images(&mut self) {
+        if self.pending_images.is_empty() {
+            return;
+        }
+        let text = self.composer.text();
+        let mut retained = Vec::new();
+        for (index, image) in std::mem::take(&mut self.pending_images)
+            .into_iter()
+            .enumerate()
+        {
+            let placeholder = image_placeholder(index + 1);
+            if text.contains(&placeholder) {
+                retained.push((placeholder, image));
+            } else {
+                super::clipboard_image::remove_managed_paste(&image.path);
+            }
+        }
+        for (index, (old_placeholder, _)) in retained.iter().enumerate() {
+            let new_placeholder = image_placeholder(index + 1);
+            if old_placeholder == &new_placeholder {
+                continue;
+            }
+            let text = self.composer.text();
+            if let Some((start, end)) = literal_char_range(&text, old_placeholder) {
+                let _ = self.composer.replace_range(start, end, &new_placeholder);
+            }
+        }
+        self.pending_images = retained.into_iter().map(|(_, image)| image).collect();
+    }
+
+    pub fn has_composer_draft(&self) -> bool {
+        !self.composer.is_empty() || !self.pending_images.is_empty()
+    }
+
+    pub fn attach_pending_image(&mut self, mut image: PromptImage) -> Result<(), String> {
+        if self.pending_images.len() >= MAX_PROMPT_IMAGES {
+            return Err(format!("at most {MAX_PROMPT_IMAGES} images per message"));
+        }
+        if let Ok(canonical) = std::fs::canonicalize(&image.path) {
+            image.path = canonical;
+        }
+        let bytes = std::fs::read(&image.path)
+            .map_err(|_| format!("image is not readable: {}", image.path.display()))?;
+        if bytes.len() > MAX_IMAGE_BYTES {
+            return Err(format!("image is too large ({} bytes)", bytes.len()));
+        }
+        if mime_from_bytes(&bytes).is_none() {
+            return Err("attached file is not a PNG/JPEG/GIF/WebP image".to_string());
+        }
+        if self
+            .pending_images
+            .iter()
+            .any(|existing| existing.path == image.path)
+        {
+            return Ok(());
+        }
+        let next_placeholder = image_placeholder(self.pending_images.len() + 1);
+        if !self.composer.can_insert_text_exact(&next_placeholder) {
+            return Err(COMPOSER_INPUT_TRUNCATED.to_string());
+        }
+        self.disarm_quit();
+        self.header_selected = None;
+        if self.composer.delete_selection() {
+            self.reconcile_pending_images();
+        }
+        let next_placeholder = image_placeholder(self.pending_images.len() + 1);
+        if !self.composer.insert_text_exact(&next_placeholder) {
+            return Err(COMPOSER_INPUT_TRUNCATED.to_string());
+        }
+        self.pending_images.push(image);
+        self.history_cursor = None;
+        self.reset_popup();
+        Ok(())
+    }
+
+    /// Bracketed paste: a single image path is copied into the workspace
+    /// paste dir (or replaced by clipboard bytes). Anything else is text.
+    pub fn paste_text_or_image(&mut self, text: &str) {
+        if let Some(result) = super::clipboard_image::import_pasted_text(&self.workspace, text) {
+            match result.and_then(|image| self.attach_pending_image(image)) {
+                Ok(()) => {}
+                Err(err) => {
+                    self.push(ChatItem::Notice { text: err });
+                }
+            }
+            return;
+        }
+        self.insert_text(text);
+    }
+
     pub fn insert_text(&mut self, text: &str) {
         self.disarm_quit();
         self.header_selected = None;
@@ -1538,6 +1903,7 @@ impl AppState {
         let pre_truncated = end < text.len();
         let text = text[..end].replace("\r\n", "\n").replace('\r', "\n");
         let fully_inserted = self.composer.insert_text(&text) && !pre_truncated;
+        self.reconcile_pending_images();
         if !fully_inserted
             && !matches!(
                 self.chat.last(),
@@ -1555,6 +1921,7 @@ impl AppState {
         self.disarm_quit();
         self.header_selected = None;
         self.composer.insert_newline();
+        self.reconcile_pending_images();
         self.history_cursor = None;
         self.reset_popup();
     }
@@ -1562,18 +1929,37 @@ impl AppState {
     /// already on the first line (so the caller recalls history instead).
     pub fn composer_up(&mut self) -> bool {
         self.disarm_quit();
-        self.composer.up()
+        let moved = self.composer.up();
+        self.snap_cursor_around_image(None);
+        moved
     }
     /// Move the cursor down within a multi-line composer; returns false if it is
     /// already on the last line.
     pub fn composer_down(&mut self) -> bool {
         self.disarm_quit();
-        self.composer.down()
+        let moved = self.composer.down();
+        self.snap_cursor_around_image(None);
+        moved
     }
     pub fn backspace(&mut self) {
         self.disarm_quit();
         self.header_selected = None;
-        self.composer.backspace();
+        let cursor = self.composer.cursor();
+        let text = self.composer.text();
+        let image_range = (self.composer.selection_range().is_none())
+            .then(|| {
+                (1..=self.pending_images.len()).find_map(|number| {
+                    let placeholder = image_placeholder(number);
+                    literal_char_range(&text, &placeholder).filter(|(_, end)| *end == cursor)
+                })
+            })
+            .flatten();
+        if let Some((start, end)) = image_range {
+            self.composer.delete_range(start, end);
+        } else {
+            self.composer.backspace();
+        }
+        self.reconcile_pending_images();
         self.history_cursor = None;
         self.reset_popup();
     }
@@ -1581,6 +1967,15 @@ impl AppState {
         self.disarm_quit();
         self.header_selected = None;
         self.composer.delete_word();
+        self.reconcile_pending_images();
+        self.history_cursor = None;
+        self.reset_popup();
+    }
+    pub fn clear_line(&mut self) {
+        self.disarm_quit();
+        self.header_selected = None;
+        self.composer.delete_line();
+        self.reconcile_pending_images();
         self.history_cursor = None;
         self.reset_popup();
     }
@@ -1588,17 +1983,20 @@ impl AppState {
         self.disarm_quit();
         self.header_selected = None;
         self.composer.clear();
+        self.discard_pending_images();
         self.history_cursor = None;
         self.reset_popup();
     }
     pub fn cursor_left(&mut self) {
         self.disarm_quit();
         self.composer.left();
+        self.snap_cursor_around_image(Some(false));
         self.reset_popup();
     }
     pub fn cursor_right(&mut self) {
         self.disarm_quit();
         self.composer.right();
+        self.snap_cursor_around_image(Some(true));
         self.reset_popup();
     }
     pub fn cursor_home(&mut self) {
@@ -1614,9 +2012,17 @@ impl AppState {
     pub fn take_composer(&mut self) -> String {
         self.disarm_quit();
         let text = self.composer.take();
+        // Keep copies on disk: adapters may still be reading them.
+        self.pending_images.clear();
         self.history_cursor = None;
         self.reset_popup();
         text
+    }
+
+    fn discard_pending_images(&mut self) {
+        for image in self.pending_images.drain(..) {
+            super::clipboard_image::remove_managed_paste(&image.path);
+        }
     }
 
     pub fn popup_up(&mut self) {
@@ -1647,6 +2053,7 @@ impl AppState {
         let insert = completion.items[index].insert.clone();
         let before = self.composer.text();
         self.composer.replace_token(completion.token_start, &insert);
+        self.reconcile_pending_images();
         self.reset_popup();
         self.composer.text() != before
     }
@@ -1671,6 +2078,10 @@ impl AppState {
     /// to the newest entry; further steps walk backwards.
     pub fn history_prev(&mut self) {
         self.disarm_quit();
+        if !self.pending_images.is_empty() {
+            self.composer.home();
+            return;
+        }
         if self.prompt_history.is_empty() {
             return;
         }
@@ -1941,11 +2352,16 @@ impl AppState {
         self.disarm_quit();
         self.drawer = if self.drawer.as_ref() == Some(&drawer) {
             self.stash_team_editor_catalog();
+            self.mode_editor = None;
             None
         } else {
             self.stash_team_editor_catalog();
+            if drawer != Drawer::Mode {
+                self.mode_editor = None;
+            }
             match drawer {
                 Drawer::Team => self.open_team_editor(),
+                Drawer::Mode => self.open_mode_editor(),
                 Drawer::Runs => {
                     self.ensure_selected_run();
                 }
@@ -2060,6 +2476,7 @@ impl AppState {
         self.drawer = None;
         self.drawer_scroll = 0;
         self.stash_team_editor_catalog();
+        self.mode_editor = None;
     }
 
     pub fn stage_selected_run_action(&mut self) -> bool {
@@ -2254,6 +2671,51 @@ impl AppState {
         self.team_editor.as_ref()
     }
 
+    pub(crate) fn mode_editor(&self) -> Option<&ModeEditor> {
+        self.mode_editor.as_ref()
+    }
+
+    pub(crate) fn handle_mode_editor_key(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> ModeEditorOutcome {
+        if self.drawer != Some(Drawer::Mode) {
+            return ModeEditorOutcome::Ignored;
+        }
+        let Some(editor) = self.mode_editor.as_mut() else {
+            return ModeEditorOutcome::Ignored;
+        };
+        editor.handle_key(code, modifiers)
+    }
+
+    pub(crate) fn insert_mode_editor_text(&mut self, text: &str) -> bool {
+        if self.drawer != Some(Drawer::Mode) {
+            return false;
+        }
+        self.mode_editor
+            .as_mut()
+            .is_some_and(|editor| editor.insert_edit_text(text))
+    }
+
+    fn open_mode_editor(&mut self) {
+        let members = self
+            .members
+            .iter()
+            .map(|view| self.view_to_member(view))
+            .collect();
+        self.mode_editor = Some(ModeEditor::new(
+            self.team.clone(),
+            PathBuf::from(&self.workspace),
+            self.default_target.clone(),
+            members,
+            self.modes.clone(),
+            self.mode_overrides.clone(),
+            self.suggested_verify.clone(),
+            self.active_mode,
+        ));
+    }
+
     pub(crate) fn handle_team_editor_key(
         &mut self,
         code: KeyCode,
@@ -2415,11 +2877,11 @@ impl AppState {
     }
 
     pub fn scroll_up(&mut self) {
-        self.scroll_by(1);
+        self.scroll_by(self.chat_page_rows as i32);
     }
 
     pub fn scroll_down(&mut self) {
-        self.scroll_by(-1);
+        self.scroll_by(-(self.chat_page_rows as i32));
     }
 
     pub fn scroll_by(&mut self, delta: i32) {
@@ -2434,6 +2896,10 @@ impl AppState {
     pub fn reset_scroll(&mut self) {
         self.disarm_quit();
         self.scroll = 0;
+    }
+
+    pub fn is_quit_armed(&self) -> bool {
+        self.quit_armed
     }
 
     pub fn quit(&mut self) {
@@ -2452,8 +2918,26 @@ impl AppState {
         }
     }
 
+    pub fn thinking_expanded(&self) -> bool {
+        self.thinking_expanded
+    }
+
+    pub fn diffs_expanded(&self) -> bool {
+        self.diffs_expanded
+    }
+
     pub fn tools_expanded(&self) -> bool {
         self.tools_expanded
+    }
+
+    pub fn toggle_thinking_expansion(&mut self) {
+        self.disarm_quit();
+        self.thinking_expanded = !self.thinking_expanded;
+    }
+
+    pub fn toggle_diffs_expansion(&mut self) {
+        self.disarm_quit();
+        self.diffs_expanded = !self.diffs_expanded;
     }
 
     pub fn toggle_tools_expansion(&mut self) {
@@ -2466,6 +2950,16 @@ impl AppState {
     }
 
     /// How long `member` has been running, for the "working" elapsed timer.
+    pub fn is_thinking_live(&self, member: &MemberId) -> bool {
+        self.reasoning_buffers.contains_key(member)
+    }
+
+    pub fn thinking_live_secs(&self, member: &MemberId) -> Option<u64> {
+        self.thinking_started
+            .get(member)
+            .map(|started| started.elapsed().as_secs())
+    }
+
     pub fn member_elapsed_secs(&self, member: &MemberId) -> Option<u64> {
         self.running_since
             .get(member)
@@ -2585,8 +3079,9 @@ fn format_inherited_user_body(target: &MessageTarget, body: &str) -> String {
 /// Searchable text for one chat item (used by `/find`).
 fn chat_item_search_text(item: &ChatItem) -> String {
     match item {
-        ChatItem::User { body, .. } => body.clone(),
+        ChatItem::User { body, .. } => crate::adapter::prompt_images::display_prompt_images(body),
         ChatItem::Agent { text, .. } => text.clone(),
+        ChatItem::Thinking { text, .. } => text.clone(),
         ChatItem::Tool {
             name,
             summary,
@@ -2595,7 +3090,7 @@ fn chat_item_search_text(item: &ChatItem) -> String {
         } => format!("{name} {summary} {detail}"),
         ChatItem::Diff { files, .. } => files
             .iter()
-            .map(|(path, _)| path.as_str())
+            .map(|file| file.path.as_str())
             .collect::<Vec<_>>()
             .join(" "),
         ChatItem::Route { body, .. } => body.clone(),
@@ -2620,23 +3115,14 @@ fn estimate_item_lines(item: &ChatItem) -> usize {
                 text.lines().count().max(1) + 1 // +1 for header
             }
         }
-        ChatItem::Tool { detail, .. } => 1 + usize::from(!detail.is_empty()),
+        ChatItem::Thinking { .. } => 1,
+        ChatItem::Tool { detail, .. } => 2 + usize::from(!detail.is_empty()),
         ChatItem::Diff { files, .. } => 1 + files.len(),
         ChatItem::Route { body, .. } => 1 + body.lines().count().max(1),
         ChatItem::Notice { text } => text.lines().count().max(1),
         ChatItem::Error { message, .. } => message.lines().count().max(1),
         ChatItem::Verdict { summary, .. } => 1 + summary.lines().count(),
     }
-}
-
-fn chat_budget_fits(
-    retained_items: usize,
-    retained_bytes: usize,
-    incoming_items: usize,
-    incoming_bytes: usize,
-) -> bool {
-    retained_items.saturating_add(incoming_items) <= MAX_CHAT_ITEMS
-        && retained_bytes.saturating_add(incoming_bytes) <= MAX_CHAT_BYTES
 }
 
 fn chat_truncation_notice() -> ChatItem {
@@ -2678,6 +3164,22 @@ fn bound_chat_item(item: ChatItem) -> ChatItem {
                 text,
             })
         }
+        ChatItem::Thinking {
+            member,
+            display_name,
+            backend,
+            text,
+            elapsed_secs,
+        } => {
+            let fixed = member.as_str().len().saturating_add(display_name.len());
+            bounded_chat_field(text, fixed).map(|text| ChatItem::Thinking {
+                member,
+                display_name,
+                backend,
+                text,
+                elapsed_secs,
+            })
+        }
         ChatItem::Tool {
             member,
             name,
@@ -2701,7 +3203,21 @@ fn bound_chat_item(item: ChatItem) -> ChatItem {
         ChatItem::Diff { member, files, ok } => (member.as_str().len().saturating_add(
             files
                 .iter()
-                .map(|(path, kind)| path.len().saturating_add(kind.len()))
+                .map(|file| {
+                    file.path
+                        .len()
+                        .saturating_add(file.kind.len())
+                        .saturating_add(
+                            file.old_text
+                                .as_ref()
+                                .map(String::len)
+                                .unwrap_or(0)
+                                .saturating_add(
+                                    file.new_text.as_ref().map(String::len).unwrap_or(0),
+                                )
+                                .saturating_add(file.patch.as_ref().map(String::len).unwrap_or(0)),
+                        )
+                })
                 .sum::<usize>(),
         ) <= MAX_CHAT_ITEM_BYTES)
             .then_some(ChatItem::Diff { member, files, ok }),
@@ -2745,6 +3261,12 @@ fn chat_item_bytes(item: &ChatItem) -> usize {
             display_name,
             text,
             ..
+        }
+        | ChatItem::Thinking {
+            member,
+            display_name,
+            text,
+            ..
         } => member.as_str().len() + display_name.len() + text.len(),
         ChatItem::Tool {
             member,
@@ -2757,7 +3279,13 @@ fn chat_item_bytes(item: &ChatItem) -> usize {
             member.as_str().len()
                 + files
                     .iter()
-                    .map(|(path, kind)| path.len() + kind.len())
+                    .map(|file| {
+                        file.path.len()
+                            + file.kind.len()
+                            + file.old_text.as_ref().map(String::len).unwrap_or(0)
+                            + file.new_text.as_ref().map(String::len).unwrap_or(0)
+                            + file.patch.as_ref().map(String::len).unwrap_or(0)
+                    })
                     .sum::<usize>()
         }
         ChatItem::Route { from, to, body } => {
@@ -2773,35 +3301,11 @@ fn chat_item_bytes(item: &ChatItem) -> usize {
     }
 }
 
-fn trim_initial_chat(chat: &mut Vec<ChatItem>) {
+fn trim_initial_chat(chat: &mut [ChatItem]) {
+    // Bound each item, but keep the conversation from its first message.
     for item in chat.iter_mut() {
         let original = std::mem::replace(item, chat_truncation_notice());
         *item = bound_chat_item(original);
-    }
-    let mut bytes = chat.iter().map(chat_item_bytes).sum::<usize>();
-    let mut remove = 0;
-    while remove < chat.len()
-        && (chat.len().saturating_sub(remove) > MAX_CHAT_ITEMS || bytes > MAX_CHAT_BYTES)
-    {
-        bytes = bytes.saturating_sub(chat_item_bytes(&chat[remove]));
-        remove += 1;
-    }
-    if remove > 0 {
-        chat.drain(..remove);
-        let notice = chat_truncation_summary();
-        let notice_bytes = chat_item_bytes(&notice);
-        while !chat_budget_fits(chat.len(), bytes, 1, notice_bytes) && !chat.is_empty() {
-            bytes = bytes.saturating_sub(chat_item_bytes(&chat[0]));
-            chat.remove(0);
-        }
-        chat.insert(0, notice);
-        chat.shrink_to_fit();
-    }
-}
-
-fn chat_truncation_summary() -> ChatItem {
-    ChatItem::Notice {
-        text: EARLIER_HISTORY_OMITTED.to_string(),
     }
 }
 
@@ -2829,6 +3333,10 @@ fn trim_prompt_history(history: &mut Vec<String>) {
 fn compact_active_chat_item(item: &mut ChatItem) -> bool {
     match item {
         ChatItem::Agent { text, .. } if text != ACTIVE_MESSAGE_OUTPUT_OMITTED => {
+            *text = ACTIVE_MESSAGE_OUTPUT_OMITTED.to_string();
+            true
+        }
+        ChatItem::Thinking { text, .. } if text != ACTIVE_MESSAGE_OUTPUT_OMITTED => {
             *text = ACTIVE_MESSAGE_OUTPUT_OMITTED.to_string();
             true
         }
@@ -2879,19 +3387,6 @@ fn interrupted_completion_text(
     completed
 }
 
-fn removed_prefix_counts(remove: &[bool]) -> Vec<usize> {
-    let mut counts = Vec::with_capacity(remove.len() + 1);
-    counts.push(0);
-    for &removed in remove {
-        counts.push(counts.last().copied().unwrap_or(0) + usize::from(removed));
-    }
-    counts
-}
-
-fn remap_index(index: usize, remove: &[bool], removed_before: &[usize]) -> Option<usize> {
-    (!remove.get(index).copied().unwrap_or(true)).then(|| index - removed_before[index])
-}
-
 #[cfg(test)]
-#[path = "app_state_tests.rs"]
+#[path = "app_state_tests/mod.rs"]
 mod tests;

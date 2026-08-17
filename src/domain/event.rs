@@ -6,7 +6,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::mode::{CollabMode, ModeStatusSummary, TerminalMode};
+use crate::domain::mode::{CollabMode, ModeStatusSummary, ModesConfig, TerminalMode};
 use crate::domain::team::{
     BackendKind, DefaultTarget, Effort, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
     TeamMember, TeamSettings,
@@ -208,6 +208,49 @@ pub struct TeamMessage {
     pub body: String,
 }
 
+/// One edited path, optionally with the before/after text used to paint a
+/// Codex-style `+/-` hunk when the file-changes block is expanded. Native
+/// backends may instead provide a unified patch, which keeps its source line
+/// numbers without requiring full before/after file snapshots.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileChangeItem {
+    pub path: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch: Option<String>,
+}
+
+impl FileChangeItem {
+    pub fn new(path: impl Into<String>, kind: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            kind: kind.into(),
+            old_text: None,
+            new_text: None,
+            patch: None,
+        }
+    }
+
+    pub fn with_texts(
+        mut self,
+        old_text: Option<impl Into<String>>,
+        new_text: Option<impl Into<String>>,
+    ) -> Self {
+        self.old_text = old_text.map(Into::into).filter(|text| !text.is_empty());
+        self.new_text = new_text.map(Into::into).filter(|text| !text.is_empty());
+        self
+    }
+
+    pub fn with_patch(mut self, patch: Option<impl Into<String>>) -> Self {
+        self.patch = patch.map(Into::into).filter(|text| !text.is_empty());
+        self
+    }
+}
+
 /// Who a user submission is addressed to.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum MessageTarget {
@@ -231,13 +274,21 @@ pub struct ImportedMessage {
 
 /// Commands sent from the TUI to the runtime.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)] // Queue events intentionally carry their complete payload.
 pub enum UiCommand {
     /// Select the mode used by subsequent messages in this terminal session.
     SetMode { mode: TerminalMode },
+    /// Replace conversation-scoped mode knob overrides (field-level).
+    SetModeOverrides { overrides: ModesConfig },
+    /// Persist the selected mode's current overrides into team.json.
+    SaveModeDefaults { mode: TerminalMode },
     /// Submit a user message to one or more members.
     UserMessage { target: MessageTarget, body: String },
     /// Cancel a specific member's run, or all running members when `None`.
+    /// Queued prompts are kept and start as soon as the current run exits.
     Cancel { member: Option<MemberId> },
+    /// Pull the last not-yet-started queued prompt back into the composer.
+    EditQueuedPrompt { member: Option<MemberId> },
     /// Re-run the most recent turn.
     Retry,
     /// Resolve a pending approval.
@@ -273,6 +324,13 @@ pub enum UiCommand {
         member: MemberId,
         items: Vec<ImportedMessage>,
     },
+    /// Import an existing native session (Claude, Codex, Grok) by session ID into the chat.
+    ImportSession {
+        member: Option<MemberId>,
+        session_id: String,
+    },
+    /// Export the current session to Claude Code native format (~/.claude/projects/...).
+    ExportSession { format: Option<String> },
     /// Ask the runtime to reserve exclusive access to one member's native
     /// interactive session. This travels through the ordered work queue so it
     /// cannot overtake earlier user commands.
@@ -353,6 +411,10 @@ pub enum AgentEvent {
     TextDelta(String),
     /// A reasoning/thinking summary (rendered faintly, not the final answer).
     Reasoning(String),
+    /// The backend opened a new reasoning-summary section.
+    ReasoningSectionBreak,
+    /// The backend completed the current reasoning-summary item.
+    ReasoningCompleted,
     /// The current assistant message is complete, with its full text.
     MessageCompleted(String),
     /// A tool/command invocation has started.
@@ -389,7 +451,7 @@ pub enum AgentEvent {
     ParseWarning(String),
     /// A set of file changes the agent made (apply_patch / edits).
     FileChange {
-        files: Vec<(String, String)>,
+        files: Vec<FileChangeItem>,
         ok: bool,
     },
     /// The backend process exited.
@@ -591,6 +653,14 @@ pub enum RuntimeEvent {
         default_target: Option<DefaultTarget>,
         members: Vec<MemberSummary>,
         runs: Vec<RunSummary>,
+        modes: ModesConfig,
+        mode_overrides: ModesConfig,
+        suggested_verify: Option<String>,
+    },
+    /// Conversation mode bindings changed without a full roster refresh.
+    ModesUpdated {
+        defaults: ModesConfig,
+        overrides: ModesConfig,
     },
     /// Complete user-editable settings, emitted on request and after a
     /// successful replacement or conversation restore.
@@ -617,6 +687,16 @@ pub enum RuntimeEvent {
         member: MemberId,
         status: MemberStatus,
     },
+    /// A member's not-yet-started prompts after a queue change.
+    QueueUpdated {
+        member: MemberId,
+        prompts: Vec<String>,
+    },
+    /// The last queued prompt was returned for editing.
+    QueuedPromptReturned {
+        member: MemberId,
+        body: String,
+    },
     /// A new agent message cell begins.
     MessageStarted {
         msg: MessageId,
@@ -636,6 +716,10 @@ pub enum RuntimeEvent {
     Reasoning {
         member: MemberId,
         text: String,
+    },
+    /// The current reasoning progress has completed and should disappear.
+    ReasoningCompleted {
+        member: MemberId,
     },
     ToolStarted {
         member: MemberId,
@@ -657,7 +741,7 @@ pub enum RuntimeEvent {
     /// A set of file changes the agent made (rendered as a diff card).
     FileChange {
         member: MemberId,
-        files: Vec<(String, String)>,
+        files: Vec<FileChangeItem>,
         ok: bool,
     },
     /// An agent-to-agent message was routed (shown inline in the chat).
@@ -774,6 +858,16 @@ pub enum ChatItem {
         backend: BackendKind,
         text: String,
     },
+    /// One legacy/imported thinking segment retained for replay compatibility.
+    Thinking {
+        member: MemberId,
+        display_name: String,
+        backend: BackendKind,
+        text: String,
+        /// Set when the segment is closed. `None` means it is still streaming
+        /// or was recorded before elapsed times were stored.
+        elapsed_secs: Option<u64>,
+    },
     Tool {
         member: MemberId,
         name: String,
@@ -783,7 +877,7 @@ pub enum ChatItem {
     },
     Diff {
         member: MemberId,
-        files: Vec<(String, String)>,
+        files: Vec<FileChangeItem>,
         ok: bool,
     },
     Route {
