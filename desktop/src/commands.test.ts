@@ -16,7 +16,8 @@ describe("parseComposerInput", () => {
     expect(parseComposerInput("/verify cargo test", "default")).toEqual({ kind: "command", command: { type: "verify_run", command: "cargo test" } });
   });
 
-  it("marks deferred drawers explicitly", () => {
-    expect(parseComposerInput("/diff", "default")).toEqual({ kind: "unsupported", command: "diff" });
+  it("opens utility drawers and preserves an optional search query", () => {
+    expect(parseComposerInput("/diff", "default")).toEqual({ kind: "utility", utility: "diff", query: undefined });
+    expect(parseComposerInput("/find bridge", "default")).toEqual({ kind: "utility", utility: "find", query: "bridge" });
   });
 });

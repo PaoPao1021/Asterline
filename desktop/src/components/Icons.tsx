@@ -1,14 +1,22 @@
 import type { LucideIcon, LucideProps } from "lucide-react";
 import {
+  Activity,
+  Bot,
   Check,
   ChevronRight,
   CirclePlay,
+  Code2,
+  Command,
+  Copy,
+  Cpu,
   Ellipsis,
   FileCode2,
+  Flame,
   FolderOpen,
   GitFork,
   History,
   Languages,
+  Layers,
   MessageSquareText,
   MoonStar,
   Orbit,
@@ -16,16 +24,20 @@ import {
   PanelRightClose,
   Plus,
   RotateCcw,
+  Search,
   Send,
   Settings2,
+  Shield,
   ShieldCheck,
   Sparkles,
   Square,
   SunMedium,
+  Terminal,
   TriangleAlert,
   UsersRound,
   Wrench,
   X,
+  Zap,
 } from "lucide-react";
 
 export type IconProps = LucideProps;
@@ -72,3 +84,15 @@ export const SparkIcon = withDefaults(Sparkles);
 export const MoreIcon = withDefaults(Ellipsis);
 export const HistoryIcon = withDefaults(History);
 export const RefreshIcon = withDefaults(RotateCcw);
+export const SearchIcon = withDefaults(Search);
+export const TerminalIcon = withDefaults(Terminal);
+export const ActivityIcon = withDefaults(Activity);
+export const BotIcon = withDefaults(Bot);
+export const CodeIcon = withDefaults(Code2);
+export const CommandIcon = withDefaults(Command);
+export const CopyIcon = withDefaults(Copy);
+export const CpuIcon = withDefaults(Cpu);
+export const FlameIcon = withDefaults(Flame);
+export const LayersIcon = withDefaults(Layers);
+export const ShieldIcon = withDefaults(Shield);
+export const ZapIcon = withDefaults(Zap);

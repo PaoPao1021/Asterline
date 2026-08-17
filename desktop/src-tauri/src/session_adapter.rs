@@ -51,6 +51,7 @@ pub struct PreparedSession {
     pub workspace: String,
     pub team: TeamSettingsV1,
     pub initial_chat: Vec<asterline::domain::event::ChatItem>,
+    pub initial_logs: Vec<asterline::domain::event::LogEntry>,
 }
 
 impl PreparedSession {
@@ -59,15 +60,13 @@ impl PreparedSession {
         let team = team_settings_from_domain(&session.team_settings(), Some(&workspace))
             .map_err(io::Error::other)?;
         let initial_chat = session.take_initial_chat();
-        // Logs intentionally stay outside the v1 timeline. Drain them here so
-        // future bridge versions can add a bounded log drawer without changing
-        // ownership of AppSession.
-        let _initial_logs = session.take_initial_logs();
+        let initial_logs = session.take_initial_logs();
         Ok(Self {
             session,
             workspace,
             team,
             initial_chat,
+            initial_logs,
         })
     }
 
@@ -198,6 +197,11 @@ pub fn command_to_runtime(
 ) -> Result<UiCommand, String> {
     let run_id = |id: Option<u64>| id.map(RunId);
     match command {
+        DesktopCommandV1::RequestLogs { .. }
+        | DesktopCommandV1::RequestDiff { .. }
+        | DesktopCommandV1::RequestSkills { .. } => {
+            Err("utility queries are handled by the desktop host".to_string())
+        }
         DesktopCommandV1::SetMode { mode } => Ok(UiCommand::SetMode {
             mode: terminal_mode(mode),
         }),

@@ -4,6 +4,7 @@
 /desktop/dist/
 /desktop/src-tauri/target/
 /desktop/src-tauri/gen/
+/target-v11-preview/
 /desktop/*.tsbuildinfo
 /.playwright-cli/
 /output/

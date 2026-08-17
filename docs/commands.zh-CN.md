@@ -232,6 +232,12 @@ Codex Skill 的 `@<Codex 成员> /skill` 才会转换。`@member /` 会列出真
 `/resume` 不接受 ID 或其他参数。当成员或验证任务仍在运行时不能切换，应先使用
 `Esc` 取消。
 
+### Desktop V1.1 工具抽屉
+
+Desktop 命令输入框还支持 `/logs`、`/diff`、`/skills` 和 `/find`，用于打开只读工具
+抽屉。日志、Git Diff 和 Skills 发现均按需请求并限制结果数量；`/find` 只搜索当前
+已经加载的会话时间线。Desktop 工具按钮也可以打开相同抽屉。
+
 ### `/retry`
 
 ```text

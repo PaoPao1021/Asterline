@@ -255,6 +255,14 @@ cancel.
 `/resume` accepts no ID or other argument. Asterline refuses to switch while
 members or verification are active; press `Esc` first.
 
+### Desktop V1.1 utility drawers
+
+The Desktop command composer also accepts `/logs`, `/diff`, `/skills`, and
+`/find`. These open read-only utility drawers. Logs, Git diff, and skill
+discovery are requested on demand with bounded results; `/find` searches only
+the currently loaded conversation timeline. The same drawers are available
+from the Desktop utility buttons.
+
 ### `/retry`
 
 ```text

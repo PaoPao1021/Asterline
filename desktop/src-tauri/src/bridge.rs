@@ -364,6 +364,37 @@ pub struct DesktopSnapshotV1 {
     pub last_error: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevelV1 {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LogEntryV1 {
+    pub level: LogLevelV1,
+    pub source: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DiffResultV1 {
+    pub text: String,
+    pub truncated: bool,
+    pub file_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SkillSummaryV1 {
+    pub name: String,
+    pub description: String,
+    pub backend: BackendKindV1,
+    pub invocation: String,
+}
+
 impl Default for DesktopSnapshotV1 {
     fn default() -> Self {
         Self {
@@ -453,6 +484,20 @@ pub enum DesktopRuntimeEventV1 {
         source: String,
         message: String,
     },
+    LogsReplaced {
+        request_id: u64,
+        entries: Vec<LogEntryV1>,
+        truncated: bool,
+    },
+    DiffReplaced {
+        request_id: u64,
+        result: DiffResultV1,
+    },
+    SkillsReplaced {
+        request_id: u64,
+        skills: Vec<SkillSummaryV1>,
+        truncated: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -462,7 +507,7 @@ pub enum ApprovalChoiceV1 {
     Reject,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MessageTargetV1 {
     Default,
@@ -471,9 +516,25 @@ pub enum MessageTargetV1 {
     Members { members: Vec<String> },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DesktopCommandV1 {
+    RequestLogs {
+        request_id: u64,
+        member: Option<String>,
+        level: Option<LogLevelV1>,
+        query: Option<String>,
+        limit: Option<usize>,
+    },
+    RequestDiff {
+        request_id: u64,
+    },
+    RequestSkills {
+        request_id: u64,
+        backend: Option<BackendKindV1>,
+        query: Option<String>,
+        limit: Option<usize>,
+    },
     SetMode {
         mode: TerminalModeV1,
     },
@@ -561,6 +622,7 @@ pub enum DesktopCommandV1 {
 pub struct DesktopModel {
     pub snapshot: DesktopSnapshotV1,
     item_sequence: u64,
+    logs: Vec<LogEntryV1>,
 }
 
 impl DesktopModel {
@@ -584,6 +646,38 @@ impl DesktopModel {
 
     pub fn set_team(&mut self, team: TeamSettingsV1) {
         self.snapshot.team = Some(team);
+    }
+
+    pub fn seed_logs(&mut self, logs: Vec<LogEntryV1>) {
+        self.logs = logs;
+        self.trim_logs();
+    }
+
+    pub fn logs(&self) -> &[LogEntryV1] {
+        &self.logs
+    }
+
+    pub fn push_log(&mut self, entry: LogEntryV1) {
+        self.logs.push(entry);
+        self.trim_logs();
+    }
+
+    fn trim_logs(&mut self) {
+        const MAX_LOGS: usize = 4_000;
+        const MAX_LOG_BYTES: usize = 2 * 1024 * 1024;
+        while self.logs.len() > MAX_LOGS
+            || self
+                .logs
+                .iter()
+                .map(|entry| entry.source.len().saturating_add(entry.message.len()))
+                .sum::<usize>()
+                > MAX_LOG_BYTES
+        {
+            if self.logs.is_empty() {
+                break;
+            }
+            self.logs.remove(0);
+        }
     }
 
     pub fn seed_chat(&mut self, chat: Vec<ChatItem>) {
@@ -872,11 +966,19 @@ impl DesktopModel {
                 item.ok = Some(approve);
                 self.add_timeline(item)
             }
-            Log(entry) => DesktopRuntimeEventV1::RuntimeLog {
-                level: entry.level.as_str().to_string(),
-                source: entry.source,
-                message: entry.message,
-            },
+            Log(entry) => {
+                let level = entry.level.as_str().to_string();
+                self.push_log(LogEntryV1 {
+                    level: log_level(entry.level.as_str()),
+                    source: entry.source.clone(),
+                    message: entry.message.clone(),
+                });
+                DesktopRuntimeEventV1::RuntimeLog {
+                    level,
+                    source: entry.source,
+                    message: entry.message,
+                }
+            }
             Notice(message) => {
                 let mut item = TimelineItemV1::new(self.fresh_id("notice"), TimelineKindV1::Notice);
                 item.text = Some(message.clone());
@@ -1294,7 +1396,16 @@ fn terminal_mode(value: &str) -> TerminalModeV1 {
     }
 }
 
-fn backend_kind(value: &str) -> BackendKindV1 {
+fn log_level(value: &str) -> LogLevelV1 {
+    match value {
+        "debug" => LogLevelV1::Debug,
+        "warn" => LogLevelV1::Warn,
+        "error" => LogLevelV1::Error,
+        _ => LogLevelV1::Info,
+    }
+}
+
+pub(crate) fn backend_kind(value: &str) -> BackendKindV1 {
     match value {
         "claude" => BackendKindV1::Claude,
         "grok" => BackendKindV1::Grok,
@@ -1523,5 +1634,31 @@ mod tests {
         });
         model.apply_runtime(RuntimeEvent::SessionReset);
         assert_eq!(model.snapshot.members[0].session, None);
+    }
+
+    #[test]
+    fn runtime_logs_are_retained_outside_the_chat_timeline() {
+        let mut model = DesktopModel::default();
+        let event = model.apply_runtime(RuntimeEvent::Log(
+            asterline::domain::event::LogEntry::warn("builder", "approval pending"),
+        ));
+        assert!(matches!(event, DesktopRuntimeEventV1::RuntimeLog { .. }));
+        assert_eq!(model.logs()[0].source, "builder");
+        assert_eq!(model.logs()[0].level, LogLevelV1::Warn);
+        assert!(model.snapshot.timeline.is_empty());
+    }
+
+    #[test]
+    fn utility_commands_use_versioned_request_ids() {
+        let command = DesktopCommandV1::RequestSkills {
+            request_id: 17,
+            backend: Some(BackendKindV1::Claude),
+            query: Some("audit".to_string()),
+            limit: Some(8),
+        };
+        let value = serde_json::to_value(command).unwrap();
+        assert_eq!(value["type"], "request_skills");
+        assert_eq!(value["request_id"], 17);
+        assert_eq!(value["backend"], "claude");
     }
 }

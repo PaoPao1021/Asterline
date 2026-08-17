@@ -17,7 +17,8 @@ use tauri::{AppHandle, Emitter, Manager, Runtime, State, WindowEvent};
 use attach::{AttachCapabilitiesV1, ExternalAttachLaunchV1};
 use bridge::{
     DESKTOP_EVENT_CHANNEL, DesktopCommandV1, DesktopEventV1, DesktopModel, DesktopPhase,
-    DesktopRuntimeEventV1, DesktopSnapshotV1, RunStatusV1, envelope,
+    DesktopRuntimeEventV1, DesktopSnapshotV1, DiffResultV1, LogEntryV1, LogLevelV1,
+    RunStatusV1, SkillSummaryV1, envelope,
 };
 use recent::RecentWorkspaceV1;
 use session_adapter::{ActiveSession, BootstrapAdapterOutcome, PendingTeamSetup, PreparedSession};
@@ -138,6 +139,18 @@ fn dispatch_desktop_command(
         return shutdown_desktop(app, state);
     }
 
+    if matches!(
+        command,
+        DesktopCommandV1::RequestLogs { .. }
+            | DesktopCommandV1::RequestDiff { .. }
+            | DesktopCommandV1::RequestSkills { .. }
+    ) {
+        let mut inner = state.lock()?;
+        let event = utility_query(&inner, command)?;
+        emit_locked(&app, &mut inner, event);
+        return Ok(());
+    }
+
     // Upstream 0.2.9 makes the complete team settings document the single
     // authoritative mutation path. Preserve the compact Desktop effort action
     // by translating it into that validated atomic update.
@@ -225,6 +238,105 @@ fn dispatch_desktop_command(
         inner.model.clear_next_paused_route();
     }
     Ok(())
+}
+
+fn utility_query(
+    inner: &HostInner,
+    command: DesktopCommandV1,
+) -> Result<DesktopRuntimeEventV1, String> {
+    let workspace = inner
+        .workspace
+        .as_deref()
+        .ok_or_else(|| "open a workspace before requesting utility data".to_string())?;
+    match command {
+        DesktopCommandV1::RequestLogs {
+            request_id,
+            member,
+            level,
+            query,
+            limit,
+        } => {
+            let query = query.unwrap_or_default().to_lowercase();
+            let max = limit.unwrap_or(400).clamp(1, 400);
+            let mut entries = inner
+                .model
+                .logs()
+                .iter()
+                .filter(|entry| member.as_deref().is_none_or(|value| value == entry.source))
+                .filter(|entry| level.as_ref().is_none_or(|value| value == &entry.level))
+                .filter(|entry| {
+                    query.is_empty()
+                        || entry.source.to_lowercase().contains(&query)
+                        || entry.message.to_lowercase().contains(&query)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let truncated = entries.len() > max;
+            if truncated {
+                let start = entries.len() - max;
+                entries = entries.split_off(start);
+            }
+            Ok(DesktopRuntimeEventV1::LogsReplaced {
+                request_id,
+                entries,
+                truncated,
+            })
+        }
+        DesktopCommandV1::RequestDiff { request_id } => {
+            let text = asterline::tui::compute_git_diff(&workspace.to_string_lossy());
+            let truncated = text.contains("[diff output truncated at 2 MiB]")
+                || text.contains("[untracked file list truncated]");
+            let file_count = text
+                .lines()
+                .filter(|line| line.starts_with("diff --git ") || line.starts_with("  "))
+                .count();
+            Ok(DesktopRuntimeEventV1::DiffReplaced {
+                request_id,
+                result: DiffResultV1 {
+                    text,
+                    truncated,
+                    file_count,
+                },
+            })
+        }
+        DesktopCommandV1::RequestSkills {
+            request_id,
+            backend,
+            query,
+            limit,
+        } => {
+            let query = query.unwrap_or_default().to_lowercase();
+            let max = limit.unwrap_or(512).clamp(1, 512);
+            let mut skills = asterline::tui::skills::discover(Path::new(workspace))
+                .into_iter()
+                .filter(|skill| {
+                    backend
+                        .as_ref()
+                        .is_none_or(|value| bridge::backend_kind(skill.backend.as_str()) == *value)
+                })
+                .filter(|skill| {
+                    query.is_empty()
+                        || skill.name.to_lowercase().contains(&query)
+                        || skill.description.to_lowercase().contains(&query)
+                        || skill.invocation.to_lowercase().contains(&query)
+                })
+                .map(|skill| SkillSummaryV1 {
+                    name: skill.name,
+                    description: skill.description,
+                    backend: bridge::backend_kind(skill.backend.as_str()),
+                    invocation: skill.invocation,
+                })
+                .collect::<Vec<_>>();
+            let truncated = skills.len() > max;
+            skills.truncate(max);
+            Ok(DesktopRuntimeEventV1::SkillsReplaced {
+                request_id,
+                skills,
+                truncated,
+            })
+        }
+        _ => Err("unsupported utility query".to_string()),
+    }
 }
 
 #[tauri::command]
@@ -452,6 +564,20 @@ fn install_prepared(
     let workspace = prepared.workspace.clone();
     let team = prepared.team.clone();
     let chat = prepared.initial_chat.clone();
+    let logs = prepared
+        .initial_logs
+        .iter()
+        .map(|entry| LogEntryV1 {
+            level: match entry.level.as_str() {
+                "debug" => LogLevelV1::Debug,
+                "warn" => LogLevelV1::Warn,
+                "error" => LogLevelV1::Error,
+                _ => LogLevelV1::Info,
+            },
+            source: entry.source.clone(),
+            message: entry.message.clone(),
+        })
+        .collect();
     let (runtime_tx, runtime_rx) = mpsc::channel();
     let active = prepared
         .activate(runtime_tx)
@@ -468,6 +594,7 @@ fn install_prepared(
         inner.model.set_workspace(workspace);
         inner.model.set_team(team);
         inner.model.seed_chat(chat);
+        inner.model.seed_logs(logs);
         inner.active = Some(active);
         inner.generation
     };

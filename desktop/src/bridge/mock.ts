@@ -190,6 +190,21 @@ class MockDesktopClient implements DesktopClient {
         this.snapshot.mode = command.mode;
         this.emit({ type: "mode_changed", mode: command.mode });
         return;
+      case "request_logs":
+        this.emit({ type: "logs_replaced", request_id: command.request_id, entries: [
+          { level: "info", source: "runtime", message: "Desktop demo log stream is ready." },
+          { level: "warn", source: "builder", message: "A verification command is waiting for approval." },
+        ], truncated: false });
+        return;
+      case "request_diff":
+        this.emit({ type: "diff_replaced", request_id: command.request_id, result: { text: "diff --git a/desktop/src/App.tsx b/desktop/src/App.tsx\n@@\n+utility drawer enabled\n", truncated: false, file_count: 1 } });
+        return;
+      case "request_skills":
+        this.emit({ type: "skills_replaced", request_id: command.request_id, skills: [
+          { name: "review", description: "Review a change set with the team.", backend: "codex", invocation: "/review" },
+          { name: "audit", description: "Audit a repository for risks.", backend: "claude", invocation: "/audit" },
+        ], truncated: false });
+        return;
       case "user_message": {
         const turn = Date.now();
         const user: TimelineItemV1 = { id: `mock-user-${++this.messageCounter}`, kind: "user", turn, text: command.body, timestamp: now() };

@@ -105,4 +105,14 @@ describe("Asterline desktop workspace", () => {
     await user.click(restoreInspector);
     expect(inspector).toHaveClass("is-open");
   });
+
+  it("opens the utility drawer and loads bounded demo data", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "Logs" }));
+    expect(await screen.findByRole("complementary", { name: "Utilities" })).toBeInTheDocument();
+    expect(await screen.findByText("Desktop demo log stream is ready.")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Diff" }));
+    expect(await screen.findByText(/utility drawer enabled/)).toBeInTheDocument();
+  });
 });

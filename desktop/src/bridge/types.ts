@@ -15,6 +15,7 @@ export type Effort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 export type SandboxPolicy = "read-only" | "workspace-write" | "danger-full-access";
 export type SessionPolicy = "resume" | "fresh";
 export type PermissionMode = "default" | "acceptEdits" | "plan" | "auto" | "dontAsk" | "bypassPermissions";
+export type LogLevel = "debug" | "info" | "warn" | "error";
 export type RunStatus = "planned" | "running" | "verifying" | "done" | "failed" | "blocked";
 export type RunStepStatus = "todo" | "doing" | "done" | "blocked";
 
@@ -193,6 +194,25 @@ export interface DesktopSnapshotV1 {
   last_error?: string | null;
 }
 
+export interface LogEntryV1 {
+  level: LogLevel;
+  source: string;
+  message: string;
+}
+
+export interface DiffResultV1 {
+  text: string;
+  truncated: boolean;
+  file_count: number;
+}
+
+export interface SkillSummaryV1 {
+  name: string;
+  description: string;
+  backend: BackendKind;
+  invocation: string;
+}
+
 export interface DesktopEventV1 {
   version: 1;
   sequence: number;
@@ -218,7 +238,10 @@ export type DesktopRuntimeEventV1 =
   | { type: "turn_finished"; turn: number }
   | { type: "route_paused"; turn: number; member: string; to: string[]; reason: string; queued: number }
   | { type: "session_updated"; member: string; session: string }
-  | { type: "runtime_log"; level: string; source: string; message: string };
+  | { type: "runtime_log"; level: string; source: string; message: string }
+  | { type: "logs_replaced"; request_id: number; entries: LogEntryV1[]; truncated: boolean }
+  | { type: "diff_replaced"; request_id: number; result: DiffResultV1 }
+  | { type: "skills_replaced"; request_id: number; skills: SkillSummaryV1[]; truncated: boolean };
 
 export type MessageTargetV1 =
   | { type: "default" }
@@ -227,6 +250,9 @@ export type MessageTargetV1 =
   | { type: "members"; members: string[] };
 
 export type DesktopCommandV1 =
+  | { type: "request_logs"; request_id: number; member?: string | null; level?: LogLevel | null; query?: string | null; limit?: number | null }
+  | { type: "request_diff"; request_id: number }
+  | { type: "request_skills"; request_id: number; backend?: BackendKind | null; query?: string | null; limit?: number | null }
   | { type: "set_mode"; mode: TerminalMode }
   | { type: "user_message"; target: MessageTargetV1; body: string }
   | { type: "cancel"; member?: string | null }

@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { demoSnapshot } from "./bridge/mock";
-import { desktopReducer } from "./state";
+import { desktopReducer, initialUtilityState } from "./state";
 
 describe("desktopReducer", () => {
   it("ignores duplicate and older events", () => {
-    const state = { snapshot: structuredClone(demoSnapshot), loading: false, error: null };
+    const state = { snapshot: structuredClone(demoSnapshot), loading: false, error: null, utility: structuredClone(initialUtilityState) };
     const next = desktopReducer(state, {
       type: "event",
       packet: { version: 1, sequence: demoSnapshot.sequence, event: { type: "mode_changed", mode: "review" } },
@@ -14,7 +14,7 @@ describe("desktopReducer", () => {
 
   it("merges streaming timeline updates by stable id", () => {
     const snapshot = structuredClone(demoSnapshot);
-    const state = { snapshot, loading: false, error: null };
+    const state = { snapshot, loading: false, error: null, utility: structuredClone(initialUtilityState) };
     const next = desktopReducer(state, {
       type: "event",
       packet: {
@@ -29,7 +29,7 @@ describe("desktopReducer", () => {
 
   it("surfaces paused routes as actionable timeline items", () => {
     const snapshot = structuredClone(demoSnapshot);
-    const next = desktopReducer({ snapshot, loading: false, error: null }, {
+    const next = desktopReducer({ snapshot, loading: false, error: null, utility: structuredClone(initialUtilityState) }, {
       type: "event",
       packet: {
         version: 1,
@@ -38,5 +38,33 @@ describe("desktopReducer", () => {
       },
     });
     expect(next.snapshot?.timeline.at(-1)).toMatchObject({ kind: "route_paused", member: "builder", text: "relay limit reached", detail: "2" });
+  });
+
+  it("keeps member and team session IDs in sync", () => {
+    const snapshot = structuredClone(demoSnapshot);
+    const state = { snapshot, loading: false, error: null, utility: structuredClone(initialUtilityState) };
+    const next = desktopReducer(state, {
+      type: "event",
+      packet: {
+        version: 1,
+        sequence: snapshot.sequence + 1,
+        event: { type: "session_updated", member: "researcher", session: "session-refreshed" },
+      },
+    });
+
+    expect(next.snapshot?.members.find(({ id }) => id === "researcher")?.session).toBe("session-refreshed");
+    expect(next.snapshot?.team?.members.find(({ id }) => id === "researcher")?.session_id).toBe("session-refreshed");
+  });
+
+  it("ignores stale utility responses", () => {
+    const snapshot = structuredClone(demoSnapshot);
+    const requested = desktopReducer({ snapshot, loading: false, error: null, utility: structuredClone(initialUtilityState) }, {
+      type: "utility_request", utility: "logs", requestId: 9,
+    });
+    const stale = desktopReducer(requested, {
+      type: "event",
+      packet: { version: 1, sequence: snapshot.sequence + 1, event: { type: "logs_replaced", request_id: 8, entries: [{ level: "info", source: "old", message: "stale" }], truncated: false } },
+    });
+    expect(stale.utility.logs.value).toEqual([]);
   });
 });

@@ -1,7 +1,7 @@
 import { Fragment, useState } from "react";
 import type { MemberSummaryV1, TimelineItemV1 } from "../bridge/types";
 import type { Locale, Translate } from "../i18n";
-import { AlertIcon, CheckIcon, ChevronIcon, FileIcon, RouteIcon, SparkIcon, ToolIcon, XIcon } from "./Icons";
+import { AlertIcon, CheckIcon, ChevronIcon, CopyIcon, FileIcon, RouteIcon, SparkIcon, ToolIcon, XIcon } from "./Icons";
 
 interface TimelineProps {
   items: TimelineItemV1[];
@@ -23,12 +23,33 @@ function formatTime(value: string | null | undefined, locale: Locale): string {
 
 function DetailToggle({ detail, t }: { detail: string; t: Translate }) {
   const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const copy = async (event: React.MouseEvent) => {
+    event.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(detail);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      /* clipboard write may fail gracefully */
+    }
+  };
+
   return (
     <div className="detail-toggle">
-      <button onClick={() => setOpen((value) => !value)} aria-expanded={open}>
-        <ChevronIcon size={14} className={open ? "rotate-90" : ""} /> {open ? t("hideDetail") : t("showDetail")}
-      </button>
-      {open && <pre>{detail}</pre>}
+      <div className="detail-toggle-bar">
+        <button onClick={() => setOpen((value) => !value)} aria-expanded={open}>
+          <ChevronIcon size={14} className={open ? "rotate-90" : ""} /> {open ? t("hideDetail") : t("showDetail")}
+        </button>
+        {open && (
+          <button className="detail-copy-btn" onClick={copy} title={t("copyDetail")} aria-label={t("copyDetail")}>
+            {copied ? <CheckIcon size={12} /> : <CopyIcon size={12} />}
+            <span>{copied ? t("copied") : t("copyDetail")}</span>
+          </button>
+        )}
+      </div>
+      {open && <pre className="detail-code-block">{detail}</pre>}
     </div>
   );
 }
@@ -120,9 +141,16 @@ export function Timeline({ items, members, locale, t, resolvingRoute, onResolveP
   if (items.length === 0) {
     return (
       <div className="timeline-empty">
-        <div className="empty-orbit"><span /><span /><span /></div>
-        <h2>{t("timelineEmptyTitle")}</h2>
-        <p>{t("timelineEmptyBody")}</p>
+        <div className="empty-typo-canvas" aria-hidden="true">
+          <div className="typo-word">ASTERLINE</div>
+          <div className="typo-word outline">ASTERLINE</div>
+          <div className="typo-word blur">ASTERLINE</div>
+        </div>
+        <div className="empty-content-box">
+          <div className="empty-orbit"><span /><span /><span /></div>
+          <h2>{t("timelineEmptyTitle")}</h2>
+          <p>{t("timelineEmptyBody")}</p>
+        </div>
       </div>
     );
   }

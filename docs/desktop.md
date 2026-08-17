@@ -18,8 +18,16 @@ opened on the same workspace at the same time.
 - Switch between English and Simplified Chinese, light and dark themes.
 - Check manually for Desktop releases.
 
-The first release intentionally does not embed a terminal, provide repository
-search, expose a separate log explorer, or add telemetry.
+Desktop V1.1 also adds four read-only utility drawers:
+
+- `/logs` browses runtime diagnostics with level, source, and text filters. Each request returns at most 400 entries and reports truncation explicitly.
+- `/diff` shows staged, unstaged, and untracked changes relative to Git HEAD. It never mutates the workspace, caps output at 2 MiB, and stops Git after 10 seconds.
+- `/skills` lists skills discovered for the workspace, with backend and text filters plus copyable invocations. Results are capped at 512 and never expose absolute local paths to the WebView.
+- `/find` searches the currently loaded conversation timeline only, with match counts and previous/next navigation.
+
+Utility data is requested on demand through versioned bridge commands rather than being added to `DesktopSnapshotV1`. Switching workspaces, restoring a conversation, or shutting down clears stale utility results.
+
+The first release intentionally does not embed a terminal or add telemetry.
 
 ## Architecture and trust boundary
 

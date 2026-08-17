@@ -3,11 +3,11 @@ import type { DesktopCommandV1, MessageTargetV1, TerminalMode } from "./bridge/t
 export type ParsedComposerAction =
   | { kind: "empty" }
   | { kind: "command"; command: DesktopCommandV1 }
+  | { kind: "utility"; utility: "logs" | "diff" | "skills" | "find"; query?: string }
   | { kind: "message"; target: MessageTargetV1; body: string }
   | { kind: "unsupported"; command: string };
 
 const MODES = new Set<TerminalMode>(["normal", "review", "plan", "brainstorm", "team"]);
-const DEFERRED = new Set(["logs", "diff", "skills", "find"]);
 
 export function parseComposerInput(raw: string, selectedTarget: string): ParsedComposerAction {
   const text = raw.trim();
@@ -25,7 +25,9 @@ export function parseComposerInput(raw: string, selectedTarget: string): ParsedC
     if (name === "cancel") return { kind: "command", command: { type: "cancel", member: tail || null } };
     if (name === "continue") return { kind: "command", command: { type: "continue_run", note: tail || null } };
     if (name === "verify") return { kind: "command", command: { type: "verify_run", command: tail || null } };
-    if (DEFERRED.has(name)) return { kind: "unsupported", command: name };
+    if (name === "logs" || name === "diff" || name === "skills" || name === "find") {
+      return { kind: "utility", utility: name, query: tail || undefined };
+    }
     return { kind: "unsupported", command: name || "/" };
   }
 

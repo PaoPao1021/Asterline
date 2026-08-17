@@ -745,7 +745,7 @@ fn handle_search_action(action: Action, state: &mut AppState) {
 
 /// Capture staged and unstaged working-tree changes, including untracked files
 /// (mirrors codex's `/diff`). Returns a human-readable message on failure.
-fn compute_git_diff(workspace: &str) -> String {
+pub fn compute_git_diff(workspace: &str) -> String {
     const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
     const MAX_UNTRACKED_BYTES: usize = 256 * 1024;
     const MAX_UNTRACKED_FILES: usize = 2_000;

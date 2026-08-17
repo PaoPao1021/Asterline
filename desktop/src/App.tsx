@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { getDesktopClient } from "./bridge/client";
-import type { DesktopCommandV1, DesktopEventV1, TeamSettingsV1, TerminalMode } from "./bridge/types";
+import type { BackendKind, DesktopCommandV1, DesktopEventV1, LogEntryV1, TeamSettingsV1, TerminalMode } from "./bridge/types";
 import { parseComposerInput } from "./commands";
 import { ApprovalQueue } from "./components/ApprovalQueue";
 import { Composer } from "./components/Composer";
@@ -10,6 +10,7 @@ import { ProjectPicker } from "./components/ProjectPicker";
 import { SettingsModal } from "./components/SettingsModal";
 import { Sidebar } from "./components/Sidebar";
 import { Timeline } from "./components/Timeline";
+import { UtilityDrawer, type UtilityKind } from "./components/UtilityDrawer";
 import { createTranslator, detectLocale, type Locale } from "./i18n";
 import { desktopReducer, errorMessage, initialDesktopState } from "./state";
 
@@ -73,6 +74,9 @@ export function App() {
   const [target, setTarget] = useState("default");
   const [activeConversation, setActiveConversation] = useState<number | null>(null);
   const [toast, setToast] = useState<{ id: number; text: string; tone?: "error" | "success" } | null>(null);
+  const [utilityKind, setUtilityKind] = useState<UtilityKind | null>(null);
+  const [utilityQuery, setUtilityQuery] = useState<string | undefined>(undefined);
+  const utilityRequest = useRef(0);
   const pendingEvents = useRef<DesktopEventV1[]>([]);
   const hasSnapshot = useRef(false);
   const shell = useRef<HTMLDivElement>(null);
@@ -180,9 +184,29 @@ export function App() {
     catch (error) { notify(errorMessage(error), "error"); throw error; }
   }, [client, notify]);
 
+  const requestUtility = useCallback(async (kind: Exclude<UtilityKind, "find">, filters?: { query?: string; level?: LogEntryV1["level"]; backend?: BackendKind }) => {
+    const requestId = ++utilityRequest.current;
+    reduce({ type: "utility_request", utility: kind, requestId });
+    const command: DesktopCommandV1 = kind === "logs"
+      ? { type: "request_logs", request_id: requestId, query: filters?.query ?? null, level: filters?.level ?? null, member: null, limit: 400 }
+      : kind === "diff"
+        ? { type: "request_diff", request_id: requestId }
+        : { type: "request_skills", request_id: requestId, query: filters?.query ?? null, backend: filters?.backend ?? null, limit: 512 };
+    try { await dispatch(command); }
+    catch (error) { reduce({ type: "utility_error", utility: kind, requestId, error: errorMessage(error) }); }
+  }, [dispatch]);
+
+  const openUtility = useCallback((kind: UtilityKind, initialQuery?: string) => {
+    setUtilityKind(kind);
+    setUtilityQuery(initialQuery);
+    if (kind !== "find") void requestUtility(kind);
+  }, [requestUtility]);
+
   const openWorkspace = async (workspace: string) => {
     setProjectBusy(true);
     try {
+      setUtilityKind(null);
+      setUtilityQuery(undefined);
       if (snapshot?.workspace && snapshot.workspace !== workspace) await client.shutdownDesktop();
       hasSnapshot.current = false;
       pendingEvents.current = [];
@@ -200,9 +224,12 @@ export function App() {
     const action = parseComposerInput(text, target);
     if (action.kind === "empty") return false;
     if (action.kind === "unsupported") {
-      const deferred = ["logs", "diff", "skills", "find"].includes(action.command);
-      notify(t(deferred ? "deferredCommand" : "unknownCommand", { command: action.command }), "error");
+      notify(t("unknownCommand", { command: action.command }), "error");
       return false;
+    }
+    if (action.kind === "utility") {
+      openUtility(action.utility, action.query);
+      return true;
     }
     if (action.kind === "command") {
       await dispatch(action.command);
@@ -255,6 +282,8 @@ export function App() {
 
   const resume = async (conversation: number) => {
     setActiveConversation(conversation);
+    setUtilityKind(null);
+    setUtilityQuery(undefined);
     setResolvedRoutes(new Set());
     await dispatch({ type: "resume_conversation", conversation });
     if (window.innerWidth < 900) setSidebarOpen(false);
@@ -262,6 +291,8 @@ export function App() {
 
   const newSession = async () => {
     setActiveConversation(null);
+    setUtilityKind(null);
+    setUtilityQuery(undefined);
     setResolvedRoutes(new Set());
     await dispatch({ type: "new_session" });
     if (window.innerWidth < 900) setSidebarOpen(false);
@@ -322,6 +353,13 @@ export function App() {
         <span className="art-flare art-flare-one" />
         <span className="art-flare art-flare-two" />
         <span className="art-grid" />
+        <svg className="art-noise-svg" aria-hidden="true">
+          <filter id="canvas-grain">
+            <feTurbulence type="fractalNoise" baseFrequency="0.75" numOctaves="3" stitchTiles="stitch" />
+            <feColorMatrix type="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 0.05 0" />
+          </filter>
+          <rect width="100%" height="100%" filter="url(#canvas-grain)" />
+        </svg>
       </div>
       <Sidebar
         open={sidebarOpen}
@@ -354,11 +392,15 @@ export function App() {
             <button className="icon-button" aria-label={t("theme")} title={t("theme")} onClick={() => setTheme((value) => value === "light" ? "dark" : "light")}>{theme === "light" ? <MoonIcon /> : <SunIcon />}</button>
             <button className={`icon-button ${updateBusy ? "is-spinning" : ""}`} aria-label={t("update")} title={t("update")} disabled={updateBusy} onClick={() => void checkUpdate()}><RefreshIcon /></button>
             <button className="icon-button" aria-label={t("settings")} title={t("settings")} onClick={() => setSettingsOpen(true)}><SettingsIcon /></button>
+            <button className="utility-launcher-button" onClick={() => openUtility("find")} title={t("find")}><span>/</span>{t("find")}</button>
             {!inspectorOpen && <button className="icon-button panel-restore-button" onClick={toggleInspector} aria-label={t("details")}><PanelRightIcon /></button>}
           </div>
         </header>
 
         {client.kind === "mock" && <div className="demo-banner">{t("mockBanner")}</div>}
+        <div className="utility-launcher" aria-label={t("utilities")}>
+          {(["logs", "diff", "skills"] as const).map((kind) => <button key={kind} onClick={() => openUtility(kind)} className={utilityKind === kind ? "active" : ""}>{t(kind)}</button>)}
+        </div>
         <div className="conversation-column">
           <div className="timeline-scroll" ref={timelineScroll}>
             <div className="timeline-inner">
@@ -371,6 +413,8 @@ export function App() {
       </main>
 
       <Inspector open={inspectorOpen} members={snapshot?.members ?? []} runs={snapshot?.runs ?? []} locale={locale} t={t} onToggle={toggleInspector} dispatch={dispatch} onAttach={attach} />
+
+      {utilityKind && <UtilityDrawer kind={utilityKind} locale={locale} t={t} logs={state.utility.logs} diff={state.utility.diff} skills={state.utility.skills} timelineText={(snapshot?.timeline ?? []).map((item) => ({ id: item.id, title: item.title || item.kind, text: item.text || item.detail || "" }))} initialQuery={utilityQuery} onClose={() => setUtilityKind(null)} onOpen={openUtility} onRefresh={(kind, filters) => void requestUtility(kind, filters)} />}
 
       {projectPicker && <ProjectPicker recents={recents} canClose={Boolean(snapshot?.workspace)} initialPath={snapshot?.workspace ?? ""} busy={projectBusy} t={t} onClose={() => setProjectPicker(false)} onOpen={openWorkspace} />}
       {settingsOpen && <SettingsModal settings={teamSettings} busy={settingsBusy} t={t} onClose={() => setSettingsOpen(false)} onSave={saveSettings} />}
