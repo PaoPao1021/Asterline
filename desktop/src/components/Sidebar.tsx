@@ -1,14 +1,15 @@
-import type { ConversationSummaryV1, RecentWorkspaceV1 } from "../bridge/types";
+import { useMemo, useState } from "react";
+import type { ConversationSummaryV2, RecentWorkspace } from "../bridge/types";
 import type { Locale, Translate } from "../i18n";
-import { ChatIcon, FolderIcon, HistoryIcon, PanelLeftIcon, PlusIcon, SettingsIcon } from "./Icons";
+import { ChatIcon, DownloadIcon, FolderIcon, HistoryIcon, PanelLeftIcon, PlusIcon, SearchIcon, SettingsIcon } from "./Icons";
 
 interface SidebarProps {
   open: boolean;
   locale: Locale;
   workspace?: string | null;
   teamName?: string | null;
-  conversations: ConversationSummaryV1[];
-  recents: RecentWorkspaceV1[];
+  conversations: ConversationSummaryV2[];
+  recents: RecentWorkspace[];
   activeConversation?: number | null;
   t: Translate;
   onToggle: () => void;
@@ -17,6 +18,8 @@ interface SidebarProps {
   onOpenRecent: (workspace: string) => void;
   onResume: (id: number) => void;
   onSettings: () => void;
+  onImportSession: () => void;
+  onExportSession: () => void;
 }
 
 const projectName = (path?: string | null) => path?.split(/[\\/]/).filter(Boolean).at(-1) ?? "Workspace";
@@ -49,7 +52,18 @@ export function Sidebar({
   onOpenRecent,
   onResume,
   onSettings,
+  onImportSession,
+  onExportSession,
 }: SidebarProps) {
+  const [search, setSearch] = useState("");
+  const filteredConversations = useMemo(() => {
+    const needle = search.trim().toLowerCase();
+    if (!needle) return conversations;
+    return conversations.filter((conversation) =>
+      conversation.preview.toLowerCase().includes(needle) || String(conversation.id).includes(needle),
+    );
+  }, [conversations, search]);
+
   return (
     <aside className={`sidebar ${open ? "is-open" : "is-closed"}`} aria-label={t("menu")}>
       <div className="brand-row">
@@ -82,9 +96,19 @@ export function Sidebar({
       <nav className="sidebar-scroll">
         <section className="sidebar-section">
           <div className="section-heading"><span>{t("conversations")}</span><HistoryIcon size={14} /></div>
+          <label className="sidebar-search">
+            <SearchIcon size={13} />
+            <input
+              value={search}
+              placeholder={t("sessionSearch")}
+              aria-label={t("sessionSearch")}
+              onChange={(event) => setSearch(event.target.value)}
+            />
+          </label>
           <div className="conversation-list">
             {conversations.length === 0 && <div className="sidebar-empty">{t("noConversations")}</div>}
-            {conversations.slice(0, 8).map((conversation) => (
+            {filteredConversations.length === 0 && conversations.length > 0 && <div className="sidebar-empty">{t("noHistoryMatches")}</div>}
+            {filteredConversations.map((conversation) => (
               <button
                 key={conversation.id}
                 className={`conversation-item ${activeConversation === conversation.id ? "active" : ""}`}
@@ -97,6 +121,10 @@ export function Sidebar({
                 </span>
               </button>
             ))}
+          </div>
+          <div className="sidebar-session-tools">
+            <button className="sidebar-tool" onClick={onImportSession}><PlusIcon size={13} /><span>{t("importSession")}</span></button>
+            <button className="sidebar-tool" onClick={onExportSession}><DownloadIcon size={13} /><span>{t("exportToClaude")}</span></button>
           </div>
         </section>
 

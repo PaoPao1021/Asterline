@@ -1,12 +1,28 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { getDesktopClient } from "./bridge/client";
-import type { BackendKind, DesktopCommandV1, DesktopEventV1, DesktopUpdateV1, LogEntryV1, TeamSettingsV1, TerminalMode } from "./bridge/types";
-import { parseComposerInput } from "./commands";
+import type {
+  BackendKind,
+  CommandSpec,
+  ComposerAction,
+  DesktopCommandV2,
+  DesktopEventV2,
+  DesktopLaunchOptions,
+  DesktopUpdate,
+  LogEntryV2,
+  MessageTargetV2,
+  StagedAttachment,
+  TeamSettingsV2,
+  TerminalMode,
+} from "./bridge/types";
 import { ApprovalQueue } from "./components/ApprovalQueue";
+import { CommandPalette } from "./components/CommandPalette";
 import { Composer } from "./components/Composer";
-import { ChevronIcon, FolderIcon, GlobeIcon, MoonIcon, PanelLeftIcon, PanelRightIcon, RefreshIcon, SettingsIcon, SunIcon, XIcon } from "./components/Icons";
+import { ChevronIcon, CommandIcon, FolderIcon, GlobeIcon, MoonIcon, PanelLeftIcon, PanelRightIcon, PauseIcon, PlayIcon, RefreshIcon, SettingsIcon, SunIcon, XIcon } from "./components/Icons";
 import { Inspector } from "./components/Inspector";
+import { ModePanel } from "./components/ModePanel";
 import { ProjectPicker } from "./components/ProjectPicker";
+import { RunsPanel } from "./components/RunsPanel";
+import { SessionImportModal } from "./components/SessionImportModal";
 import { SettingsModal } from "./components/SettingsModal";
 import { Sidebar } from "./components/Sidebar";
 import { Timeline } from "./components/Timeline";
@@ -29,7 +45,7 @@ function initialTheme(): Theme {
   return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
-function fallbackTeam(workspace = ""): TeamSettingsV1 {
+function fallbackTeam(workspace = ""): TeamSettingsV2 {
   return {
     name: workspace.split(/[\\/]/).filter(Boolean).at(-1) || "New team",
     workspace,
@@ -68,7 +84,7 @@ export function App() {
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [projectBusy, setProjectBusy] = useState(false);
   const [updateBusy, setUpdateBusy] = useState(false);
-  const [availableUpdate, setAvailableUpdate] = useState<DesktopUpdateV1 | null>(null);
+  const [availableUpdate, setAvailableUpdate] = useState<DesktopUpdate | null>(null);
   const [approvalBusy, setApprovalBusy] = useState<number | null>(null);
   const [resolvingRoute, setResolvingRoute] = useState<string | null>(null);
   const [resolvedRoutes, setResolvedRoutes] = useState<Set<string>>(() => new Set());
@@ -77,8 +93,16 @@ export function App() {
   const [toast, setToast] = useState<{ id: number; text: string; tone?: "error" | "success" } | null>(null);
   const [utilityKind, setUtilityKind] = useState<UtilityKind | null>(null);
   const [utilityQuery, setUtilityQuery] = useState<string | undefined>(undefined);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [paletteExecutable, setPaletteExecutable] = useState(true);
+  const [catalog, setCatalog] = useState<CommandSpec[]>([]);
+  const [modePanelOpen, setModePanelOpen] = useState(false);
+  const [runsOpen, setRunsOpen] = useState(false);
+  const [sessionImportOpen, setSessionImportOpen] = useState(false);
+  const [launchOptions, setLaunchOptions] = useState<DesktopLaunchOptions>({});
+  const [composerInjection, setComposerInjection] = useState<{ text: string; nonce: number } | null>(null);
   const utilityRequest = useRef(0);
-  const pendingEvents = useRef<DesktopEventV1[]>([]);
+  const pendingEvents = useRef<DesktopEventV2[]>([]);
   const hasSnapshot = useRef(false);
   const shell = useRef<HTMLDivElement>(null);
   const pointerFrame = useRef<number | null>(null);
@@ -98,10 +122,10 @@ export function App() {
     try { setRecents(await client.listRecentWorkspaces()); } catch { /* app config is non-critical */ }
   }, [client]);
 
-  const bootstrap = useCallback(async (workspace?: string) => {
+  const bootstrap = useCallback(async (workspace?: string, options?: DesktopLaunchOptions) => {
     reduce({ type: "loading" });
     try {
-      const next = await client.bootstrapDesktop(workspace);
+      const next = await client.bootstrapDesktop(workspace, options);
       hasSnapshot.current = true;
       setResolvedRoutes(new Set());
       reduce({ type: "snapshot", snapshot: next });
@@ -124,13 +148,17 @@ export function App() {
     } catch (error) {
       reduce({ type: "error", error: errorMessage(error) });
     }
-  }, [client, notify, refreshRecents]);
+  }, [client, notify, refreshRecents, t]);
 
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void client.listenRuntimeEvents((packet) => {
       if (disposed) return;
+      // A queued prompt pulled back for editing lands in the composer draft.
+      if (packet.event.type === "queued_prompt_returned") {
+        setComposerInjection({ text: packet.event.body, nonce: packet.sequence });
+      }
       if (!hasSnapshot.current) pendingEvents.current.push(packet);
       else reduce({ type: "event", packet });
     }).then((stop) => {
@@ -188,16 +216,36 @@ export function App() {
     }
   }, [notify, snapshot?.team, t]);
 
-  const dispatch = useCallback(async (command: DesktopCommandV1) => {
+  // Load the shared command catalog once for palettes and /help.
+  useEffect(() => {
+    let alive = true;
+    client.commandCatalog().then((value) => { if (alive) setCatalog(value); }).catch(() => undefined);
+    return () => { alive = false; };
+  }, [client]);
+
+  // Ctrl+K opens the executable command palette.
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setPaletteExecutable(true);
+        setPaletteOpen(true);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
+
+  const dispatch = useCallback(async (command: DesktopCommandV2) => {
     try { await client.dispatchDesktopCommand(command); }
     catch (error) { notify(errorMessage(error), "error"); throw error; }
   }, [client, notify]);
 
-  const requestUtility = useCallback(async (kind: Exclude<UtilityKind, "find">, filters?: { query?: string; level?: LogEntryV1["level"]; backend?: BackendKind }) => {
+  const requestUtility = useCallback(async (kind: Exclude<UtilityKind, "find">, filters?: { query?: string; level?: LogEntryV2["level"]; backend?: BackendKind; member?: string | null }) => {
     const requestId = ++utilityRequest.current;
     reduce({ type: "utility_request", utility: kind, requestId });
-    const command: DesktopCommandV1 = kind === "logs"
-      ? { type: "request_logs", request_id: requestId, query: filters?.query ?? null, level: filters?.level ?? null, member: null, limit: 400 }
+    const command: DesktopCommandV2 = kind === "logs"
+      ? { type: "request_logs", request_id: requestId, query: filters?.query ?? null, level: filters?.level ?? null, member: filters?.member ?? null, limit: 400 }
       : kind === "diff"
         ? { type: "request_diff", request_id: requestId }
         : { type: "request_skills", request_id: requestId, query: filters?.query ?? null, backend: filters?.backend ?? null, limit: 512 };
@@ -211,15 +259,17 @@ export function App() {
     if (kind !== "find") void requestUtility(kind);
   }, [requestUtility]);
 
-  const openWorkspace = async (workspace: string) => {
+  const openWorkspace = async (workspace: string, options: DesktopLaunchOptions = {}) => {
     setProjectBusy(true);
     try {
+      const { riskAck: _riskAck, ...launch } = options;
+      setLaunchOptions(launch);
       setUtilityKind(null);
       setUtilityQuery(undefined);
       if (snapshot?.workspace && snapshot.workspace !== workspace) await client.shutdownDesktop();
       hasSnapshot.current = false;
       pendingEvents.current = [];
-      await bootstrap(workspace);
+      await bootstrap(workspace, launch);
       setProjectPicker(false);
     } finally { setProjectBusy(false); }
   };
@@ -229,35 +279,121 @@ export function App() {
     await dispatch({ type: "set_mode", mode });
   };
 
-  const submit = async (text: string): Promise<boolean> => {
-    const action = parseComposerInput(text, target);
-    if (action.kind === "empty") return false;
-    if (action.kind === "unsupported") {
-      notify(t("unknownCommand", { command: action.command }), "error");
-      return false;
-    }
-    if (action.kind === "utility") {
-      openUtility(action.utility, action.query);
-      return true;
-    }
-    if (action.kind === "command") {
-      await dispatch(action.command);
-      if (action.command.type === "set_mode") notify(t("commandOnly"), "success");
-      return true;
-    }
-    await dispatch({ type: "user_message", target: action.target, body: action.body });
-    return true;
-  };
+  const selectedTarget = (value: string): MessageTargetV2 =>
+    value === "all" ? { type: "all" } : value === "default" ? { type: "default" } : { type: "member", member: value };
 
-  const decision = async (id: number, decisionValue: "approve" | "reject") => {
+  const decision = useCallback(async (id: number, decisionValue: "approve" | "reject") => {
     setApprovalBusy(id);
     try {
       await dispatch({ type: "approve", id, decision: decisionValue });
       notify(t(decisionValue === "approve" ? "approvalGranted" : "approvalRejected"), "success");
     } finally { setApprovalBusy(null); }
+  }, [dispatch, notify, t]);
+
+  const approveFirst = async (decisionValue: "approve" | "reject") => {
+    const pending = snapshot?.approvals[0];
+    if (!pending) {
+      notify(t("noMatches"), "error");
+      return;
+    }
+    await decision(pending.id, decisionValue);
   };
 
-  const saveSettings = async (settings: TeamSettingsV1) => {
+  const submit = async (text: string, attachments: StagedAttachment[] = []): Promise<boolean> => {
+    let action: ComposerAction;
+    try {
+      action = await client.parseComposerText(text);
+    } catch (error) {
+      notify(errorMessage(error), "error");
+      return false;
+    }
+    const send = async (body: string, messageTarget: MessageTargetV2, staged: StagedAttachment[]): Promise<boolean> => {
+      try {
+        await dispatch({ type: "user_message", target: messageTarget, body, attachments: staged.map(({ token }) => token) });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    switch (action.type) {
+      case "empty":
+        return attachments.length > 0 ? send("", { type: "default" }, attachments) : false;
+      case "needs_target":
+        // Bare text follows the GUI target selector — the GUI affordance for
+        // the TUI's remembered last target.
+        return send(text, selectedTarget(target), attachments);
+      case "invalid":
+        notify(action.message, "error");
+        return false;
+      case "help":
+        setPaletteExecutable(false);
+        setPaletteOpen(true);
+        return true;
+      case "exit":
+        if (window.confirm(t("exitConfirm"))) {
+          try { await client.exitDesktop(); } catch (error) { notify(errorMessage(error), "error"); }
+        }
+        return true;
+      case "attach":
+        try {
+          const result = await client.openNativeSession(action.member);
+          notify(result.message || (result.launched ? `${t("attach")}: ${result.terminal ?? "terminal"}` : t("errorTitle")), result.launched ? "success" : "error");
+        } catch (error) { notify(errorMessage(error), "error"); }
+        return true;
+      case "find":
+        openUtility("find", action.query);
+        return true;
+      case "surface":
+        if (action.surface === "logs") {
+          openUtility("logs");
+        } else if (action.surface === "diff") {
+          openUtility("diff");
+        } else if (action.surface === "member_logs") {
+          setUtilityKind("logs");
+          setUtilityQuery(undefined);
+          if (action.member) await requestUtility("logs", { member: action.member });
+        } else if (action.surface === "mode") {
+          setModePanelOpen(true);
+        } else if (action.surface === "runs") {
+          setRunsOpen(true);
+        } else if (action.surface === "team") {
+          setSettingsOpen(true);
+        }
+        return true;
+      case "approve_first":
+        await approveFirst(action.decision);
+        return true;
+      case "command": {
+        // A target-only submission (`@member` with no body) sends nothing on
+        // its own — it exists to carry staged images, like the TUI.
+        if (
+          action.command.type === "user_message" &&
+          !action.command.body.trim() &&
+          !(action.command.attachments?.length) &&
+          attachments.length === 0
+        ) {
+          return false;
+        }
+        if (
+          action.command.type === "user_message" &&
+          attachments.length > 0 &&
+          !(action.command.attachments?.length)
+        ) {
+          await dispatch({
+            ...action.command,
+            attachments: attachments.map(({ token }) => token),
+          });
+          return true;
+        }
+        await dispatch(action.command);
+        if (action.command.type === "set_mode") notify(t("commandOnly"), "success");
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const saveSettings = async (settings: TeamSettingsV2) => {
     setSettingsBusy(true);
     pendingTeamSettings.current = JSON.stringify(settings);
     notify(t("settingsSubmitted"));
@@ -324,6 +460,7 @@ export function App() {
     setUtilityQuery(undefined);
     setResolvedRoutes(new Set());
     await dispatch({ type: "new_session" });
+    await client.discardStagedAttachments().catch(() => undefined);
     if (window.innerWidth < 900) setSidebarOpen(false);
   };
 
@@ -332,6 +469,10 @@ export function App() {
       const result = await client.openNativeSession(member);
       notify(result.message || (result.launched ? `${t("attach")}: ${result.terminal ?? "terminal"}` : t("errorTitle")), result.launched ? "success" : "error");
     } catch (error) { notify(errorMessage(error), "error"); }
+  };
+
+  const runPaletteCommand = (text: string) => {
+    void submit(text);
   };
 
   const toggleSidebar = () => {
@@ -370,7 +511,7 @@ export function App() {
 
   if ((state.error || snapshot?.phase === "error" || snapshot?.phase === "locked") && !projectPicker) {
     const locked = snapshot?.phase === "locked";
-    return <div className="full-state error-state"><img src="/asterline-mark.svg" alt="" /><h1>{t(locked ? "lockedTitle" : "errorTitle")}</h1><p>{locked ? t("lockedBody") : state.error || snapshot?.last_error}</p><div><button className="primary-button" onClick={() => void bootstrap(snapshot?.workspace ?? undefined)}>{t("retryOpen")}</button><button className="secondary-button" onClick={() => setProjectPicker(true)}>{t("chooseAnother")}</button></div>{projectPicker && <ProjectPicker recents={recents} canClose initialPath={snapshot?.workspace ?? ""} busy={projectBusy} t={t} onClose={() => setProjectPicker(false)} onOpen={openWorkspace} />}</div>;
+    return <div className="full-state error-state"><img src="/asterline-mark.svg" alt="" /><h1>{t(locked ? "lockedTitle" : "errorTitle")}</h1><p>{locked ? t("lockedBody") : state.error || snapshot?.last_error}</p><div><button className="primary-button" onClick={() => void bootstrap(snapshot?.workspace ?? undefined, launchOptions)}>{t("retryOpen")}</button><button className="secondary-button" onClick={() => setProjectPicker(true)}>{t("chooseAnother")}</button></div>{projectPicker && <ProjectPicker recents={recents} canClose initialPath={snapshot?.workspace ?? ""} busy={projectBusy} t={t} onClose={() => setProjectPicker(false)} onOpen={openWorkspace} />}</div>;
   }
 
   const teamSettings = snapshot?.team ?? fallbackTeam(snapshot?.workspace ?? "");
@@ -397,7 +538,7 @@ export function App() {
         teamName={snapshot?.team?.name}
         conversations={snapshot?.conversations ?? []}
         recents={recents}
-        activeConversation={activeConversation}
+        activeConversation={activeConversation ?? snapshot?.active_conversation ?? null}
         t={t}
         onToggle={toggleSidebar}
         onNew={() => void newSession()}
@@ -405,6 +546,8 @@ export function App() {
         onOpenRecent={(workspace) => void openWorkspace(workspace)}
         onResume={(id) => void resume(id)}
         onSettings={() => setSettingsOpen(true)}
+        onImportSession={() => setSessionImportOpen(true)}
+        onExportSession={() => void dispatch({ type: "export_session", format: "claude" })}
       />
 
       <main className="workspace-main">
@@ -417,6 +560,8 @@ export function App() {
           <div className="topbar-title"><span className="topbar-folder"><FolderIcon size={16} /></span><div><span className="topbar-kicker">LIVE WORKSPACE / 01</span><strong>{snapshot?.team?.name || snapshot?.workspace?.split(/[\\/]/).at(-1) || t("workspace")}</strong><small><i className={snapshot?.phase === "ready" ? "online" : ""} />{snapshot?.phase === "ready" ? t("connected") : t("starting")}</small></div></div>
           <div className="topbar-actions">
             {client.kind === "mock" && <span className="demo-pill">{t("demo")}</span>}
+            <button className="icon-button" aria-label={snapshot?.relay_paused ? t("resumeRelayAuto") : t("pauseRelay")} title={snapshot?.relay_paused ? t("resumeRelayAuto") : t("pauseRelay")} onClick={() => void dispatch({ type: "set_relay_paused", paused: !snapshot?.relay_paused })}>{snapshot?.relay_paused ? <PlayIcon /> : <PauseIcon />}</button>
+            <button className="icon-button" aria-label={t("commandPalette")} title={`${t("commandPalette")} (Ctrl+K)`} onClick={() => { setPaletteExecutable(true); setPaletteOpen(true); }}><CommandIcon /></button>
             <button className="icon-button" aria-label={t("language")} title={t("language")} onClick={() => setLocale((value) => value === "zh-CN" ? "en-US" : "zh-CN")}><GlobeIcon /><small>{locale === "zh-CN" ? "中" : "EN"}</small></button>
             <button className="icon-button" aria-label={t("theme")} title={t("theme")} onClick={() => setTheme((value) => value === "light" ? "dark" : "light")}>{theme === "light" ? <MoonIcon /> : <SunIcon />}</button>
             <button className={`icon-button ${updateBusy ? "is-spinning" : ""}`} aria-label={t("update")} title={t("update")} disabled={updateBusy} onClick={() => void checkUpdate()}><RefreshIcon /></button>
@@ -429,21 +574,54 @@ export function App() {
         {client.kind === "mock" && <div className="demo-banner">{t("mockBanner")}</div>}
         <div className="utility-launcher" aria-label={t("utilities")}>
           {(["logs", "diff", "skills"] as const).map((kind) => <button key={kind} onClick={() => openUtility(kind)} className={utilityKind === kind ? "active" : ""}>{t(kind)}</button>)}
+          <button onClick={() => setRunsOpen(true)} className={runsOpen ? "active" : ""}>{t("runs")}</button>
+          <button onClick={() => setModePanelOpen(true)} className={modePanelOpen ? "active" : ""}>{t("modes")}</button>
         </div>
         <div className="conversation-column">
           <div className="timeline-scroll" ref={timelineScroll}>
             <div className="timeline-inner">
+              {snapshot?.timeline_truncated && (
+                <div className="timeline-truncated" role="status">{t("truncated")}</div>
+              )}
               <Timeline items={(snapshot?.timeline ?? []).filter(({ id }) => !resolvedRoutes.has(id))} members={snapshot?.members ?? []} locale={locale} t={t} resolvingRoute={resolvingRoute} onResolvePausedRoute={resolvePausedRoute} />
               <ApprovalQueue approvals={snapshot?.approvals ?? []} members={snapshot?.members ?? []} busyId={approvalBusy} t={t} onDecision={decision} />
             </div>
           </div>
-          <Composer members={snapshot?.members ?? []} mode={snapshot?.mode ?? "normal"} target={target} busy={membersBusy} disabled={snapshot?.phase !== "ready"} t={t} onTarget={setTarget} onMode={(mode) => void changeMode(mode)} onSubmit={submit} onCancel={() => dispatch({ type: "cancel", member: null })} />
+          <Composer
+            members={snapshot?.members ?? []}
+            mode={snapshot?.mode ?? "normal"}
+            target={target}
+            busy={membersBusy}
+            disabled={snapshot?.phase !== "ready"}
+            queues={snapshot?.queues ?? []}
+            defaultMemberId={snapshot?.team?.default_target?.type === "member" ? snapshot.team.default_target.member : snapshot?.members[0]?.id ?? null}
+            injection={composerInjection}
+            t={t}
+            onTarget={setTarget}
+            onMode={(mode) => void changeMode(mode)}
+            onEditQueued={() => void dispatch({ type: "edit_queued_prompt", member: target === "all" || target === "default" ? null : target })}
+            onSubmit={submit}
+            onCancel={() => dispatch({ type: "cancel", member: target === "all" || target === "default" ? null : target })}
+          />
         </div>
       </main>
 
       <Inspector open={inspectorOpen} members={snapshot?.members ?? []} runs={snapshot?.runs ?? []} locale={locale} t={t} onToggle={toggleInspector} dispatch={dispatch} onAttach={attach} />
 
       {utilityKind && <UtilityDrawer kind={utilityKind} locale={locale} t={t} logs={state.utility.logs} diff={state.utility.diff} skills={state.utility.skills} timelineText={(snapshot?.timeline ?? []).map((item) => ({ id: item.id, title: item.title || item.kind, text: item.text || item.detail || "" }))} initialQuery={utilityQuery} onClose={() => setUtilityKind(null)} onOpen={openUtility} onRefresh={(kind, filters) => void requestUtility(kind, filters)} onExportDiagnostics={exportDiagnostics} />}
+
+      {runsOpen && (
+        <RunsPanel runs={snapshot?.runs ?? []} members={snapshot?.members ?? []} suggestedVerify={snapshot?.suggested_verify} busy={membersBusy} t={t} onClose={() => setRunsOpen(false)} dispatch={dispatch} />
+      )}
+      {modePanelOpen && (
+        <ModePanel mode={snapshot?.mode ?? "normal"} defaults={teamSettings.modes} overrides={snapshot?.mode_overrides ?? {}} members={snapshot?.members ?? []} busy={membersBusy} t={t} onClose={() => setModePanelOpen(false)} dispatch={dispatch} />
+      )}
+      {sessionImportOpen && (
+        <SessionImportModal workspace={snapshot?.workspace ?? ""} members={snapshot?.members ?? []} busy={membersBusy} t={t} onClose={() => setSessionImportOpen(false)} dispatch={dispatch} listSessions={(backend, cwd) => client.listNativeSessions(backend, cwd)} />
+      )}
+      {paletteOpen && (
+        <CommandPalette catalog={catalog} executable={paletteExecutable} title={paletteExecutable ? t("commandPalette") : t("helpTitle")} t={t} onClose={() => setPaletteOpen(false)} onRun={runPaletteCommand} members={(snapshot?.members ?? []).map(({ id, display_name }) => ({ id, display_name }))} />
+      )}
 
       {projectPicker && <ProjectPicker recents={recents} canClose={Boolean(snapshot?.workspace)} initialPath={snapshot?.workspace ?? ""} busy={projectBusy} t={t} onClose={() => setProjectPicker(false)} onOpen={openWorkspace} />}
       {settingsOpen && <SettingsModal settings={teamSettings} busy={settingsBusy} t={t} onClose={() => setSettingsOpen(false)} onSave={saveSettings} />}

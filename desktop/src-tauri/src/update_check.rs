@@ -43,7 +43,7 @@ pub fn open_release(url: &str) -> Result<(), String> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DesktopUpdateV1 {
+pub struct DesktopUpdateV2 {
     pub current_version: String,
     pub available_version: Option<String>,
     pub release_url: Option<String>,
@@ -61,12 +61,12 @@ struct Release {
     prerelease: bool,
 }
 
-pub fn check() -> DesktopUpdateV1 {
+pub fn check() -> DesktopUpdateV2 {
     let current_text = env!("CARGO_PKG_VERSION").to_string();
     match check_inner() {
         Ok(Some((available, url))) => {
             let current = Version::parse(&current_text).unwrap_or_else(|_| Version::new(0, 0, 0));
-            DesktopUpdateV1 {
+            DesktopUpdateV2 {
                 current_version: current_text,
                 available_version: Some(available.to_string()),
                 release_url: Some(url),
@@ -74,14 +74,14 @@ pub fn check() -> DesktopUpdateV1 {
                 error: None,
             }
         }
-        Ok(None) => DesktopUpdateV1 {
+        Ok(None) => DesktopUpdateV2 {
             current_version: current_text,
             available_version: None,
             release_url: None,
             update_available: false,
             error: None,
         },
-        Err(error) => DesktopUpdateV1 {
+        Err(error) => DesktopUpdateV2 {
             current_version: current_text,
             available_version: None,
             release_url: None,
@@ -96,7 +96,7 @@ fn check_inner() -> Result<Option<(Version, String)>, String> {
         .timeout_global(Some(Duration::from_secs(20)))
         .tls_config(
             ureq::tls::TlsConfig::builder()
-                .provider(ureq::tls::TlsProvider::NativeTls)
+                .provider(ureq::tls::TlsProvider::Rustls)
                 .build(),
         )
         .build()

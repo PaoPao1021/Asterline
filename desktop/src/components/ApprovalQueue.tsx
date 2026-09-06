@@ -1,10 +1,10 @@
-import type { ApprovalSummaryV1, MemberSummaryV1 } from "../bridge/types";
+import type { ApprovalSummaryV2, MemberSummaryV2 } from "../bridge/types";
 import type { Translate } from "../i18n";
 import { AlertIcon, CheckIcon, ToolIcon, XIcon } from "./Icons";
 
 interface ApprovalQueueProps {
-  approvals: ApprovalSummaryV1[];
-  members: MemberSummaryV1[];
+  approvals: ApprovalSummaryV2[];
+  members: MemberSummaryV2[];
   busyId?: number | null;
   t: Translate;
   onDecision: (id: number, decision: "approve" | "reject") => Promise<void>;

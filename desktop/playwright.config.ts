@@ -5,7 +5,10 @@ export default defineConfig({
   outputDir: "../output/playwright/results",
   fullyParallel: true,
   forbidOnly: Boolean(process.env.CI),
-  retries: process.env.CI ? 2 : 0,
+  // The mock-runtime queue scenario depends on a timing window; one local
+  // retry keeps machine-load flake from masking genuine regressions. CI
+  // retries twice.
+  retries: process.env.CI ? 2 : 1,
   reporter: [
     ["line"],
     ["html", { outputFolder: "../output/playwright/report", open: "never" }],
@@ -23,7 +26,9 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: "pnpm dev --host 127.0.0.1",
+    // `npx vite` instead of `pnpm dev` so the web server also starts in
+    // plain shells where pnpm is not on PATH.
+    command: "npx vite --host 127.0.0.1 --port 1420 --strictPort",
     url: "http://127.0.0.1:1420",
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,

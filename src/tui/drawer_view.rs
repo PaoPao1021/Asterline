@@ -649,15 +649,15 @@ fn drawer_palette() -> Vec<Line<'static>> {
         Line::raw(""),
     ];
 
-    for (name, hint, takes_arg) in crate::tui::completion::COMMANDS {
-        let cmd = if *takes_arg {
-            format!("/{name} …")
+    for spec in crate::contract::COMMAND_CATALOG {
+        let cmd = if spec.takes_argument {
+            format!("/{} …", spec.name)
         } else {
-            format!("/{name}")
+            format!("/{}", spec.name)
         };
         lines.push(Line::from(vec![
             Span::styled(format!("  {:<24} ", cmd), theme::accent_bold()),
-            Span::styled(format!(" {hint}"), theme::text()),
+            Span::styled(format!(" {}", spec.hint), theme::text()),
         ]));
     }
     lines

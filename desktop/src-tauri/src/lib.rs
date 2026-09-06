@@ -1,5 +1,8 @@
 mod attach;
+mod attachments;
 mod bridge;
+mod catalog;
+mod composer;
 mod diagnostics;
 mod platform_env;
 mod recent;
@@ -13,18 +16,28 @@ use std::thread;
 use std::time::Duration;
 
 use asterline::domain::event::RuntimeEvent;
+use asterline::tui::skills::{self, SkillInfo};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State, WindowEvent};
 
-use attach::{AttachCapabilitiesV1, ExternalAttachLaunchV1};
-use bridge::{
-    DESKTOP_EVENT_CHANNEL, DesktopCommandV1, DesktopEventV1, DesktopModel, DesktopPhase,
-    DesktopRuntimeEventV1, DesktopSnapshotV1, DiffResultV1, LogEntryV1, LogLevelV1, RunStatusV1,
-    SkillSummaryV1, envelope,
+use crate::attach::{AttachCapabilitiesV2, ExternalAttachLaunchV2};
+use crate::attachments::{AttachmentRegistry, StagedAttachmentV2};
+use crate::bridge::{
+    DESKTOP_EVENT_CHANNEL, DesktopCommandV2, DesktopEventV2, DesktopModel, DesktopPhase,
+    DesktopRuntimeEventV2, DesktopSnapshotV2, DiffResultV2, LogEntryV2, LogLevelV2, RunStatusV2,
+    SkillSummaryV2, envelope,
 };
-use diagnostics::{Diagnostics, DiagnosticsStatusV1};
-use recent::RecentWorkspaceV1;
-use session_adapter::{ActiveSession, BootstrapAdapterOutcome, PendingTeamSetup, PreparedSession};
-use update_check::DesktopUpdateV1;
+use crate::catalog::{BackendAvailabilityV2, ModelSummaryV2};
+use crate::composer::{CompletionV2, ComposerActionV2};
+use crate::diagnostics::{Diagnostics, DiagnosticsStatusV2};
+use crate::recent::RecentWorkspaceV2;
+use crate::session_adapter::{
+    ActiveSession, BootstrapAdapterOutcome, DesktopLaunchOptionsV2, PendingTeamSetup,
+    PreparedSession,
+};
+use crate::update_check::DesktopUpdateV2;
+
+/// Desktop composer budget, mirrored from the TUI composer.
+const MAX_COMPOSER_BYTES: usize = 256 * 1024;
 
 #[derive(Default)]
 struct HostInner {
@@ -36,6 +49,8 @@ struct HostInner {
     sequence: u64,
     attaching: std::collections::HashSet<String>,
     attach_waiters: std::collections::HashMap<String, mpsc::SyncSender<Result<(), String>>>,
+    attachments: AttachmentRegistry,
+    skills: Vec<SkillInfo>,
 }
 
 #[derive(Default)]
@@ -56,10 +71,20 @@ fn bootstrap_desktop(
     app: AppHandle,
     state: State<'_, DesktopHost>,
     workspace: Option<String>,
-) -> Result<DesktopSnapshotV1, String> {
+    options: Option<DesktopLaunchOptionsV2>,
+) -> Result<DesktopSnapshotV2, String> {
     let Some(workspace) = workspace else {
         return Ok(state.lock()?.model.snapshot());
     };
+    let mut options = options.unwrap_or_default();
+    // Debug-build escape hatch for smoke tests: run the offline fake agents
+    // without walking the advanced launcher. Release builds ignore it, and it
+    // is never persisted.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("ASTERLINE_DESKTOP_FAKE").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        options.fake = true;
+    }
+    // Debug and fake launches are session-scoped: they never persist anywhere.
     let workspace = validate_workspace(&workspace)?;
 
     let (active, generation) = {
@@ -72,6 +97,7 @@ fn bootstrap_desktop(
         inner.generation = inner.generation.saturating_add(1);
         inner.pending = None;
         inner.attach_waiters.clear();
+        inner.attachments.discard_all();
         inner.workspace = Some(workspace.clone());
         let previous_sequence = inner.sequence;
         inner.model = DesktopModel::default();
@@ -87,7 +113,7 @@ fn bootstrap_desktop(
         active.shutdown();
     }
 
-    match session_adapter::bootstrap_workspace(workspace.clone()) {
+    match session_adapter::bootstrap_workspace(workspace.clone(), &options) {
         Ok(BootstrapAdapterOutcome::Ready(prepared)) => {
             install_prepared(&app, &state, *prepared, generation)?;
             if let Err(error) = recent::record(&app, &workspace) {
@@ -127,25 +153,151 @@ fn bootstrap_desktop(
 }
 
 #[tauri::command]
-fn get_desktop_snapshot(state: State<'_, DesktopHost>) -> Result<DesktopSnapshotV1, String> {
+fn get_desktop_snapshot(state: State<'_, DesktopHost>) -> Result<DesktopSnapshotV2, String> {
     Ok(state.lock()?.model.snapshot())
 }
+
+/// Parse composer text with the shared contract parser. The WebView keeps no
+/// parsing rules of its own; unknown commands stay draftable and report a
+/// structured error.
+#[tauri::command]
+fn parse_composer_text(
+    state: State<'_, DesktopHost>,
+    text: String,
+) -> Result<ComposerActionV2, String> {
+    if text.len() > MAX_COMPOSER_BYTES {
+        return Err(format!(
+            "composer input is limited to {} KiB",
+            MAX_COMPOSER_BYTES / 1024
+        ));
+    }
+    let inner = state.lock()?;
+    Ok(composer::parse_composer_text(
+        &text,
+        &inner.model.snapshot.members,
+        &inner.skills,
+    ))
+}
+
+/// Shared completion (commands, modes, members, targeted skills).
+#[tauri::command]
+fn complete_composer(
+    state: State<'_, DesktopHost>,
+    head: String,
+) -> Result<Option<CompletionV2>, String> {
+    let inner = state.lock()?;
+    Ok(composer::complete_composer(
+        &head,
+        &inner.model.snapshot.members,
+        &inner.skills,
+    ))
+}
+
+/// The shared command catalog for palettes and `/help`.
+#[tauri::command]
+fn command_catalog() -> Vec<composer::CommandSpecV2> {
+    composer::command_catalog()
+}
+
+#[tauri::command]
+fn get_backend_availability() -> BackendAvailabilityV2 {
+    catalog::backend_availability()
+}
+
+#[tauri::command]
+fn list_models(backend: bridge::BackendKindV2, cwd: String) -> Result<Vec<ModelSummaryV2>, String> {
+    catalog::list_models(backend, &cwd)
+}
+
+#[tauri::command]
+fn list_native_sessions(
+    backend: bridge::BackendKindV2,
+    cwd: String,
+) -> Result<Vec<asterline::tui::native_sessions::NativeSessionSummary>, String> {
+    Ok(catalog::list_native_sessions(backend, &cwd))
+}
+
+// --- attachment lifecycle ---------------------------------------------------
+
+#[tauri::command]
+fn stage_clipboard_image(state: State<'_, DesktopHost>) -> Result<StagedAttachmentV2, String> {
+    let workspace = current_workspace(&state)?;
+    let image = asterline::tui::clipboard_image::paste_clipboard_image(&workspace)?;
+    let mut inner = state.lock()?;
+    inner.attachments.stage(image)
+}
+
+#[tauri::command]
+fn stage_image_path(
+    state: State<'_, DesktopHost>,
+    path: String,
+) -> Result<StagedAttachmentV2, String> {
+    let workspace = current_workspace(&state)?;
+    let image = asterline::tui::clipboard_image::import_image_file(&workspace, Path::new(&path))?;
+    let mut inner = state.lock()?;
+    inner.attachments.stage(image)
+}
+
+#[tauri::command]
+fn stage_image_bytes(
+    state: State<'_, DesktopHost>,
+    bytes_base64: String,
+) -> Result<StagedAttachmentV2, String> {
+    let bytes = attachments::decode_base64(&bytes_base64)
+        .ok_or_else(|| "attachment payload is not valid base64".to_string())?;
+    if bytes.is_empty() {
+        return Err("attachment is empty".to_string());
+    }
+    if bytes.len() > asterline::adapter::prompt_images::MAX_IMAGE_BYTES {
+        return Err("images are limited to 10 MiB".to_string());
+    }
+    let workspace = current_workspace(&state)?;
+    let image = asterline::tui::clipboard_image::persist_image_bytes(&workspace, &bytes)?;
+    let mut inner = state.lock()?;
+    inner.attachments.stage(image)
+}
+
+#[tauri::command]
+fn remove_staged_attachment(state: State<'_, DesktopHost>, token: String) -> Result<(), String> {
+    let mut inner = state.lock()?;
+    inner.attachments.remove(&token)
+}
+
+/// Drop every staged attachment and wipe this session's managed paste
+/// directory (workspace switch, new session, or close).
+#[tauri::command]
+fn discard_staged_attachments(state: State<'_, DesktopHost>) -> Result<(), String> {
+    let mut inner = state.lock()?;
+    inner.attachments.discard_all();
+    Ok(())
+}
+
+fn current_workspace(state: &State<'_, DesktopHost>) -> Result<String, String> {
+    state
+        .lock()?
+        .workspace
+        .as_ref()
+        .map(|workspace| workspace.to_string_lossy().into_owned())
+        .ok_or_else(|| "open a workspace before attaching images".to_string())
+}
+
+// --- runtime commands -------------------------------------------------------
 
 #[tauri::command]
 fn dispatch_desktop_command(
     app: AppHandle,
     state: State<'_, DesktopHost>,
-    command: DesktopCommandV1,
+    command: DesktopCommandV2,
 ) -> Result<(), String> {
-    if matches!(command, DesktopCommandV1::Shutdown) {
+    if matches!(command, DesktopCommandV2::Shutdown) {
         return shutdown_desktop(app, state);
     }
 
     if matches!(
         command,
-        DesktopCommandV1::RequestLogs { .. }
-            | DesktopCommandV1::RequestDiff { .. }
-            | DesktopCommandV1::RequestSkills { .. }
+        DesktopCommandV2::RequestLogs { .. }
+            | DesktopCommandV2::RequestDiff { .. }
+            | DesktopCommandV2::RequestSkills { .. }
     ) {
         let mut inner = state.lock()?;
         let event = utility_query(&inner, command)?;
@@ -153,26 +305,28 @@ fn dispatch_desktop_command(
         return Ok(());
     }
 
-    // Upstream 0.2.9 makes the complete team settings document the single
-    // authoritative mutation path. Preserve the compact Desktop effort action
-    // by translating it into that validated atomic update.
+    // Clearing a mode's conversation overrides is computed against the live
+    // snapshot (the runtime only accepts full replacement maps).
     let command = match command {
-        DesktopCommandV1::SetEffort { member, effort } => {
-            let mut settings = state
-                .lock()?
-                .model
-                .snapshot()
-                .team
-                .ok_or_else(|| "team settings are not available".to_string())?;
-            let target = settings
-                .members
-                .iter_mut()
-                .find(|candidate| candidate.id == member)
-                .ok_or_else(|| format!("unknown member: {member}"))?;
-            target.effort = Some(effort);
-            DesktopCommandV1::ReplaceTeamSettings {
-                settings: Box::new(settings),
-            }
+        DesktopCommandV2::ResetModeOverrides { mode } => {
+            let inner = state.lock()?;
+            let mut overrides = inner.model.snapshot.mode_overrides.clone();
+            bridge::clear_mode_overrides(&mut overrides, mode);
+            let workspace = inner
+                .workspace
+                .as_deref()
+                .ok_or_else(|| "open a workspace before sending commands".to_string())?;
+            let runtime_command = session_adapter::command_to_runtime(
+                DesktopCommandV2::SetModeOverrides { overrides },
+                workspace,
+                &|token| inner.attachments.resolve(token),
+            )?;
+            inner
+                .active
+                .as_ref()
+                .ok_or_else(|| "the workspace runtime is not ready".to_string())?
+                .send(runtime_command)?;
+            return Ok(());
         }
         command => command,
     };
@@ -188,7 +342,7 @@ fn dispatch_desktop_command(
     }
 
     let pending_settings = match &command {
-        DesktopCommandV1::ReplaceTeamSettings { settings } => Some(settings.clone()),
+        DesktopCommandV2::ReplaceTeamSettings { settings } => Some(settings.clone()),
         _ => None,
     };
     if let Some(settings) = pending_settings {
@@ -229,13 +383,24 @@ fn dispatch_desktop_command(
         .workspace
         .as_deref()
         .ok_or_else(|| "open a workspace before sending commands".to_string())?;
-    let resolves_paused = matches!(&command, DesktopCommandV1::ResolvePausedRoute { .. });
-    let runtime_command = session_adapter::command_to_runtime(command, workspace)?;
+    let resolves_paused = matches!(
+        &command,
+        DesktopCommandV2::ResolvePausedRoute { resume: true }
+    );
+    // Sending a message consumes its staged attachments: they belong to the
+    // persisted prompt now and are cleaned up with the session, like the TUI.
+    let consumes_attachments = matches!(&command, DesktopCommandV2::UserMessage { attachments, .. } if !attachments.is_empty());
+    let runtime_command = session_adapter::command_to_runtime(command, workspace, &|token| {
+        inner.attachments.resolve(token)
+    })?;
     inner
         .active
         .as_ref()
         .ok_or_else(|| "the workspace runtime is not ready".to_string())?
         .send(runtime_command)?;
+    if consumes_attachments {
+        inner.attachments.retain_only(&[]);
+    }
     if resolves_paused {
         inner.model.clear_next_paused_route();
     }
@@ -244,14 +409,14 @@ fn dispatch_desktop_command(
 
 fn utility_query(
     inner: &HostInner,
-    command: DesktopCommandV1,
-) -> Result<DesktopRuntimeEventV1, String> {
+    command: DesktopCommandV2,
+) -> Result<DesktopRuntimeEventV2, String> {
     let workspace = inner
         .workspace
         .as_deref()
         .ok_or_else(|| "open a workspace before requesting utility data".to_string())?;
     match command {
-        DesktopCommandV1::RequestLogs {
+        DesktopCommandV2::RequestLogs {
             request_id,
             member,
             level,
@@ -278,13 +443,13 @@ fn utility_query(
                 let start = entries.len() - max;
                 entries = entries.split_off(start);
             }
-            Ok(DesktopRuntimeEventV1::LogsReplaced {
+            Ok(DesktopRuntimeEventV2::LogsReplaced {
                 request_id,
                 entries,
                 truncated,
             })
         }
-        DesktopCommandV1::RequestDiff { request_id } => {
+        DesktopCommandV2::RequestDiff { request_id } => {
             let text = asterline::tui::compute_git_diff(&workspace.to_string_lossy());
             let truncated = text.contains("[diff output truncated at 2 MiB]")
                 || text.contains("[untracked file list truncated]");
@@ -292,16 +457,16 @@ fn utility_query(
                 .lines()
                 .filter(|line| line.starts_with("diff --git ") || line.starts_with("  "))
                 .count();
-            Ok(DesktopRuntimeEventV1::DiffReplaced {
+            Ok(DesktopRuntimeEventV2::DiffReplaced {
                 request_id,
-                result: DiffResultV1 {
+                result: DiffResultV2 {
                     text,
                     truncated,
                     file_count,
                 },
             })
         }
-        DesktopCommandV1::RequestSkills {
+        DesktopCommandV2::RequestSkills {
             request_id,
             backend,
             query,
@@ -309,7 +474,7 @@ fn utility_query(
         } => {
             let query = query.unwrap_or_default().to_lowercase();
             let max = limit.unwrap_or(512).clamp(1, 512);
-            let mut skills = asterline::tui::skills::discover(Path::new(workspace))
+            let mut skills = skills::discover(Path::new(workspace))
                 .into_iter()
                 .filter(|skill| {
                     backend
@@ -322,16 +487,16 @@ fn utility_query(
                         || skill.description.to_lowercase().contains(&query)
                         || skill.invocation.to_lowercase().contains(&query)
                 })
-                .map(|skill| SkillSummaryV1 {
-                    name: skill.name,
-                    description: skill.description,
+                .map(|skill| SkillSummaryV2 {
+                    name: skill.name.clone(),
+                    description: skill.description.clone(),
                     backend: bridge::backend_kind(skill.backend.as_str()),
-                    invocation: skill.invocation,
+                    invocation: skill.invocation.clone(),
                 })
                 .collect::<Vec<_>>();
             let truncated = skills.len() > max;
             skills.truncate(max);
-            Ok(DesktopRuntimeEventV1::SkillsReplaced {
+            Ok(DesktopRuntimeEventV2::SkillsReplaced {
                 request_id,
                 skills,
                 truncated,
@@ -343,14 +508,32 @@ fn utility_query(
 
 #[tauri::command]
 fn shutdown_desktop(app: AppHandle, state: State<'_, DesktopHost>) -> Result<(), String> {
+    shutdown_inner(&app, &state)?;
+    Ok(())
+}
+
+/// `/exit`: gracefully stop the runtime, then close the window.
+#[tauri::command]
+fn exit_desktop(app: AppHandle, state: State<'_, DesktopHost>) -> Result<(), String> {
+    shutdown_inner(&app, &state)?;
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.close();
+    } else {
+        app.exit(0);
+    }
+    Ok(())
+}
+
+fn shutdown_inner(app: &AppHandle, state: &State<'_, DesktopHost>) -> Result<(), String> {
     let active = {
         let mut inner = state.lock()?;
         inner.generation = inner.generation.saturating_add(1);
         inner.pending = None;
         inner.attaching.clear();
         inner.attach_waiters.clear();
+        inner.attachments.discard_all();
         let event = inner.model.set_phase(DesktopPhase::ShuttingDown, None);
-        emit_locked(&app, &mut inner, event);
+        emit_locked(app, &mut inner, event);
         inner.active.take()
     };
     if let Some(active) = active {
@@ -361,15 +544,15 @@ fn shutdown_desktop(app: AppHandle, state: State<'_, DesktopHost>) -> Result<(),
     let sequence = inner.sequence;
     inner.model = DesktopModel::default();
     inner.model.snapshot.sequence = sequence;
-    let event = DesktopRuntimeEventV1::SnapshotReplaced {
+    let event = DesktopRuntimeEventV2::SnapshotReplaced {
         snapshot: inner.model.snapshot(),
     };
-    emit_locked(&app, &mut inner, event);
+    emit_locked(app, &mut inner, event);
     Ok(())
 }
 
 #[tauri::command]
-fn list_recent_workspaces(app: AppHandle) -> Result<Vec<RecentWorkspaceV1>, String> {
+fn list_recent_workspaces(app: AppHandle) -> Result<Vec<RecentWorkspaceV2>, String> {
     recent::list(&app)
 }
 
@@ -379,10 +562,10 @@ fn forget_recent_workspace(app: AppHandle, workspace: String) -> Result<(), Stri
 }
 
 #[tauri::command]
-async fn check_desktop_update() -> DesktopUpdateV1 {
+async fn check_desktop_update() -> DesktopUpdateV2 {
     tauri::async_runtime::spawn_blocking(update_check::check)
         .await
-        .unwrap_or_else(|error| DesktopUpdateV1 {
+        .unwrap_or_else(|error| DesktopUpdateV2 {
             current_version: env!("CARGO_PKG_VERSION").to_string(),
             available_version: None,
             release_url: None,
@@ -394,7 +577,7 @@ async fn check_desktop_update() -> DesktopUpdateV1 {
 #[tauri::command]
 fn get_desktop_diagnostics_status(
     diagnostics: State<'_, Diagnostics>,
-) -> Result<DiagnosticsStatusV1, String> {
+) -> Result<DiagnosticsStatusV2, String> {
     diagnostics.status()
 }
 
@@ -412,7 +595,7 @@ fn open_desktop_update(url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_attach_capabilities() -> AttachCapabilitiesV1 {
+fn get_attach_capabilities() -> AttachCapabilitiesV2 {
     attach::capabilities()
 }
 
@@ -421,7 +604,7 @@ fn open_native_session(
     app: AppHandle,
     state: State<'_, DesktopHost>,
     member: String,
-) -> Result<ExternalAttachLaunchV1, String> {
+) -> Result<ExternalAttachLaunchV2, String> {
     let (attach_tx, attach_rx) = mpsc::sync_channel(1);
     let (summary, generation) = {
         let mut inner = state.lock()?;
@@ -431,17 +614,17 @@ fn open_native_session(
         if inner.model.snapshot.members.iter().any(|candidate| {
             matches!(
                 candidate.status,
-                bridge::MemberStatusV1::Queued
-                    | bridge::MemberStatusV1::Running
-                    | bridge::MemberStatusV1::Waiting
-                    | bridge::MemberStatusV1::NeedsApproval
+                bridge::MemberStatusV2::Queued
+                    | bridge::MemberStatusV2::Running
+                    | bridge::MemberStatusV2::Waiting
+                    | bridge::MemberStatusV2::NeedsApproval
             )
         }) || inner
             .model
             .snapshot
             .runs
             .iter()
-            .any(|run| matches!(run.status, RunStatusV1::Running | RunStatusV1::Verifying))
+            .any(|run| matches!(run.status, RunStatusV2::Running | RunStatusV2::Verifying))
         {
             return Err(
                 "wait for or cancel all runtime work before opening a native session".to_string(),
@@ -589,12 +772,12 @@ fn install_prepared(
     let logs = prepared
         .initial_logs
         .iter()
-        .map(|entry| LogEntryV1 {
+        .map(|entry| LogEntryV2 {
             level: match entry.level.as_str() {
-                "debug" => LogLevelV1::Debug,
-                "warn" => LogLevelV1::Warn,
-                "error" => LogLevelV1::Error,
-                _ => LogLevelV1::Info,
+                "debug" => LogLevelV2::Debug,
+                "warn" => LogLevelV2::Warn,
+                "error" => LogLevelV2::Error,
+                _ => LogLevelV2::Info,
             },
             source: entry.source.clone(),
             message: entry.message.clone(),
@@ -613,10 +796,11 @@ fn install_prepared(
         }
         inner.workspace = Some(PathBuf::from(&workspace));
         inner.pending = None;
-        inner.model.set_workspace(workspace);
+        inner.model.set_workspace(workspace.clone());
         inner.model.set_team(team);
         inner.model.seed_chat(chat);
         inner.model.seed_logs(logs);
+        inner.skills = skills::discover(Path::new(&workspace));
         inner.active = Some(active);
         inner.generation
     };
@@ -675,16 +859,16 @@ fn emit_notice_for_generation<R: Runtime>(app: &AppHandle<R>, generation: u64, m
 fn emit_locked<R: Runtime>(
     app: &AppHandle<R>,
     inner: &mut HostInner,
-    mut event: DesktopRuntimeEventV1,
-) -> DesktopEventV1 {
+    mut event: DesktopRuntimeEventV2,
+) -> DesktopEventV2 {
     inner.sequence = inner.sequence.saturating_add(1);
     let sequence = inner.sequence;
     inner.model.snapshot.sequence = inner.sequence;
-    if let DesktopRuntimeEventV1::SnapshotReplaced { snapshot } = &mut event {
+    if let DesktopRuntimeEventV2::SnapshotReplaced { snapshot } = &mut event {
         snapshot.sequence = sequence;
     }
     let event = envelope(sequence, event);
-    if let DesktopRuntimeEventV1::RuntimeLog {
+    if let DesktopRuntimeEventV2::RuntimeLog {
         level,
         source,
         message,
@@ -697,22 +881,23 @@ fn emit_locked<R: Runtime>(
     event
 }
 
-fn command_can_dispatch_backend(command: &DesktopCommandV1) -> bool {
+fn command_can_dispatch_backend(command: &DesktopCommandV2) -> bool {
     matches!(
         command,
-        DesktopCommandV1::UserMessage { .. }
-            | DesktopCommandV1::Retry
-            | DesktopCommandV1::Approve {
-                decision: bridge::ApprovalChoiceV1::Approve,
+        DesktopCommandV2::UserMessage { .. }
+            | DesktopCommandV2::Retry
+            | DesktopCommandV2::Approve {
+                decision: bridge::ApprovalChoiceV2::Approve,
                 ..
             }
-            | DesktopCommandV1::ResolvePausedRoute { resume: true }
-            | DesktopCommandV1::ReplaceTeamSettings { .. }
-            | DesktopCommandV1::NewSession
-            | DesktopCommandV1::ResumeConversation { .. }
-            | DesktopCommandV1::ContinueRun { .. }
-            | DesktopCommandV1::VerifyRun { .. }
-            | DesktopCommandV1::RunMode { .. }
+            | DesktopCommandV2::ResolvePausedRoute { resume: true }
+            | DesktopCommandV2::ReplaceTeamSettings { .. }
+            | DesktopCommandV2::NewSession
+            | DesktopCommandV2::ResumeConversation { .. }
+            | DesktopCommandV2::ImportSession { .. }
+            | DesktopCommandV2::ContinueRun { .. }
+            | DesktopCommandV2::VerifyRun { .. }
+            | DesktopCommandV2::RunMode { .. }
     )
 }
 
@@ -761,8 +946,20 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             bootstrap_desktop,
             get_desktop_snapshot,
+            parse_composer_text,
+            complete_composer,
+            command_catalog,
+            get_backend_availability,
+            list_models,
+            list_native_sessions,
+            stage_clipboard_image,
+            stage_image_path,
+            stage_image_bytes,
+            remove_staged_attachment,
+            discard_staged_attachments,
             dispatch_desktop_command,
             shutdown_desktop,
+            exit_desktop,
             list_recent_workspaces,
             forget_recent_workspace,
             check_desktop_update,
@@ -780,6 +977,7 @@ pub fn run() {
                         inner.generation = inner.generation.saturating_add(1);
                         inner.attaching.clear();
                         inner.attach_waiters.clear();
+                        inner.attachments.discard_all();
                         inner.active.take()
                     });
                     if let Some(active) = active {
@@ -798,10 +996,11 @@ pub fn run() {
                     // synchronous so process exit cannot strand backend child
                     // processes or leave SQLite cleanup to a detached thread.
                     let state = window.state::<DesktopHost>();
-                    if let Ok(mut inner) = state.lock()
-                        && let Some(active) = inner.active.take()
-                    {
-                        active.shutdown();
+                    if let Ok(mut inner) = state.lock() {
+                        inner.attachments.discard_all();
+                        if let Some(active) = inner.active.take() {
+                            active.shutdown();
+                        }
                     }
                 }
                 _ => {}
@@ -830,22 +1029,42 @@ mod tests {
 
     #[test]
     fn attach_blocks_commands_that_can_start_backend_work() {
-        assert!(command_can_dispatch_backend(&DesktopCommandV1::Retry));
+        assert!(command_can_dispatch_backend(&DesktopCommandV2::Retry));
         assert!(command_can_dispatch_backend(
-            &DesktopCommandV1::UserMessage {
-                target: bridge::MessageTargetV1::All,
+            &DesktopCommandV2::UserMessage {
+                target: bridge::MessageTargetV2::All,
                 body: "hello".to_string(),
+                attachments: Vec::new(),
             }
         ));
-        assert!(command_can_dispatch_backend(&DesktopCommandV1::VerifyRun {
+        assert!(command_can_dispatch_backend(&DesktopCommandV2::VerifyRun {
             run_id: None,
             command: None,
         }));
-        assert!(!command_can_dispatch_backend(&DesktopCommandV1::SetMode {
-            mode: bridge::TerminalModeV1::Plan,
+        assert!(command_can_dispatch_backend(
+            &DesktopCommandV2::ImportSession {
+                member: None,
+                session_id: "sess-1".to_string(),
+            }
+        ));
+        assert!(!command_can_dispatch_backend(&DesktopCommandV2::SetMode {
+            mode: bridge::TerminalModeV2::Plan,
         }));
-        assert!(!command_can_dispatch_backend(&DesktopCommandV1::Cancel {
+        assert!(!command_can_dispatch_backend(&DesktopCommandV2::Cancel {
             member: None,
         }));
+        assert!(!command_can_dispatch_backend(
+            &DesktopCommandV2::EditQueuedPrompt { member: None }
+        ));
+    }
+
+    #[test]
+    fn launch_options_default_to_safe_values() {
+        let options = DesktopLaunchOptionsV2::default();
+        assert!(options.team_path.is_none());
+        assert!(!options.pick_team);
+        assert!(options.db_path.is_none());
+        assert!(!options.debug);
+        assert!(!options.fake);
     }
 }

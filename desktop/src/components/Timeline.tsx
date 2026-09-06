@@ -1,11 +1,12 @@
-import { Fragment, useState } from "react";
-import type { MemberSummaryV1, TimelineItemV1 } from "../bridge/types";
+import { Fragment, useMemo, useState } from "react";
+import type { MemberSummaryV2, TimelineItemV2 } from "../bridge/types";
+import { renderMarkdown } from "../markdown";
 import type { Locale, Translate } from "../i18n";
-import { AlertIcon, CheckIcon, ChevronIcon, CopyIcon, FileIcon, RouteIcon, SparkIcon, ToolIcon, XIcon } from "./Icons";
+import { AlertIcon, CheckIcon, ChevronIcon, CopyIcon, FileIcon, ImageIcon, RouteIcon, SparkIcon, ToolIcon, XIcon } from "./Icons";
 
 interface TimelineProps {
-  items: TimelineItemV1[];
-  members: MemberSummaryV1[];
+  items: TimelineItemV2[];
+  members: MemberSummaryV2[];
   locale: Locale;
   t: Translate;
   resolvingRoute?: string | null;
@@ -54,7 +55,7 @@ function DetailToggle({ detail, t }: { detail: string; t: Translate }) {
   );
 }
 
-function TimelineCard({ item, members, locale, t, resolvingRoute, actionablePausedRoute, onResolvePausedRoute }: { item: TimelineItemV1; members: MemberSummaryV1[]; locale: Locale; t: Translate; resolvingRoute?: string | null; actionablePausedRoute?: string; onResolvePausedRoute: (itemId: string, resume: boolean) => Promise<void> }) {
+function TimelineCard({ item, members, locale, t, resolvingRoute, actionablePausedRoute, onResolvePausedRoute }: { item: TimelineItemV2; members: MemberSummaryV2[]; locale: Locale; t: Translate; resolvingRoute?: string | null; actionablePausedRoute?: string; onResolvePausedRoute: (itemId: string, resume: boolean) => Promise<void> }) {
   const member = members.find(({ id }) => id === item.member);
   const name = item.display_name || member?.display_name || item.member || "Asterline";
   const backend = item.backend || member?.backend;
@@ -97,6 +98,7 @@ function TimelineCard({ item, members, locale, t, resolvingRoute, actionablePaus
         <div className="tool-card-head">
           <span className="tool-icon"><ToolIcon size={15} /></span>
           <div><strong>{item.title || t("tool")}</strong><small>{name}</small></div>
+          {item.truncated && <span className="truncated-pill">{t("truncated")}</span>}
           <span className={`result-icon ${item.ok === false ? "bad" : "good"}`}>{item.ok === false ? <XIcon size={14} /> : <CheckIcon size={14} />}</span>
         </div>
         {item.detail && <DetailToggle detail={item.detail} t={t} />}
@@ -119,6 +121,11 @@ function TimelineCard({ item, members, locale, t, resolvingRoute, actionablePaus
   }
 
   const isUser = item.kind === "user";
+  const plainLines = useMemo(() => (item.text ?? "").split("\n"), [item.text]);
+  const html = useMemo(
+    () => (!isUser && item.text ? renderMarkdown(item.text) : ""),
+    [isUser, item.text],
+  );
   return (
     <article className={`message-row ${isUser ? "is-user" : "is-agent"}`}>
       {!isUser && <div className={`member-avatar backend-${backend ?? "system"}`}>{initials(name)}</div>}
@@ -127,9 +134,17 @@ function TimelineCard({ item, members, locale, t, resolvingRoute, actionablePaus
           <strong>{isUser ? "You" : name}</strong>
           {!isUser && backend && <span className={`backend-label backend-${backend}`}>{backend}</span>}
           <time>{formatTime(item.timestamp, locale)}</time>
+          {item.truncated && <span className="truncated-pill" title={t("truncated")}>{t("truncated")}</span>}
         </div>
+        {isUser && item.attachments && item.attachments.length > 0 && (
+          <div className="message-attachments" aria-label={t("attachments")}>
+            {item.attachments.map((label) => <span key={label} className="attachment-chip"><ImageIcon size={11} />{label}</span>)}
+          </div>
+        )}
         <div className={`message-bubble ${item.streaming ? "is-streaming" : ""}`}>
-          {(item.text ?? "").split("\n").map((line, index) => <Fragment key={index}>{line}{index < (item.text ?? "").split("\n").length - 1 && <br />}</Fragment>)}
+          {isUser
+            ? plainLines.map((line, index) => <Fragment key={index}>{line}{index < plainLines.length - 1 && <br />}</Fragment>)
+            : <div className="markdown-body" dangerouslySetInnerHTML={{ __html: html }} />}
           {item.streaming && <span className="streaming-caret" />}
         </div>
       </div>

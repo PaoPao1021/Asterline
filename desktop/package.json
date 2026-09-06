@@ -1,7 +1,7 @@
 {
   "name": "asterline-desktop",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "packageManager": "pnpm@11.16.0",
   "scripts": {
@@ -33,6 +33,7 @@
     "@types/react": "19.1.10",
     "@types/react-dom": "19.1.7",
     "@vitejs/plugin-react": "5.0.2",
+    "axe-core": "^4.13.0",
     "jsdom": "26.1.0",
     "typescript": "5.9.2",
     "vite": "7.1.3",

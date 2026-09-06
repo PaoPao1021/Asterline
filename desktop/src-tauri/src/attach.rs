@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
 
-use crate::bridge::{BackendKindV1, MemberStatusV1, MemberSummaryV1};
+use crate::bridge::{BackendKindV2, MemberStatusV2, MemberSummaryV2};
 
 const DESCRIPTOR_LIMIT: u64 = 64 * 1024;
 const RESULT_LIMIT: u64 = 16 * 1024 * 1024;
@@ -20,28 +20,28 @@ const IMPORT_TEXT_LIMIT: usize = 8 * 1024 * 1024;
 const RESULT_WAIT_LIMIT: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct AttachBackendCapabilityV1 {
+pub struct AttachBackendCapabilityV2 {
     pub can_open: bool,
     pub can_import: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct AttachBackendsV1 {
-    pub codex: AttachBackendCapabilityV1,
-    pub claude: AttachBackendCapabilityV1,
-    pub grok: AttachBackendCapabilityV1,
-    pub agy: AttachBackendCapabilityV1,
+pub struct AttachBackendsV2 {
+    pub codex: AttachBackendCapabilityV2,
+    pub claude: AttachBackendCapabilityV2,
+    pub grok: AttachBackendCapabilityV2,
+    pub agy: AttachBackendCapabilityV2,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct AttachCapabilitiesV1 {
+pub struct AttachCapabilitiesV2 {
     pub supported: bool,
     pub terminal: Option<String>,
-    pub backends: AttachBackendsV1,
+    pub backends: AttachBackendsV2,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct ExternalAttachLaunchV1 {
+pub struct ExternalAttachLaunchV2 {
     pub member: String,
     pub launched: bool,
     pub terminal: Option<String>,
@@ -65,7 +65,7 @@ struct AttachDescriptor {
     token: String,
     member: String,
     display_name: String,
-    backend: BackendKindV1,
+    backend: BackendKindV2,
     session: Option<String>,
     cwd: String,
     result_path: PathBuf,
@@ -87,16 +87,16 @@ struct AttachImported {
     text: String,
 }
 
-pub fn capabilities() -> AttachCapabilitiesV1 {
+pub fn capabilities() -> AttachCapabilitiesV2 {
     let terminal = terminal_name();
-    let capability = |backend, can_import| AttachBackendCapabilityV1 {
+    let capability = |backend, can_import| AttachBackendCapabilityV2 {
         can_open: resolve_program(backend).is_some(),
         can_import,
     };
-    AttachCapabilitiesV1 {
+    AttachCapabilitiesV2 {
         supported: terminal.is_some(),
         terminal,
-        backends: AttachBackendsV1 {
+        backends: AttachBackendsV2 {
             codex: capability("codex", true),
             claude: capability("claude", true),
             grok: capability("grok", false),
@@ -107,9 +107,9 @@ pub fn capabilities() -> AttachCapabilitiesV1 {
 
 pub fn launch(
     app: &AppHandle,
-    member: &MemberSummaryV1,
-) -> Result<(ExternalAttachLaunchV1, AttachWatch), String> {
-    if !matches!(member.status, MemberStatusV1::Idle | MemberStatusV1::Failed) {
+    member: &MemberSummaryV2,
+) -> Result<(ExternalAttachLaunchV2, AttachWatch), String> {
+    if !matches!(member.status, MemberStatusV2::Idle | MemberStatusV2::Failed) {
         return Err(format!(
             "{} is {}; cancel or wait for its run before attaching",
             member.display_name,
@@ -150,13 +150,13 @@ pub fn launch(
         let _ = fs::remove_file(&descriptor_path);
         return Err(format!("could not open external terminal: {error}"));
     }
-    let message = if matches!(member.backend, BackendKindV1::Grok | BackendKindV1::Agy) {
+    let message = if matches!(member.backend, BackendKindV2::Grok | BackendKindV2::Agy) {
         Some("This backend can be opened, but v1 cannot import its native transcript.".to_string())
     } else {
         None
     };
     Ok((
-        ExternalAttachLaunchV1 {
+        ExternalAttachLaunchV2 {
             member: member.id.clone(),
             launched: true,
             terminal: Some(terminal),
@@ -244,7 +244,7 @@ fn run_helper(path: &Path, token: &str) -> Result<(), String> {
         Some(program) => program,
         None => return write_failed_result(&descriptor, &format!("{program_name} is not on PATH")),
     };
-    let fresh_session = (descriptor.backend == BackendKindV1::Claude
+    let fresh_session = (descriptor.backend == BackendKindV2::Claude
         && descriptor.session.is_none())
     .then(|| uuid::Uuid::new_v4().to_string());
     let transcript_session = descriptor.session.as_deref().or(fresh_session.as_deref());
@@ -260,13 +260,13 @@ fn run_helper(path: &Path, token: &str) -> Result<(), String> {
     }
     let snapshot =
         match descriptor.backend {
-            BackendKindV1::Codex => Some(Snapshot::Codex(
+            BackendKindV2::Codex => Some(Snapshot::Codex(
                 asterline::tui::rollout_import::snapshot(transcript_session, &descriptor.cwd),
             )),
-            BackendKindV1::Claude => Some(Snapshot::Claude(
+            BackendKindV2::Claude => Some(Snapshot::Claude(
                 asterline::tui::claude_import::snapshot(transcript_session, &descriptor.cwd),
             )),
-            BackendKindV1::Grok | BackendKindV1::Agy => None,
+            BackendKindV2::Grok | BackendKindV2::Agy => None,
         };
 
     println!(
@@ -440,48 +440,48 @@ fn ensure_windows_console() -> Result<(), String> {
     Ok(())
 }
 
-fn backend_program(backend: BackendKindV1) -> &'static str {
+fn backend_program(backend: BackendKindV2) -> &'static str {
     match backend {
-        BackendKindV1::Codex => "codex",
-        BackendKindV1::Claude => "claude",
-        BackendKindV1::Grok => "grok",
-        BackendKindV1::Agy => "agy",
+        BackendKindV2::Codex => "codex",
+        BackendKindV2::Claude => "claude",
+        BackendKindV2::Grok => "grok",
+        BackendKindV2::Agy => "agy",
     }
 }
 
 fn backend_arguments(
-    backend: BackendKindV1,
+    backend: BackendKindV2,
     session: Option<&str>,
     fresh_session: Option<&str>,
 ) -> Vec<String> {
     match (backend, session, fresh_session) {
-        (BackendKindV1::Codex, Some(session), _) => {
+        (BackendKindV2::Codex, Some(session), _) => {
             vec!["resume".to_string(), session.to_string()]
         }
-        (BackendKindV1::Claude, Some(session), _) => {
+        (BackendKindV2::Claude, Some(session), _) => {
             vec!["--resume".to_string(), session.to_string()]
         }
-        (BackendKindV1::Claude, None, Some(session)) => {
+        (BackendKindV2::Claude, None, Some(session)) => {
             vec!["--session-id".to_string(), session.to_string()]
         }
-        (BackendKindV1::Grok, Some(session), _) => {
+        (BackendKindV2::Grok, Some(session), _) => {
             vec!["--resume".to_string(), session.to_string()]
         }
-        (BackendKindV1::Agy, Some(session), _) => {
+        (BackendKindV2::Agy, Some(session), _) => {
             vec!["--conversation".to_string(), session.to_string()]
         }
         (_, None, _) => Vec::new(),
     }
 }
 
-fn member_status_name(status: MemberStatusV1) -> &'static str {
+fn member_status_name(status: MemberStatusV2) -> &'static str {
     match status {
-        MemberStatusV1::Idle => "idle",
-        MemberStatusV1::Queued => "queued",
-        MemberStatusV1::Running => "running",
-        MemberStatusV1::Waiting => "waiting",
-        MemberStatusV1::NeedsApproval => "waiting for approval",
-        MemberStatusV1::Failed => "failed",
+        MemberStatusV2::Idle => "idle",
+        MemberStatusV2::Queued => "queued",
+        MemberStatusV2::Running => "running",
+        MemberStatusV2::Waiting => "waiting",
+        MemberStatusV2::NeedsApproval => "waiting for approval",
+        MemberStatusV2::Failed => "failed",
     }
 }
 
@@ -605,21 +605,21 @@ mod tests {
     #[test]
     fn backend_arguments_do_not_pass_through_a_shell() {
         assert_eq!(
-            backend_arguments(BackendKindV1::Codex, Some("thread;echo bad"), None),
+            backend_arguments(BackendKindV2::Codex, Some("thread;echo bad"), None),
             vec!["resume", "thread;echo bad"]
         );
         assert_eq!(
-            backend_arguments(BackendKindV1::Claude, None, Some("fresh-id")),
+            backend_arguments(BackendKindV2::Claude, None, Some("fresh-id")),
             vec!["--session-id", "fresh-id"]
         );
     }
 
     #[test]
     fn active_members_cannot_be_attached() {
-        assert_ne!(member_status_name(MemberStatusV1::Running), "idle");
+        assert_ne!(member_status_name(MemberStatusV2::Running), "idle");
         assert!(!matches!(
-            MemberStatusV1::Running,
-            MemberStatusV1::Idle | MemberStatusV1::Failed
+            MemberStatusV2::Running,
+            MemberStatusV2::Idle | MemberStatusV2::Failed
         ));
     }
 

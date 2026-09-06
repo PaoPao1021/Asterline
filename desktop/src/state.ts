@@ -1,4 +1,16 @@
-import type { DesktopEventV1, DesktopSnapshotV1, DiffResultV1, LogEntryV1, SkillSummaryV1, TimelineItemV1 } from "./bridge/types";
+import type {
+  DesktopEventV2,
+  DesktopSnapshotV2,
+  DiffResultV2,
+  LogEntryV2,
+  ModesConfigV2,
+  SkillSummaryV2,
+  TimelineItemV2,
+} from "./bridge/types";
+
+/** Timeline caps mirrored from the host so live streaming truncates the same
+ * way a recovered snapshot would (5 000 items; per-item bytes clamp host-side). */
+export const MAX_TIMELINE_ITEMS = 5_000;
 
 export type UtilityStatus = "idle" | "loading" | "ready" | "error";
 export interface UtilityResource<T> {
@@ -9,13 +21,13 @@ export interface UtilityResource<T> {
   error: string | null;
 }
 export interface UtilityState {
-  logs: UtilityResource<LogEntryV1[]>;
-  diff: UtilityResource<DiffResultV1 | null>;
-  skills: UtilityResource<SkillSummaryV1[]>;
+  logs: UtilityResource<LogEntryV2[]>;
+  diff: UtilityResource<DiffResultV2 | null>;
+  skills: UtilityResource<SkillSummaryV2[]>;
 }
 
 export interface DesktopState {
-  snapshot: DesktopSnapshotV1 | null;
+  snapshot: DesktopSnapshotV2 | null;
   loading: boolean;
   error: string | null;
   utility: UtilityState;
@@ -24,27 +36,52 @@ export interface DesktopState {
 const emptyResource = <T,>(value: T): UtilityResource<T> => ({ status: "idle", requestId: 0, value, truncated: false, error: null });
 
 export const initialUtilityState: UtilityState = {
-  logs: emptyResource<LogEntryV1[]>([]),
-  diff: emptyResource<DiffResultV1 | null>(null),
-  skills: emptyResource<SkillSummaryV1[]>([]),
+  logs: emptyResource<LogEntryV2[]>([]),
+  diff: emptyResource<DiffResultV2 | null>(null),
+  skills: emptyResource<SkillSummaryV2[]>([]),
 };
 
 export type DesktopAction =
   | { type: "loading" }
-  | { type: "snapshot"; snapshot: DesktopSnapshotV1 }
-  | { type: "event"; packet: DesktopEventV1 }
+  | { type: "snapshot"; snapshot: DesktopSnapshotV2 }
+  | { type: "event"; packet: DesktopEventV2 }
   | { type: "utility_request"; utility: keyof UtilityState; requestId: number }
   | { type: "utility_error"; utility: keyof UtilityState; requestId: number; error: string }
   | { type: "error"; error: string };
 
 export const initialDesktopState: DesktopState = { snapshot: null, loading: true, error: null, utility: initialUtilityState };
 
-function upsertTimeline(items: TimelineItemV1[], item: TimelineItemV1): TimelineItemV1[] {
+function upsertTimeline(items: TimelineItemV2[], item: TimelineItemV2): TimelineItemV2[] {
   const index = items.findIndex(({ id }) => id === item.id);
-  if (index < 0) return [...items, item];
-  const next = [...items];
-  next[index] = { ...next[index], ...item };
+  let next: TimelineItemV2[];
+  if (index < 0) next = [...items, item];
+  else {
+    next = [...items];
+    next[index] = { ...next[index], ...item };
+  }
+  // Mirror the host's timeline cap while streaming.
+  if (next.length > MAX_TIMELINE_ITEMS) next = next.slice(next.length - MAX_TIMELINE_ITEMS);
   return next;
+}
+
+/** Field-level merge of mode defaults and conversation overrides. */
+export function mergeModes(
+  defaults: ModesConfigV2 | undefined,
+  overrides: ModesConfigV2 | undefined,
+): ModesConfigV2 {
+  const merge = <T extends Record<string, unknown>>(
+    base: T | null | undefined,
+    over: T | null | undefined,
+  ): T | null | undefined => {
+    if (!base && !over) return null;
+    return { ...(base ?? {}), ...(over ?? {}) } as T;
+  };
+  return {
+    review: merge(defaults?.review, overrides?.review),
+    plan: merge(defaults?.plan, overrides?.plan),
+    brainstorm: merge(defaults?.brainstorm, overrides?.brainstorm),
+    team: merge(defaults?.team, overrides?.team),
+  };
 }
 
 export function desktopReducer(state: DesktopState, action: DesktopAction): DesktopState {
@@ -70,7 +107,7 @@ export function desktopReducer(state: DesktopState, action: DesktopAction): Desk
   }
 
   const { packet } = action;
-  if (packet.version !== 1 || !state.snapshot || packet.sequence <= state.snapshot.sequence) return state;
+  if (packet.version !== 2 || !state.snapshot || packet.sequence <= state.snapshot.sequence) return state;
   const snapshot = { ...state.snapshot, sequence: packet.sequence };
   const event = packet.event;
 
@@ -83,6 +120,10 @@ export function desktopReducer(state: DesktopState, action: DesktopAction): Desk
       break;
     case "mode_changed":
       snapshot.mode = event.mode;
+      break;
+    case "modes_updated":
+      snapshot.mode_overrides = event.overrides;
+      if (snapshot.team) snapshot.team = { ...snapshot.team, modes: event.defaults };
       break;
     case "member_updated":
       snapshot.members = snapshot.members.some(({ id }) => id === event.member.id)
@@ -129,6 +170,7 @@ export function desktopReducer(state: DesktopState, action: DesktopAction): Desk
       break;
     case "timeline_cleared":
       snapshot.timeline = [];
+      snapshot.timeline_truncated = false;
       break;
     case "approval_added":
       snapshot.approvals = [...snapshot.approvals.filter(({ id }) => id !== event.approval.id), event.approval];
@@ -148,13 +190,22 @@ export function desktopReducer(state: DesktopState, action: DesktopAction): Desk
       snapshot.team = event.team;
       snapshot.workspace = event.team.workspace;
       break;
+    case "queue_updated": {
+      const queues = snapshot.queues.filter((queue) => queue.member !== event.member);
+      if (event.prompts.length > 0) queues.push({ member: event.member, prompts: event.prompts });
+      snapshot.queues = queues;
+      break;
+    }
+    case "queued_prompt_returned":
+      snapshot.queues = snapshot.queues.filter((queue) => queue.member !== event.member);
+      break;
     case "notice":
-      snapshot.timeline = [...snapshot.timeline, {
+      snapshot.timeline = upsertTimeline(snapshot.timeline, {
         id: `notice-${packet.sequence}`,
         kind: "notice",
         text: event.message,
         timestamp: new Date().toISOString(),
-      }];
+      });
       break;
     case "route_paused":
       snapshot.timeline = upsertTimeline(snapshot.timeline, {

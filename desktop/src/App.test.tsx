@@ -4,11 +4,11 @@ import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } fr
 import { App } from "./App";
 import { setDesktopClientForTests } from "./bridge/client";
 import { createMockDesktopClient } from "./bridge/mock";
-import type { DesktopCommandV1 } from "./bridge/types";
+import type { DesktopCommandV2 } from "./bridge/types";
 
 describe("Asterline desktop workspace", () => {
   let client: ReturnType<typeof createMockDesktopClient>;
-  let dispatchSpy: MockInstance<(command: DesktopCommandV1) => Promise<void>>;
+  let dispatchSpy: MockInstance<(command: DesktopCommandV2) => Promise<void>>;
 
   beforeEach(() => {
     Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: 1280 });

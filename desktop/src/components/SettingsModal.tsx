@@ -1,35 +1,40 @@
 import { useEffect, useMemo, useState } from "react";
+import { getDesktopClient } from "../bridge/client";
 import type {
-  ApprovalPolicyV1,
+  ApprovalPolicyV2,
+  BackendAvailability,
   BackendKind,
-  ModesConfigV1,
+  ModesConfigV2,
+  ModelSummary,
+  NativeSessionSummary,
   PermissionMode,
   SandboxPolicy,
-  TeamMemberSettingsV1,
-  TeamSettingsV1,
+  TeamMemberSettingsV2,
+  TeamSettingsV2,
 } from "../bridge/types";
 import type { Translate } from "../i18n";
-import { AlertIcon, ApprovalIcon, CheckIcon, ModeIcon, PlusIcon, SettingsIcon, UsersIcon, XIcon } from "./Icons";
+import { Dropdown } from "./Dropdown";
+import { AlertIcon, ApprovalIcon, CheckIcon, ModeIcon, PlusIcon, RefreshIcon, SettingsIcon, UsersIcon, XIcon } from "./Icons";
 
 type SettingsTab = "general" | "members" | "approvals" | "modes";
 
 interface SettingsModalProps {
-  settings: TeamSettingsV1;
+  settings: TeamSettingsV2;
   busy: boolean;
   t: Translate;
   onClose: () => void;
-  onSave: (settings: TeamSettingsV1) => Promise<void>;
+  onSave: (settings: TeamSettingsV2) => Promise<void>;
 }
 
 const clone = <T,>(value: T): T => structuredClone(value);
 
-export function patchMember(member: TeamMemberSettingsV1, patch: Partial<TeamMemberSettingsV1>): TeamMemberSettingsV1 {
+export function patchMember(member: TeamMemberSettingsV2, patch: Partial<TeamMemberSettingsV2>): TeamMemberSettingsV2 {
   // Deliberately merge into the source member: native session ids, injected
   // prompts, and future bridge fields survive edits made by older frontends.
   return { ...member, ...patch };
 }
 
-export function replaceMemberReference(settings: TeamSettingsV1, oldId: string, newId: string | null): TeamSettingsV1 {
+export function replaceMemberReference(settings: TeamSettingsV2, oldId: string, newId: string | null): TeamSettingsV2 {
   const next = clone(settings);
   const map = (value?: string | null) => value === oldId ? newId : value;
   if (next.default_target?.type === "member" && next.default_target.member === oldId) {
@@ -41,6 +46,7 @@ export function replaceMemberReference(settings: TeamSettingsV1, oldId: string, 
   }
   if (next.modes.plan) {
     next.modes.plan.leader = map(next.modes.plan.leader);
+    next.modes.plan.builder = map(next.modes.plan.builder);
     next.modes.plan.reviewer = map(next.modes.plan.reviewer);
   }
   if (next.modes.team) next.modes.team.coordinator = map(next.modes.team.coordinator);
@@ -50,7 +56,7 @@ export function replaceMemberReference(settings: TeamSettingsV1, oldId: string, 
   return next;
 }
 
-function newMember(index: number): TeamMemberSettingsV1 {
+function newMember(index: number): TeamMemberSettingsV2 {
   return {
     id: `member-${index}`,
     display_name: `Member ${index}`,
@@ -68,7 +74,7 @@ function newMember(index: number): TeamMemberSettingsV1 {
   };
 }
 
-function validate(settings: TeamSettingsV1): boolean {
+function validate(settings: TeamSettingsV2): boolean {
   if (!settings.name.trim() || settings.members.length === 0 || settings.max_auto_relays < 1) return false;
   const ids = new Set<string>();
   const names = new Set<string>();
@@ -92,6 +98,7 @@ function validate(settings: TeamSettingsV1): boolean {
     settings.modes.review?.builder,
     settings.modes.review?.reviewer,
     settings.modes.plan?.leader,
+    settings.modes.plan?.builder,
     settings.modes.plan?.reviewer,
     settings.modes.team?.coordinator,
     ...(settings.modes.brainstorm?.participants ?? []),
@@ -107,7 +114,7 @@ function validate(settings: TeamSettingsV1): boolean {
   return references.every((id) => known.has(id)) && modeLimitsValid && brainstormParticipantsValid;
 }
 
-function effortsFor(backend: BackendKind): TeamMemberSettingsV1["effort"][] {
+function effortsFor(backend: BackendKind): TeamMemberSettingsV2["effort"][] {
   if (backend === "agy") return ["low", "medium", "high"];
   if (backend === "codex") return ["low", "medium", "high", "xhigh", "max", "ultra"];
   return ["low", "medium", "high", "xhigh", "max"];
@@ -117,11 +124,28 @@ function Field({ label, help, children, wide }: { label: string; help?: string; 
   return <label className={`settings-field ${wide ? "field-wide" : ""}`}><span>{label}</span>{children}{help && <small>{help}</small>}</label>;
 }
 
-function SelectMember({ label, value, members, onChange }: { label: string; value?: string | null; members: TeamMemberSettingsV1[]; onChange: (value: string | null) => void }) {
-  return <Field label={label}><select value={value ?? ""} onChange={(event) => onChange(event.target.value || null)}><option value="">Auto</option>{members.map((member) => <option key={member.id} value={member.id}>{member.display_name}</option>)}</select></Field>;
+function SelectMember({ label, value, members, onChange }: { label: string; value?: string | null; members: TeamMemberSettingsV2[]; onChange: (value: string | null) => void }) {
+  return (
+    <Field label={label}>
+      <Dropdown
+        label={label}
+        value={value ?? ""}
+        onChange={onChange}
+        options={[{ value: "", label: "Auto" }, ...members.map((member) => ({ value: member.id, label: member.display_name, hint: member.backend }))]}
+      />
+    </Field>
+  );
 }
 
-function GeneralSettings({ draft, setDraft, t }: { draft: TeamSettingsV1; setDraft: React.Dispatch<React.SetStateAction<TeamSettingsV1>>; t: Translate }) {
+function GeneralSettings({ draft, setDraft, t }: { draft: TeamSettingsV2; setDraft: React.Dispatch<React.SetStateAction<TeamSettingsV2>>; t: Translate }) {
+  const [availability, setAvailability] = useState<BackendAvailability | null>(null);
+  useEffect(() => {
+    let alive = true;
+    getDesktopClient().getBackendAvailability()
+      .then((value) => { if (alive) setAvailability(value); })
+      .catch(() => undefined);
+    return () => { alive = false; };
+  }, []);
   return (
     <div className="settings-pane">
       <div className="pane-intro"><h3>{t("general")}</h3><p>{t("teamNameHelp")}</p></div>
@@ -130,20 +154,49 @@ function GeneralSettings({ draft, setDraft, t }: { draft: TeamSettingsV1; setDra
         <Field label={t("workspacePath")} wide><input value={draft.workspace} disabled title={draft.workspace} /></Field>
         <Field label={t("relayLimit")} help={t("relayHelp")}><input type="number" min={1} max={100} value={draft.max_auto_relays} onChange={(event) => setDraft((value) => ({ ...value, max_auto_relays: Number(event.target.value) }))} /></Field>
         <Field label={t("defaultRecipient")}>
-          <select value={draft.default_target?.type === "all" ? "all" : draft.default_target?.member ?? ""} onChange={(event) => setDraft((value) => ({ ...value, default_target: event.target.value === "all" ? { type: "all" } : event.target.value ? { type: "member", member: event.target.value } : null }))}>
-            <option value="">{t("defaultTarget")}</option><option value="all">{t("allMembers")}</option>{draft.members.map((member) => <option key={member.id} value={member.id}>{member.display_name}</option>)}
-          </select>
+          <Dropdown
+            label={t("defaultRecipient")}
+            value={draft.default_target?.type === "all" ? "all" : draft.default_target?.member ?? ""}
+            onChange={(next) => setDraft((value) => ({ ...value, default_target: next === "all" ? { type: "all" } : next ? { type: "member", member: next } : null }))}
+            options={[
+              { value: "", label: t("defaultTarget") },
+              { value: "all", label: t("allMembers") },
+              ...draft.members.map((member) => ({ value: member.id, label: member.display_name, hint: member.backend })),
+            ]}
+          />
+        </Field>
+        <Field label={t("cliDetection")} wide>
+          <div className="cli-detection" role="status">
+            {(["codex", "claude", "grok", "agy"] as const).map((backend) => (
+              <span key={backend} className={`cli-chip ${availability ? (availability[backend] ? "found" : "missing") : ""}`}>
+                {backend} · {availability ? (availability[backend] ? t("detected") : t("notDetected")) : "…"}
+              </span>
+            ))}
+          </div>
         </Field>
       </div>
     </div>
   );
 }
 
-function MembersSettings({ draft, setDraft, t }: { draft: TeamSettingsV1; setDraft: React.Dispatch<React.SetStateAction<TeamSettingsV1>>; t: Translate }) {
+function MembersSettings({ draft, setDraft, t }: { draft: TeamSettingsV2; setDraft: React.Dispatch<React.SetStateAction<TeamSettingsV2>>; t: Translate }) {
   const [selected, setSelected] = useState(draft.members[0]?.id ?? "");
+  const [models, setModels] = useState<ModelSummary[]>([]);
+  const [nativeSessions, setNativeSessions] = useState<NativeSessionSummary[]>([]);
   const memberIndex = Math.max(0, draft.members.findIndex(({ id }) => id === selected));
   const member = draft.members[memberIndex];
-  const update = (patch: Partial<TeamMemberSettingsV1>) => setDraft((value) => ({ ...value, members: value.members.map((item, index) => index === memberIndex ? patchMember(item, patch) : item) }));
+  const update = (patch: Partial<TeamMemberSettingsV2>) => setDraft((value) => ({ ...value, members: value.members.map((item, index) => index === memberIndex ? patchMember(item, patch) : item) }));
+  const refreshCatalog = async () => {
+    if (!member) return;
+    try {
+      const [modelList, sessionList] = await Promise.all([
+        getDesktopClient().listModels(member.backend, draft.workspace).catch(() => [] as ModelSummary[]),
+        getDesktopClient().listNativeSessions(member.backend, draft.workspace).catch(() => [] as NativeSessionSummary[]),
+      ]);
+      setModels(modelList);
+      setNativeSessions(sessionList);
+    } catch { /* catalog discovery is best-effort; manual entry still works. */ }
+  };
   const remove = () => {
     if (draft.members.length <= 1) return;
     const nextMembers = draft.members.filter((_, index) => index !== memberIndex);
@@ -162,16 +215,17 @@ function MembersSettings({ draft, setDraft, t }: { draft: TeamSettingsV1; setDra
         <div className="settings-grid">
           <Field label={t("displayName")}><input aria-label={t("displayName")} value={member.display_name} onChange={(event) => update({ display_name: event.target.value })} /></Field>
           <Field label={t("memberId")}><input aria-label={t("memberId")} value={member.id} onChange={(event) => { const id = event.target.value; setDraft((value) => replaceMemberReference({ ...value, members: value.members.map((item, index) => index === memberIndex ? patchMember(item, { id }) : item) }, member.id, id)); setSelected(id); }} /></Field>
-          <Field label={t("backend")}><select value={member.backend} onChange={(event) => { const backend = event.target.value as BackendKind; const effort = effortsFor(backend).includes(member.effort) ? member.effort : null; update({ backend, effort }); }}>{["codex", "claude", "grok", "agy"].map((value) => <option key={value}>{value}</option>)}</select></Field>
+          <Field label={t("backend")}><Dropdown label={t("backend")} value={member.backend} onChange={(next) => { const backend = next as BackendKind; const effort = effortsFor(backend).includes(member.effort) ? member.effort : null; update({ backend, effort }); }} options={["codex", "claude", "grok", "agy"].map((value) => ({ value, label: value }))} /></Field>
           <Field label={t("role")}><input value={member.role} onChange={(event) => update({ role: event.target.value })} /></Field>
-          <Field label={t("model")}><input value={member.model ?? ""} placeholder="default" onChange={(event) => update({ model: event.target.value || null })} /></Field>
-          <Field label={t("effort")}><select value={member.effort ?? ""} onChange={(event) => update({ effort: (event.target.value || null) as TeamMemberSettingsV1["effort"] })}><option value="">default</option>{effortsFor(member.backend).map((value) => <option key={value}>{value}</option>)}</select></Field>
-          <Field label={t("sandbox")}><select value={member.sandbox} onChange={(event) => update({ sandbox: event.target.value as SandboxPolicy })}>{["read-only", "workspace-write", "danger-full-access"].map((value) => <option key={value}>{value}</option>)}</select></Field>
-          <Field label={t("permissionMode")}><select value={member.permission_mode ?? ""} onChange={(event) => update({ permission_mode: (event.target.value || null) as PermissionMode | null })}><option value="">default</option>{["default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"].map((value) => <option key={value}>{value}</option>)}</select></Field>
+          <Field label={t("model")} help={t("manualModel")}><input list={`models-${member.id}`} value={member.model ?? ""} placeholder="default" onChange={(event) => update({ model: event.target.value || null })} /><datalist id={`models-${member.id}`}>{models.map((model) => <option key={model.id} value={model.id}>{model.description ?? model.name}</option>)}</datalist></Field>
+          <Field label={t("modelCatalog")}><button type="button" className="secondary-button" onClick={() => void refreshCatalog()}><RefreshIcon size={13} />{t("refreshModels")}</button><small>{t("refreshModelsHint")}</small></Field>
+          <Field label={t("effort")}><Dropdown label={t("effort")} value={member.effort ?? ""} onChange={(next) => update({ effort: (next || null) as TeamMemberSettingsV2["effort"] })} options={[{ value: "", label: "default" }, ...effortsFor(member.backend).map((value) => ({ value: String(value), label: String(value) }))]} /></Field>
+          <Field label={t("sandbox")}><Dropdown label={t("sandbox")} value={member.sandbox} onChange={(next) => update({ sandbox: next as SandboxPolicy })} options={["read-only", "workspace-write", "danger-full-access"].map((value) => ({ value, label: value }))} /></Field>
+          <Field label={t("permissionMode")}><Dropdown label={t("permissionMode")} value={member.permission_mode ?? ""} onChange={(next) => update({ permission_mode: (next || null) as PermissionMode | null })} options={[{ value: "", label: "default" }, ...["default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"].map((value) => ({ value, label: value }))]} /></Field>
           <Field label={t("cwd")} wide><input value={member.cwd ?? ""} placeholder={draft.workspace} onChange={(event) => update({ cwd: event.target.value || null })} /></Field>
           <Field label={t("allowedTools")} help={t("allowedToolsHelp")} wide><input value={member.allowed_tools.join(", ")} onChange={(event) => update({ allowed_tools: event.target.value.split(",").map((value) => value.trim()).filter(Boolean) })} /></Field>
-          <Field label={t("sessionPolicy")}><select value={member.session_policy} onChange={(event) => update({ session_policy: event.target.value as "resume" | "fresh" })}><option value="resume">resume</option><option value="fresh">fresh</option></select></Field>
-          <Field label={t("sessionId")}><input value={member.session_id ?? ""} onChange={(event) => update({ session_id: event.target.value || null })} /></Field>
+          <Field label={t("sessionPolicy")}><Dropdown label={t("sessionPolicy")} value={member.session_policy} onChange={(next) => update({ session_policy: next as "resume" | "fresh" })} options={[{ value: "resume", label: "resume" }, { value: "fresh", label: "fresh" }]} /></Field>
+          <Field label={t("sessionId")} help={t("nativeSessionSearch")}><input list={`sessions-${member.id}`} value={member.session_id ?? ""} placeholder={t("sessionId")} onChange={(event) => update({ session_id: event.target.value || null })} /><datalist id={`sessions-${member.id}`}>{nativeSessions.map((session) => <option key={session.session_id} value={session.session_id}>{session.preview || session.session_id}</option>)}</datalist></Field>
           <Field label={t("systemPrompt")} wide><textarea rows={5} value={member.system_prompt ?? ""} onChange={(event) => update({ system_prompt: event.target.value || null })} /></Field>
         </div>
       </div>
@@ -192,7 +246,7 @@ function parseKeywords(value: string): Record<string, string[]> {
   return result;
 }
 
-function ApprovalsSettings({ policy, onChange, t }: { policy: ApprovalPolicyV1; onChange: (policy: ApprovalPolicyV1) => void; t: Translate }) {
+function ApprovalsSettings({ policy, onChange, t }: { policy: ApprovalPolicyV2; onChange: (policy: ApprovalPolicyV2) => void; t: Translate }) {
   const toggle = <T extends string,>(values: T[] | null | undefined, value: T, defaults: T[]): T[] => {
     const current = values ?? defaults;
     return current.includes(value) ? current.filter((item) => item !== value) : [...current, value];
@@ -213,7 +267,7 @@ function ModeCard({ title, children }: { title: string; children: React.ReactNod
   return <section className="mode-settings-card"><div className="mode-settings-title"><span /><strong>{title}</strong></div><div className="settings-grid compact">{children}</div></section>;
 }
 
-function ModesSettings({ modes, members, onChange, t }: { modes: ModesConfigV1; members: TeamMemberSettingsV1[]; onChange: (modes: ModesConfigV1) => void; t: Translate }) {
+function ModesSettings({ modes, members, onChange, t }: { modes: ModesConfigV2; members: TeamMemberSettingsV2[]; onChange: (modes: ModesConfigV2) => void; t: Translate }) {
   const review = modes.review ?? {};
   const plan = modes.plan ?? {};
   const brainstorm = modes.brainstorm ?? {};
@@ -230,8 +284,10 @@ function ModesSettings({ modes, members, onChange, t }: { modes: ModesConfigV1; 
       </ModeCard>
       <ModeCard title={t("plan")}>
         <SelectMember label={t("leader")} value={plan.leader} members={members} onChange={(leader) => onChange({ ...modes, plan: { ...plan, leader } })} />
+        <SelectMember label={t("planBuilder")} value={plan.builder} members={members} onChange={(builder) => onChange({ ...modes, plan: { ...plan, builder } })} />
         <SelectMember label={t("reviewer")} value={plan.reviewer} members={members} onChange={(reviewer) => onChange({ ...modes, plan: { ...plan, reviewer } })} />
         <Field label={t("maxIterations")}><input type="number" min={1} value={plan.max_iterations ?? 3} onChange={(event) => onChange({ ...modes, plan: { ...plan, max_iterations: Number(event.target.value) } })} /></Field>
+        <label className="switch-field"><input type="checkbox" checked={plan.auto_execute ?? false} onChange={(event) => onChange({ ...modes, plan: { ...plan, auto_execute: event.target.checked } })} /><span />{t("planAutoExecute")}</label>
         <Field label={t("verifyCommand")}><input value={plan.verify_command ?? ""} onChange={(event) => onChange({ ...modes, plan: { ...plan, verify_command: event.target.value || null } })} /></Field>
         <label className="switch-field"><input type="checkbox" checked={plan.auto_verify ?? true} onChange={(event) => onChange({ ...modes, plan: { ...plan, auto_verify: event.target.checked } })} /><span />{t("autoVerify")}</label>
       </ModeCard>

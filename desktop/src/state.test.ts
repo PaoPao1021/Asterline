@@ -7,7 +7,7 @@ describe("desktopReducer", () => {
     const state = { snapshot: structuredClone(demoSnapshot), loading: false, error: null, utility: structuredClone(initialUtilityState) };
     const next = desktopReducer(state, {
       type: "event",
-      packet: { version: 1, sequence: demoSnapshot.sequence, event: { type: "mode_changed", mode: "review" } },
+      packet: { version: 2, sequence: demoSnapshot.sequence, event: { type: "mode_changed", mode: "review" } },
     });
     expect(next).toBe(state);
   });
@@ -18,7 +18,7 @@ describe("desktopReducer", () => {
     const next = desktopReducer(state, {
       type: "event",
       packet: {
-        version: 1,
+        version: 2,
         sequence: snapshot.sequence + 1,
         event: { type: "timeline_updated", item: { id: "agent-1", kind: "agent", text: "complete", streaming: false } },
       },
@@ -32,7 +32,7 @@ describe("desktopReducer", () => {
     const next = desktopReducer({ snapshot, loading: false, error: null, utility: structuredClone(initialUtilityState) }, {
       type: "event",
       packet: {
-        version: 1,
+        version: 2,
         sequence: snapshot.sequence + 1,
         event: { type: "route_paused", turn: 14, member: "builder", to: ["reviewer"], reason: "relay limit reached", queued: 2 },
       },
@@ -46,7 +46,7 @@ describe("desktopReducer", () => {
     const next = desktopReducer(state, {
       type: "event",
       packet: {
-        version: 1,
+        version: 2,
         sequence: snapshot.sequence + 1,
         event: { type: "session_updated", member: "researcher", session: "session-refreshed" },
       },
@@ -63,7 +63,7 @@ describe("desktopReducer", () => {
     });
     const stale = desktopReducer(requested, {
       type: "event",
-      packet: { version: 1, sequence: snapshot.sequence + 1, event: { type: "logs_replaced", request_id: 8, entries: [{ level: "info", source: "old", message: "stale" }], truncated: false } },
+      packet: { version: 2, sequence: snapshot.sequence + 1, event: { type: "logs_replaced", request_id: 8, entries: [{ level: "info", source: "old", message: "stale" }], truncated: false } },
     });
     expect(stale.utility.logs.value).toEqual([]);
   });

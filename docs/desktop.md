@@ -29,6 +29,45 @@ Utility data is requested on demand through versioned bridge commands rather tha
 
 The first release intentionally does not embed a terminal or add telemetry.
 
+## 0.3.0 — full TUI parity
+
+Desktop 0.3.0 completes the alignment with the terminal UI. Composer parsing,
+the command catalog, completion, and targeted-skill validation live in a shared
+Rust contract (`asterline::contract`); the desktop composer accepts every TUI
+slash command, alias, and `@member /skill` form with identical behavior,
+including `/exit` (graceful shutdown, then window close).
+
+Highlights on top of the V1.1 drawers:
+
+- **Bridge v2.** `DesktopSnapshotV2` adds conversation-scoped mode overrides,
+  per-member prompt queues, relay pause state, the suggested verify command,
+  and the active conversation. Queue updates and pull-backs are structured
+  events. The WebView IPC version is now `2`; SQLite stores, session
+  snapshots, and `team.json` keep their on-disk formats.
+- **Queues and images.** Sending while a member runs joins that member's queue
+  (visible queue bar, last-queued pull-back). Images attach via paste,
+  drag-drop, or file picker (PNG/JPEG/GIF/WebP/TIFF, max four, TIFF converts
+  to PNG); the host stages them in the managed paste directory and the
+  WebView only sees opaque tokens.
+- **Mode panel.** Per-field binding sources (default / team.json / this chat),
+  apply to this chat, save as team default, reset overrides, direct mode-run
+  launch, and lossless plan-mode `builder`/`auto_execute` editing.
+- **Runs panel.** Structured mode-run state, full step editing (status, owner,
+  add, rename, remove), note/block/continue/verify, and event history.
+- **Sessions.** Full searchable history, native session import for
+  Claude/Codex/Grok with previews, one-click export to Claude format.
+- **Advanced launch.** Team roster file, ask-on-open, custom database path,
+  restore toggle, update-check opt-in, offline fake agents, and a debug mode
+  that disables approval gates behind an explicit risk confirmation. Debug and
+  fake apply to that launch only and are never persisted.
+- **Themed widgets and a11y.** Every native `<select>` is replaced by a themed,
+  keyboard-complete dropdown; focus visibility is guaranteed application-wide
+  and the app is checked with automated axe scans.
+
+The update check now uses rustls, so the Linux package build no longer needs
+OpenSSL. The full capability matrix (TUI feature → GUI entry → command entry →
+automated test) lives in `docs/desktop-parity.md`.
+
 ## Architecture and trust boundary
 
 The webview is a presentation layer. It sends a versioned command envelope to

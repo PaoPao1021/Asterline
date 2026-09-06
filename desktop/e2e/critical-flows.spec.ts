@@ -56,3 +56,55 @@ test("persists appearance and confirms team settings", async ({ page }) => {
   await expect(page.getByText("Team settings confirmed by the runtime")).toBeVisible();
   await expect(page.getByText("Release Team").first()).toBeVisible();
 });
+
+test("queues a second message while streaming and pulls it back for editing", async ({ page }) => {
+  const composer = page.getByRole("textbox", { name: /Message the team/ });
+  // Both submissions go out back-to-back so the second lands inside the
+  // first reply's streaming window — no wall-clock race.
+  await composer.fill("First request");
+  await composer.press("Enter");
+  await composer.fill("Second request while busy");
+  await composer.press("Enter");
+  await expect(page.getByText(/Queued for Builder: 1/)).toBeVisible();
+
+  // Pull the queued prompt back into the composer draft.
+  await page.getByRole("button", { name: /Pull the last queued message/ }).click();
+  await expect(composer).toHaveValue("Second request while busy");
+});
+
+test("opens the command palette from the composer and switches mode", async ({ page }) => {
+  await page.keyboard.press("Control+k");
+  const palette = page.getByRole("dialog", { name: "Command palette" });
+  await expect(palette).toBeVisible();
+  await palette.getByRole("textbox", { name: "Command palette" }).fill("/mode");
+  await palette.getByRole("button", { name: /\/mode/ }).first().click();
+  // The palette runs "/mode plan", switching the dispatch mode.
+  await expect(page.locator(".mode-switcher").getByRole("button", { name: "Plan" })).toHaveClass(/active/);
+});
+
+test("opens the runs panel and shows the structured mode state", async ({ page }) => {
+  await page.getByRole("button", { name: "Runs", exact: true }).click();
+  const runs = page.getByRole("dialog", { name: "Runs" });
+  await expect(runs).toBeVisible();
+  await expect(runs.getByText("run-18")).toBeVisible();
+  await expect(runs.getByText(/implementing/)).toBeVisible();
+});
+
+test("target selector is a themed dropdown with keyboard support", async ({ page }) => {
+  const composer = page.getByRole("textbox", { name: /Message the team/ });
+  await composer.click();
+
+  const trigger = page.getByRole("combobox", { name: "Target" });
+  await trigger.click();
+  const listbox = page.getByRole("listbox", { name: "Target" });
+  await expect(listbox).toBeVisible();
+  await expect(listbox.getByRole("option", { name: "Default", exact: true })).toHaveAttribute("aria-selected", "true");
+
+  // Keyboard: arrow to Reviewer and commit with Enter.
+  await trigger.press("ArrowDown");
+  await trigger.press("ArrowDown");
+  await trigger.press("ArrowDown");
+  await trigger.press("Enter");
+  await expect(trigger).toContainText("Reviewer");
+  await expect(listbox).toBeHidden();
+});

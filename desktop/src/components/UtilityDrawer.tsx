@@ -1,8 +1,9 @@
 import { useMemo, useState } from "react";
-import type { BackendKind, DiffResultV1, LogEntryV1, SkillSummaryV1 } from "../bridge/types";
+import type { BackendKind, DiffResultV2, LogEntryV2, SkillSummaryV2 } from "../bridge/types";
 import type { Locale, Translate } from "../i18n";
 import type { UtilityResource } from "../state";
 import { CheckIcon, CopyIcon, DownloadIcon, FileIcon, RefreshIcon, SearchIcon, XIcon } from "./Icons";
+import { Dropdown } from "./Dropdown";
 
 export type UtilityKind = "logs" | "diff" | "skills" | "find";
 
@@ -10,13 +11,13 @@ interface UtilityDrawerProps {
   kind: UtilityKind;
   locale: Locale;
   t: Translate;
-  logs: UtilityResource<LogEntryV1[]>;
-  diff: UtilityResource<DiffResultV1 | null>;
-  skills: UtilityResource<SkillSummaryV1[]>;
+  logs: UtilityResource<LogEntryV2[]>;
+  diff: UtilityResource<DiffResultV2 | null>;
+  skills: UtilityResource<SkillSummaryV2[]>;
   timelineText: Array<{ id: string; title: string; text: string }>;
   onClose: () => void;
   onOpen: (kind: UtilityKind, query?: string) => void;
-  onRefresh: (kind: Exclude<UtilityKind, "find">, filters?: { query?: string; level?: LogEntryV1["level"]; backend?: BackendKind }) => void;
+  onRefresh: (kind: Exclude<UtilityKind, "find">, filters?: { query?: string; level?: LogEntryV2["level"]; backend?: BackendKind }) => void;
   onExportDiagnostics: () => Promise<void>;
   initialQuery?: string;
 }
@@ -37,7 +38,7 @@ function CopyButton({ value, label, t }: { value: string; label: string; t: Tran
 
 export function UtilityDrawer({ kind, locale, t, logs, diff, skills, timelineText, onClose, onOpen, onRefresh, onExportDiagnostics, initialQuery }: UtilityDrawerProps) {
   const [query, setQuery] = useState(initialQuery ?? "");
-  const [level, setLevel] = useState<LogEntryV1["level"] | "all">("all");
+  const [level, setLevel] = useState<LogEntryV2["level"] | "all">("all");
   const [backend, setBackend] = useState<BackendKind | "all">("all");
   const [findIndex, setFindIndex] = useState(0);
   const matches = useMemo(() => {
@@ -58,7 +59,7 @@ export function UtilityDrawer({ kind, locale, t, logs, diff, skills, timelineTex
       {(["logs", "diff", "skills", "find"] as UtilityKind[]).map((tab) => <button key={tab} role="tab" aria-selected={kind === tab} className={kind === tab ? "active" : ""} onClick={() => onOpen(tab)}>{t(tab)}</button>)}
     </div>
     {kind === "logs" && <>
-      <div className="utility-filters"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("filterLogs")} aria-label={t("filterLogs")} /><select value={level} onChange={(event) => setLevel(event.target.value as typeof level)} aria-label={t("logLevel")}><option value="all">{t("allLevels")}</option>{["debug", "info", "warn", "error"].map((item) => <option key={item} value={item}>{item}</option>)}</select><button onClick={refresh} aria-label={t("refreshUtility")}><RefreshIcon size={15} /></button></div>
+      <div className="utility-filters"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("filterLogs")} aria-label={t("filterLogs")} /><Dropdown label={t("logLevel")} value={level} onChange={(next) => setLevel(next as typeof level)} options={[{ value: "all", label: t("allLevels") }, ...["debug", "info", "warn", "error"].map((item) => ({ value: item, label: item }))]} /><button onClick={refresh} aria-label={t("refreshUtility")}><RefreshIcon size={15} /></button></div>
       <div className="utility-toolbar"><span>{logs.value.length} · {logs.truncated ? t("truncated") : t("complete")}</span><button onClick={() => void onExportDiagnostics()}><DownloadIcon size={14} />{t("exportDiagnostics")}</button></div>
       <div className="utility-scroll">{logs.value.length ? logs.value.map((entry, index) => <article className={`log-row log-${entry.level}`} key={`${entry.source}-${index}`}><span>{entry.level}</span><strong>{entry.source}</strong><p>{entry.message}</p></article>) : <div className="utility-empty">{logs.status === "loading" ? t("loading") : t("noLogs")}</div>}</div>
     </>}
@@ -68,7 +69,7 @@ export function UtilityDrawer({ kind, locale, t, logs, diff, skills, timelineTex
       <pre className="utility-diff">{diff.value?.text || (diff.status === "loading" ? t("loading") : t("noDiff"))}</pre>
     </>}
     {kind === "skills" && <>
-      <div className="utility-filters"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("filterSkills")} aria-label={t("filterSkills")} /><select value={backend} onChange={(event) => setBackend(event.target.value as typeof backend)} aria-label={t("backend")}><option value="all">{t("allBackends")}</option>{backendOptions.slice(1).map((item) => <option key={item} value={item}>{item}</option>)}</select><button onClick={refresh} aria-label={t("refreshUtility")}><RefreshIcon size={15} /></button></div>
+      <div className="utility-filters"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("filterSkills")} aria-label={t("filterSkills")} /><Dropdown label={t("backend")} value={backend} onChange={(next) => setBackend(next as typeof backend)} options={[{ value: "all", label: t("allBackends") }, ...backendOptions.slice(1).map((item) => ({ value: item, label: item }))]} /><button onClick={refresh} aria-label={t("refreshUtility")}><RefreshIcon size={15} /></button></div>
       <div className="utility-meta">{skills.value.length} · {skills.truncated ? t("truncated") : t("complete")}</div>
       <div className="utility-scroll">{skills.value.length ? skills.value.map((skill) => <article className="skill-row" key={`${skill.backend}-${skill.invocation}`}><div><strong>{skill.name}</strong><span>{skill.backend}</span><p>{skill.description || t("noDescription")}</p></div><CopyButton value={skill.invocation} label={t("copyInvocation")} t={t} /></article>) : <div className="utility-empty">{skills.status === "loading" ? t("loading") : t("noSkills")}</div>}</div>
     </>}

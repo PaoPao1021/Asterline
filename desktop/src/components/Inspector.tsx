@@ -1,22 +1,22 @@
 import { useMemo, useState } from "react";
-import type { DesktopCommandV1, MemberSummaryV1, RunSummaryV1 } from "../bridge/types";
+import type { DesktopCommandV2, MemberSummaryV2, RunSummaryV2 } from "../bridge/types";
 import type { Locale, Translate } from "../i18n";
 import { CheckIcon, ChevronIcon, MoreIcon, PanelRightIcon, RefreshIcon, RunIcon, UsersIcon } from "./Icons";
 
 interface InspectorProps {
   open: boolean;
-  members: MemberSummaryV1[];
-  runs: RunSummaryV1[];
+  members: MemberSummaryV2[];
+  runs: RunSummaryV2[];
   locale: Locale;
   t: Translate;
   onToggle: () => void;
-  dispatch: (command: DesktopCommandV1) => Promise<void>;
+  dispatch: (command: DesktopCommandV2) => Promise<void>;
   onAttach: (member: string) => Promise<void>;
 }
 
 const initials = (name: string) => name.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase();
 
-function MemberCard({ member, t, onAttach }: { member: MemberSummaryV1; t: Translate; onAttach: (member: string) => Promise<void> }) {
+function MemberCard({ member, t, onAttach }: { member: MemberSummaryV2; t: Translate; onAttach: (member: string) => Promise<void> }) {
   return (
     <div className="member-card">
       <div className={`member-avatar backend-${member.backend}`}>{initials(member.display_name)}</div>
@@ -31,7 +31,7 @@ function MemberCard({ member, t, onAttach }: { member: MemberSummaryV1; t: Trans
   );
 }
 
-function RunCard({ run, t, dispatch }: { run: RunSummaryV1; t: Translate; dispatch: (command: DesktopCommandV1) => Promise<void> }) {
+function RunCard({ run, t, dispatch }: { run: RunSummaryV2; t: Translate; dispatch: (command: DesktopCommandV2) => Promise<void> }) {
   const [open, setOpen] = useState(true);
   const done = run.steps.filter(({ status }) => status === "done").length;
   const progress = run.steps.length ? Math.round((done / run.steps.length) * 100) : 0;

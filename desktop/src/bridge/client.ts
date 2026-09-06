@@ -1,13 +1,22 @@
 import type {
-  AttachCapabilitiesV1,
+  AttachCapabilities,
+  BackendAvailability,
+  BackendKind,
+  CommandSpec,
+  ComposerAction,
+  Completion,
   DesktopClient,
-  DesktopCommandV1,
-  DiagnosticsStatusV1,
-  DesktopEventV1,
-  ExternalAttachLaunchV1,
-  DesktopSnapshotV1,
-  DesktopUpdateV1,
-  RecentWorkspaceV1,
+  DesktopCommandV2,
+  DiagnosticsStatus,
+  DesktopEventV2,
+  ExternalAttachLaunch,
+  DesktopLaunchOptions,
+  DesktopSnapshotV2,
+  DesktopUpdate,
+  ModelSummary,
+  NativeSessionSummary,
+  RecentWorkspace,
+  StagedAttachment,
   Unlisten,
 } from "./types";
 import { createMockDesktopClient } from "./mock";
@@ -26,20 +35,67 @@ class TauriDesktopClient implements DesktopClient {
     return invoke<T>(command, args);
   }
 
-  async listenRuntimeEvents(listener: (event: DesktopEventV1) => void): Promise<Unlisten> {
+  async listenRuntimeEvents(listener: (event: DesktopEventV2) => void): Promise<Unlisten> {
     const { listen } = await import("@tauri-apps/api/event");
-    return listen<DesktopEventV1>(EVENT_CHANNEL, ({ payload }) => listener(payload));
+    return listen<DesktopEventV2>(EVENT_CHANNEL, ({ payload }) => listener(payload));
   }
 
-  bootstrapDesktop(workspace?: string): Promise<DesktopSnapshotV1> {
-    return this.invoke("bootstrap_desktop", { workspace: workspace || null });
+  bootstrapDesktop(workspace?: string, options?: DesktopLaunchOptions): Promise<DesktopSnapshotV2> {
+    return this.invoke("bootstrap_desktop", {
+      workspace: workspace || null,
+      options: options ?? null,
+    });
   }
 
-  getDesktopSnapshot(): Promise<DesktopSnapshotV1> {
+  getDesktopSnapshot(): Promise<DesktopSnapshotV2> {
     return this.invoke("get_desktop_snapshot");
   }
 
-  dispatchDesktopCommand(command: DesktopCommandV1): Promise<void> {
+  parseComposerText(text: string): Promise<ComposerAction> {
+    return this.invoke("parse_composer_text", { text });
+  }
+
+  completeComposer(head: string): Promise<Completion | null> {
+    return this.invoke("complete_composer", { head });
+  }
+
+  commandCatalog(): Promise<CommandSpec[]> {
+    return this.invoke("command_catalog");
+  }
+
+  getBackendAvailability(): Promise<BackendAvailability> {
+    return this.invoke("get_backend_availability");
+  }
+
+  listModels(backend: BackendKind, cwd: string): Promise<ModelSummary[]> {
+    return this.invoke("list_models", { backend, cwd });
+  }
+
+  listNativeSessions(backend: BackendKind, cwd: string): Promise<NativeSessionSummary[]> {
+    return this.invoke("list_native_sessions", { backend, cwd });
+  }
+
+  stageClipboardImage(): Promise<StagedAttachment> {
+    return this.invoke("stage_clipboard_image");
+  }
+
+  stageImagePath(path: string): Promise<StagedAttachment> {
+    return this.invoke("stage_image_path", { path });
+  }
+
+  stageImageBytes(base64: string): Promise<StagedAttachment> {
+    return this.invoke("stage_image_bytes", { bytesBase64: base64 });
+  }
+
+  removeStagedAttachment(token: string): Promise<void> {
+    return this.invoke("remove_staged_attachment", { token });
+  }
+
+  discardStagedAttachments(): Promise<void> {
+    return this.invoke("discard_staged_attachments");
+  }
+
+  dispatchDesktopCommand(command: DesktopCommandV2): Promise<void> {
     return this.invoke("dispatch_desktop_command", { command });
   }
 
@@ -47,8 +103,12 @@ class TauriDesktopClient implements DesktopClient {
     return this.invoke("shutdown_desktop");
   }
 
-  async listRecentWorkspaces(): Promise<RecentWorkspaceV1[]> {
-    const value = await this.invoke<Array<RecentWorkspaceV1 | string>>("list_recent_workspaces");
+  exitDesktop(): Promise<void> {
+    return this.invoke("exit_desktop");
+  }
+
+  async listRecentWorkspaces(): Promise<RecentWorkspace[]> {
+    const value = await this.invoke<Array<RecentWorkspace | string>>("list_recent_workspaces");
     return value.map((item) => typeof item === "string" ? { workspace: item } : item);
   }
 
@@ -56,7 +116,7 @@ class TauriDesktopClient implements DesktopClient {
     return this.invoke("forget_recent_workspace", { workspace });
   }
 
-  checkDesktopUpdate(): Promise<DesktopUpdateV1> {
+  checkDesktopUpdate(): Promise<DesktopUpdate> {
     return this.invoke("check_desktop_update");
   }
 
@@ -64,7 +124,7 @@ class TauriDesktopClient implements DesktopClient {
     return this.invoke("open_desktop_update", { url });
   }
 
-  getDesktopDiagnosticsStatus(): Promise<DiagnosticsStatusV1> {
+  getDesktopDiagnosticsStatus(): Promise<DiagnosticsStatus> {
     return this.invoke("get_desktop_diagnostics_status");
   }
 
@@ -72,11 +132,11 @@ class TauriDesktopClient implements DesktopClient {
     return this.invoke("export_desktop_diagnostics");
   }
 
-  getAttachCapabilities(): Promise<AttachCapabilitiesV1> {
+  getAttachCapabilities(): Promise<AttachCapabilities> {
     return this.invoke("get_attach_capabilities");
   }
 
-  openNativeSession(member: string): Promise<ExternalAttachLaunchV1> {
+  openNativeSession(member: string): Promise<ExternalAttachLaunch> {
     return this.invoke("open_native_session", { member });
   }
 }
@@ -92,4 +152,14 @@ export function getDesktopClient(): DesktopClient {
 
 export function setDesktopClientForTests(client?: DesktopClient): void {
   sharedClient = client;
+}
+
+/** Bytes → base64 without pulling in a dependency (file/clipboard staging). */
+export function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunk = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunk));
+  }
+  return btoa(binary);
 }

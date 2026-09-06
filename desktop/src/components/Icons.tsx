@@ -16,6 +16,7 @@ import {
   FolderOpen,
   GitFork,
   History,
+  Image,
   Languages,
   Layers,
   MessageSquareText,
@@ -23,6 +24,8 @@ import {
   Orbit,
   PanelLeftClose,
   PanelRightClose,
+  Pause,
+  Play,
   Plus,
   RotateCcw,
   Search,
@@ -84,6 +87,9 @@ export const AlertIcon = withDefaults(TriangleAlert);
 export const SparkIcon = withDefaults(Sparkles);
 export const MoreIcon = withDefaults(Ellipsis);
 export const HistoryIcon = withDefaults(History);
+export const ImageIcon = withDefaults(Image);
+export const PauseIcon = withDefaults(Pause);
+export const PlayIcon = withDefaults(Play);
 export const RefreshIcon = withDefaults(RotateCcw);
 export const SearchIcon = withDefaults(Search);
 export const TerminalIcon = withDefaults(Terminal);

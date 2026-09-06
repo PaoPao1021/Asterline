@@ -13,7 +13,7 @@ const RECENT_FILE: &str = "recent-workspaces.json";
 const RECENT_LIMIT: usize = 12;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RecentWorkspaceV1 {
+pub struct RecentWorkspaceV2 {
     pub workspace: String,
     pub name: Option<String>,
     pub last_opened_at: Option<String>,
@@ -24,14 +24,14 @@ struct RecentFile {
     #[serde(default = "recent_version")]
     version: u8,
     #[serde(default)]
-    workspaces: Vec<RecentWorkspaceV1>,
+    workspaces: Vec<RecentWorkspaceV2>,
 }
 
 fn recent_version() -> u8 {
     1
 }
 
-pub fn list(app: &AppHandle) -> Result<Vec<RecentWorkspaceV1>, String> {
+pub fn list(app: &AppHandle) -> Result<Vec<RecentWorkspaceV2>, String> {
     let path = config_path(app)?;
     load(&path)
         .map(|file| file.workspaces)
@@ -51,7 +51,7 @@ pub fn record(app: &AppHandle, workspace: &Path) -> Result<(), String> {
         .retain(|item| path_key(Path::new(&item.workspace)) != key);
     file.workspaces.insert(
         0,
-        RecentWorkspaceV1 {
+        RecentWorkspaceV2 {
             workspace: workspace_text,
             name: canonical
                 .file_name()
@@ -155,7 +155,7 @@ mod tests {
         ));
         let file = RecentFile {
             version: 1,
-            workspaces: vec![RecentWorkspaceV1 {
+            workspaces: vec![RecentWorkspaceV2 {
                 workspace: "C:\\workspace".to_string(),
                 name: Some("workspace".to_string()),
                 last_opened_at: Some("2026-08-12T00:00:00Z".to_string()),

@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod app;
+pub mod contract;
 pub mod domain;
 mod fs_safety;
 pub mod project_state;

@@ -14,7 +14,7 @@ const RUN_MARKER: &str = "running.marker";
 const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct DiagnosticsStatusV1 {
+pub struct DiagnosticsStatusV2 {
     pub previous_unclean_exit: bool,
     pub log_path: String,
 }
@@ -90,12 +90,12 @@ impl Diagnostics {
         }));
     }
 
-    pub fn status(&self) -> Result<DiagnosticsStatusV1, String> {
+    pub fn status(&self) -> Result<DiagnosticsStatusV2, String> {
         let inner = self
             .inner
             .lock()
             .map_err(|_| "diagnostics state is unavailable".to_string())?;
-        Ok(DiagnosticsStatusV1 {
+        Ok(DiagnosticsStatusV2 {
             previous_unclean_exit: inner.previous_unclean_exit,
             log_path: inner.log_path.to_string_lossy().into_owned(),
         })
