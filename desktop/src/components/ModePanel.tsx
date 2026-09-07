@@ -3,6 +3,7 @@ import type { DesktopCommandV2, MemberSummaryV2, ModesConfigV2, TerminalMode } f
 import type { Translate } from "../i18n";
 import { Dropdown } from "./Dropdown";
 import { XIcon } from "./Icons";
+import { useDialogFocus } from "./useDialogFocus";
 
 const COLLAB_MODES = ["review", "plan", "brainstorm", "team"] as const;
 type CollabMode = (typeof COLLAB_MODES)[number];
@@ -47,6 +48,7 @@ function sourceLabel(source: ValueSource, t: Translate): string {
 }
 
 export function ModePanel({ mode, defaults, overrides, members, busy, t, onClose, dispatch }: ModePanelProps) {
+  const dialog = useDialogFocus<HTMLElement>();
   // Keyboard-dismissible dialog (WCAG): Escape closes the panel.
   useEffect(() => {
     const listener = (event: KeyboardEvent) => {
@@ -75,16 +77,13 @@ export function ModePanel({ mode, defaults, overrides, members, busy, t, onClose
     if (collab === "review") {
       return [text("builder", t("builder")), text("reviewer", t("reviewer")),
         { ...readNumber("max_iterations"), label: t("maxIterationsLabel"), key: "max_iterations" },
-        { ...readFlag("auto_verify"), label: t("autoVerifyLabel"), key: "auto_verify" },
-        { ...readText("verify_command"), label: t("verifyCommandLabel"), key: "verify_command" },
+        { ...readText("reviewer_hint"), label: t("reviewerHintLabel"), key: "reviewer_hint" },
       ];
     }
     if (collab === "plan") {
       return [text("leader", t("leader")), text("builder", t("planBuilder")), text("reviewer", t("reviewer")),
         { ...readNumber("max_iterations"), label: t("maxIterationsLabel"), key: "max_iterations" },
         { ...readFlag("auto_execute"), label: t("planAutoExecute"), key: "auto_execute" },
-        { ...readFlag("auto_verify"), label: t("autoVerifyLabel"), key: "auto_verify" },
-        { ...readText("verify_command"), label: t("verifyCommandLabel"), key: "verify_command" },
       ];
     }
     if (collab === "brainstorm") {
@@ -97,8 +96,7 @@ export function ModePanel({ mode, defaults, overrides, members, busy, t, onClose
     }
     return [text("coordinator", t("coordinatorLabel")),
       { ...readNumber("max_iterations"), label: t("maxIterationsLabel"), key: "max_iterations" },
-      { ...readFlag("auto_verify"), label: t("autoVerifyLabel"), key: "auto_verify" },
-      { ...readText("verify_command"), label: t("verifyCommandLabel"), key: "verify_command" },
+      { ...readFlag("allow_add_members"), label: t("allowAddMembersLabel"), key: "allow_add_members" },
     ];
 
     function readNumber(key: string) {
@@ -119,7 +117,7 @@ export function ModePanel({ mode, defaults, overrides, members, busy, t, onClose
     const next: Record<string, unknown> = { ...(blockFor(overrides, collab) ?? {}) };
     if (raw === "") delete next[key];
     else if (key === "max_iterations" || key === "generation_rounds" || key === "ideas_per_round") next[key] = Number(raw);
-    else if (key === "auto_verify" || key === "auto_execute") next[key] = raw === "true";
+    else if (key === "auto_execute" || key === "allow_add_members") next[key] = raw === "true";
     else if (key === "participants") next[key] = raw.split(",").map((entry) => entry.trim()).filter(Boolean);
     else next[key] = raw;
     const cleaned = Object.fromEntries(Object.entries(next).filter(([, value]) => value !== undefined));
@@ -137,14 +135,25 @@ export function ModePanel({ mode, defaults, overrides, members, busy, t, onClose
 
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <section className="mode-panel-modal" role="dialog" aria-modal="true" aria-label={t("modes")}>
+      <section ref={dialog} className="mode-panel-modal" role="dialog" aria-modal="true" aria-label={t("modes")} tabIndex={-1}>
         <header>
           <h2 id="mode-panel-title">{t("modes")}</h2>
           <button className="icon-button" onClick={onClose} aria-label={t("close")}><XIcon size={15} /></button>
         </header>
         <div className="mode-panel-tabs" role="tablist">
           {(["normal", ...COLLAB_MODES] as TerminalMode[]).map((value) => (
-            <span key={value} role="tab" aria-selected={value === mode} className={value === mode ? "active" : ""}>{t(value)}</span>
+            <button
+              key={value}
+              type="button"
+              role="tab"
+              aria-selected={value === mode}
+              className={value === mode ? "active" : ""}
+              disabled={busy}
+              data-dialog-autofocus={value === mode ? "true" : undefined}
+              onClick={() => void dispatch({ type: "set_mode", mode: value })}
+            >
+              {t(value)}
+            </button>
           ))}
         </div>
 

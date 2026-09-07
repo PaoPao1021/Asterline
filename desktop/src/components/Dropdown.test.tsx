@@ -19,6 +19,7 @@ describe("Dropdown", () => {
     expect(trigger).toHaveAttribute("aria-expanded", "false");
     await user.click(trigger);
     expect(trigger).toHaveAttribute("aria-expanded", "true");
+    expect(trigger).toHaveAttribute("aria-activedescendant");
 
     const listbox = screen.getByRole("listbox", { name: "Target" });
     const selected = screen.getByRole("option", { name: /All members/ });

@@ -86,7 +86,9 @@ test("opens the runs panel and shows the structured mode state", async ({ page }
   await page.getByRole("button", { name: "Runs", exact: true }).click();
   const runs = page.getByRole("dialog", { name: "Runs" });
   await expect(runs).toBeVisible();
-  await expect(runs.getByText("run-18")).toBeVisible();
+  // Run handles are scoped to the active conversation, matching the TUI.
+  // The persisted database id is deliberately not exposed as the label.
+  await expect(runs.getByText("run-1")).toBeVisible();
   await expect(runs.getByText(/implementing/)).toBeVisible();
 });
 

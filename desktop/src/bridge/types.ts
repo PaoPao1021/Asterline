@@ -70,6 +70,8 @@ export interface ModeStateV2 {
 
 export interface RunSummaryV2 {
   id: number;
+  /** 1-based number within the active conversation. */
+  number: number;
   goal: string;
   status: RunStatus;
   coordinator?: string | null;
@@ -150,6 +152,7 @@ export interface TeamMemberSettingsV2 {
   system_prompt?: string | null;
   sandbox: SandboxPolicy;
   permission_mode?: PermissionMode | null;
+  approvals_reviewer?: "user" | "auto_review";
   allowed_tools: string[];
   session_policy: SessionPolicy;
   session_id?: string | null;
@@ -159,6 +162,8 @@ export interface TeamMemberSettingsV2 {
 }
 
 export interface ApprovalPolicyV2 {
+  /** Show native Codex tool asks in the composer; off by default. */
+  manual?: boolean;
   gate?: string[] | null;
   keywords: Record<string, string[]>;
   apply_to?: Array<"user" | "relay" | "mode"> | null;
@@ -169,8 +174,7 @@ export interface ReviewModeSettingsV2 {
   builder?: string | null;
   reviewer?: string | null;
   max_iterations?: number | null;
-  auto_verify?: boolean | null;
-  verify_command?: string | null;
+  reviewer_hint?: string | null;
   [key: string]: unknown;
 }
 
@@ -180,8 +184,6 @@ export interface PlanModeSettingsV2 {
   reviewer?: string | null;
   max_iterations?: number | null;
   auto_execute?: boolean | null;
-  auto_verify?: boolean | null;
-  verify_command?: string | null;
   [key: string]: unknown;
 }
 
@@ -195,8 +197,7 @@ export interface BrainstormModeSettingsV2 {
 export interface TeamModeSettingsV2 {
   coordinator?: string | null;
   max_iterations?: number | null;
-  auto_verify?: boolean | null;
-  verify_command?: string | null;
+  allow_add_members?: boolean | null;
   [key: string]: unknown;
 }
 
@@ -322,7 +323,6 @@ export type DesktopCommandV2 =
   | { type: "continue_run"; run_id?: number | null; note?: string | null }
   | { type: "note_run"; run_id?: number | null; note: string }
   | { type: "block_run"; run_id?: number | null; reason: string }
-  | { type: "verify_run"; run_id?: number | null; command?: string | null }
   | { type: "add_run_step"; run_id?: number | null; owner?: string | null; title: string }
   | { type: "update_run_step"; run_id?: number | null; step: number; status: RunStepStatus; note?: string | null }
   | { type: "rename_run_step"; run_id?: number | null; step: number; title: string }
@@ -402,12 +402,10 @@ export interface DesktopLaunchOptions {
   pick_team?: boolean;
   db_path?: string | null;
   restore?: boolean | null;
-  approvals?: boolean | null;
+  manual_approvals?: boolean | null;
   debug?: boolean;
   fake?: boolean;
   auto_update?: boolean | null;
-  /** Frontend-only: user accepted the approval-gate risk confirmation. */
-  riskAck?: boolean;
 }
 
 export interface RecentWorkspace {

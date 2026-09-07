@@ -155,11 +155,6 @@ pub const COMMAND_CATALOG: &[CommandSpec] = &[
         hint: "edit roster · sessions · approvals",
         takes_argument: false,
     },
-    CommandSpec {
-        name: "verify",
-        hint: "verify latest or selected run",
-        takes_argument: true,
-    },
 ];
 
 /// Dispatch modes offered after `/mode `, with their hints.
@@ -374,15 +369,6 @@ fn parse_slash(rest: &str) -> ParsedInput {
                     reason: reason.to_string(),
                 })
             }
-        }
-        "verify" => {
-            let (first, rest) = split_first_word(arg);
-            let (run_id, command) = if let Some(run_id) = parse_run_id(first) {
-                (Some(run_id), (!rest.is_empty()).then(|| rest.to_string()))
-            } else {
-                (None, (!arg.is_empty()).then(|| arg.to_string()))
-            };
-            ParsedInput::Runtime(UiCommand::VerifyRun { run_id, command })
         }
         "step" => parse_step_command(arg),
         "focus" => {
@@ -1036,38 +1022,6 @@ mod tests {
     }
 
     #[test]
-    fn verify_command_runs_default_or_explicit_check() {
-        assert_eq!(
-            parse("/verify"),
-            ParsedInput::Runtime(UiCommand::VerifyRun {
-                run_id: None,
-                command: None
-            })
-        );
-        assert_eq!(
-            parse("/verify cargo test -q"),
-            ParsedInput::Runtime(UiCommand::VerifyRun {
-                run_id: None,
-                command: Some("cargo test -q".to_string())
-            })
-        );
-        assert_eq!(
-            parse("/verify run-12 cargo test -q"),
-            ParsedInput::Runtime(UiCommand::VerifyRun {
-                run_id: Some(RunId(12)),
-                command: Some("cargo test -q".to_string())
-            })
-        );
-        assert_eq!(
-            parse("/verify run-12"),
-            ParsedInput::Runtime(UiCommand::VerifyRun {
-                run_id: Some(RunId(12)),
-                command: None
-            })
-        );
-    }
-
-    #[test]
     fn new_and_clear_both_start_a_fresh_session() {
         assert_eq!(parse("/new"), ParsedInput::Runtime(UiCommand::NewSession));
         assert_eq!(parse("/clear"), ParsedInput::Runtime(UiCommand::NewSession));
@@ -1193,7 +1147,7 @@ mod tests {
         for command in [
             "ask", "all", "attach", "approve", "block", "continue", "diff", "exit", "export",
             "find", "focus", "import", "logs", "mode", "new", "note", "reject", "resume", "retry",
-            "runs", "step", "team", "verify",
+            "runs", "step", "team",
         ] {
             assert!(
                 catalog.contains(&command),

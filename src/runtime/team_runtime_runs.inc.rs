@@ -49,10 +49,11 @@ impl TeamRuntime {
             }
         };
         let run_id = run.id;
+        let label = run.label();
         step.events.push(RuntimeEvent::RunUpdated { run });
 
         let teammates = self.team_teammate_list(&id);
-        let prompt = team_start_prompt(&goal, &teammates);
+        let prompt = team_start_prompt(&goal, &teammates, self.team_allows_add_members());
         let turn = match self.store.create_turn() {
             Ok(turn) => turn,
             Err(err) => {
@@ -62,7 +63,7 @@ impl TeamRuntime {
                 return;
             }
         };
-        let display_body = format!("[team {run_id}] → {id}: {goal}");
+        let display_body = format!("[team {label}] → {id}: {goal}");
         if let Err(err) =
             self.store
                 .record_user(turn, std::slice::from_ref(&id), &display_body)
@@ -79,52 +80,14 @@ impl TeamRuntime {
         });
         self.log(
             &id,
-            LogEntry::info("user", format!("team {run_id} → {id}: {goal}")),
+            LogEntry::info("user", format!("team {label} → {id}: {goal}")),
             step,
         );
         step.events.push(RuntimeEvent::Notice(format!(
-            "team {run_id} started → {id} · {}",
-            format_verify_label(
-                limits.auto_verify,
-                limits.verify_command.as_deref(),
-                suggested_verify_command(&self.config.workspace),
-            )
+            "team {label} started → {id}"
         )));
         self.run_turns.insert(turn, run_id);
-        let gate = self.approvals_enabled && self.matcher.applies_to(ApprovalSurface::Mode);
-        if gate && let Some(kind) = self.matcher.classify(&prompt) {
-            match self.store.insert_approval(Some(turn), None, &kind, &prompt) {
-                Ok(approval_id) => {
-                    self.held_approvals.insert(
-                        approval_id,
-                        HeldApproval {
-                            turn,
-                            targets: vec![id],
-                            prompt: prompt.clone(),
-                            mode_run: Some(run_id),
-                            member_request: None,
-                        },
-                    );
-                    step.events.push(RuntimeEvent::ApprovalRequested {
-                        id: approval_id,
-                        member: None,
-                        action: kind,
-                        body: prompt,
-                    });
-                }
-                Err(err) => {
-                    self.report_store_error("save a team approval request", err, step);
-                    self.block_mode_run(
-                        run_id,
-                        "could not persist the team approval request",
-                        step,
-                    );
-                    self.check_turn_complete(turn, step);
-                }
-            }
-        } else {
-            self.enqueue_prompt(&id, turn, prompt, step);
-        }
+        self.enqueue_prompt(&id, turn, prompt, step);
     }
 
     fn handle_continue_run(
@@ -139,7 +102,7 @@ impl TeamRuntime {
         if let Some(legacy) = &run.legacy_mode {
             step.events.push(RuntimeEvent::Notice(format!(
                 "{} is from an older Asterline (mode \"{legacy}\") — start a fresh run",
-                run.id
+                run.label()
             )));
             return;
         }
@@ -196,8 +159,8 @@ impl TeamRuntime {
         self.failed_runs.remove(&run.id);
 
         let display_body = match &note {
-            Some(note) => format!("/continue {} {note}", run.id),
-            None => format!("/continue {}", run.id),
+            Some(note) => format!("/continue {} {note}", run.label()),
+            None => format!("/continue {}", run.label()),
         };
         if let Err(err) =
             self.store
@@ -215,12 +178,12 @@ impl TeamRuntime {
         });
         self.log(
             &id,
-            LogEntry::info("user", format!("team {} continued → {id}", run.id)),
+            LogEntry::info("user", format!("team {} continued → {id}", run.label())),
             step,
         );
         step.events.push(RuntimeEvent::Notice(format!(
             "team {} continued → {id}",
-            run.id
+            run.label()
         )));
 
         let verification = run.verification.as_ref().map(|v| {
@@ -237,6 +200,7 @@ impl TeamRuntime {
             verification,
             note.as_deref(),
             false,
+            self.team_allows_add_members(),
         );
         self.run_turns.insert(turn, run.id);
         self.enqueue_prompt(&id, turn, prompt, step);
@@ -253,81 +217,8 @@ impl TeamRuntime {
             .join(", ")
     }
 
-    /// Finish a non-mode-session run turn: team runs may auto-verify; others Done.
+    /// Finish a non-mode-session run turn.
     fn finish_plain_or_team_run(&mut self, run_id: RunId, step: &mut RuntimeStep) -> bool {
-        let run = match self.store.run(run_id) {
-            Ok(run) => run,
-            Err(err) => {
-                self.report_store_error("load the finishing run", err, step);
-                return false;
-            }
-        };
-        let is_team = run
-            .mode
-            .as_ref()
-            .is_some_and(|mode| mode.mode == CollabMode::Team);
-        if is_team {
-            let limits = resolve_team_limits(&self.effective_config()).unwrap_or_default();
-            if limits.auto_verify
-                && let Some(cmd) = resolve_verify_command(
-                    limits.verify_command.as_deref(),
-                    suggested_verify_command(&self.config.workspace),
-                )
-            {
-                // Persist iteration/max_iterations (and verifying phase) before the UI event.
-                let mut status = run
-                    .mode
-                    .as_ref()
-                    .map(|m| m.state.clone())
-                    .unwrap_or_default();
-                if status.iteration == 0 {
-                    status.iteration = 1;
-                }
-                if status.max_iterations == 0 {
-                    status.max_iterations = limits.max_iterations;
-                }
-                status.phase = "verifying".to_string();
-                let json = match serde_json::to_string(&status) {
-                    Ok(json) => json,
-                    Err(err) => {
-                        step.events.push(RuntimeEvent::Notice(format!(
-                            "could not encode team verification state: {err}"
-                        )));
-                        return false;
-                    }
-                };
-                match self.store.update_run_mode_state(run_id, &json) {
-                    Ok(updated) => step
-                        .events
-                        .push(RuntimeEvent::RunUpdated { run: updated }),
-                    Err(err) => {
-                        self.report_store_error("save team verification state", err, step);
-                        return false;
-                    }
-                }
-                match self
-                    .store
-                    .update_run_status(run_id, RunStatus::Verifying)
-                {
-                    Ok(updated) => step
-                        .events
-                        .push(RuntimeEvent::RunUpdated { run: updated }),
-                    Err(err) => {
-                        self.report_store_error("save team verification status", err, step);
-                        return false;
-                    }
-                }
-                step.events
-                    .push(RuntimeEvent::Notice(format!("verifying {run_id}: {cmd}")));
-                step.verify_actions.push(VerifyAction {
-                    run_id,
-                    command: cmd,
-                    workspace: self.config.workspace.clone(),
-                    cancel: Arc::new(AtomicBool::new(false)),
-                });
-                return true;
-            }
-        }
         match self.store.update_run_status(run_id, RunStatus::Done) {
             Ok(updated) => {
                 step.events.push(RuntimeEvent::RunUpdated { run: updated });
@@ -443,6 +334,7 @@ impl TeamRuntime {
             Some((command, false, summary)),
             None,
             true,
+            self.team_allows_add_members(),
         );
         self.run_turns.insert(turn, run.id);
         self.enqueue_prompt(&id, turn, prompt, step);
@@ -498,66 +390,6 @@ impl TeamRuntime {
                 "could not mark run blocked: {err}"
             ))),
         }
-    }
-
-    fn handle_verify_run(
-        &mut self,
-        run_id: Option<RunId>,
-        command: Option<String>,
-        step: &mut RuntimeStep,
-    ) {
-        let Some(run) = self.run_or_latest(run_id, "verify", step) else {
-            return;
-        };
-        // The mode engine owns verification for live sessions; a manual /verify
-        // mid-phase would fight the FSM over the run status.
-        if self.mode_sessions.contains_key(&run.id)
-            || self.run_turns.values().any(|active| *active == run.id)
-        {
-            step.events.push(RuntimeEvent::Notice(format!(
-                "{} is an active mode run — press Esc to cancel it before manual verification",
-                run.id
-            )));
-            return;
-        }
-        if run.status == RunStatus::Verifying {
-            step.events.push(RuntimeEvent::Notice(format!(
-                "{} is already verifying",
-                run.id
-            )));
-            return;
-        }
-        let command = command
-            .or_else(|| suggested_verify_command(&self.config.workspace).map(ToString::to_string));
-        let Some(command) = command else {
-            step.events.push(RuntimeEvent::Notice(
-                "no verification command found (pass /verify [run-id] <command>)".to_string(),
-            ));
-            return;
-        };
-
-        let run_id = run.id;
-        let updated = match self
-            .store
-            .update_run_status(run_id, RunStatus::Verifying)
-        {
-            Ok(run) => run,
-            Err(err) => {
-                self.report_store_error("start verification", err, step);
-                return;
-            }
-        };
-        step.events.push(RuntimeEvent::RunUpdated { run: updated });
-        step.events.push(RuntimeEvent::Notice(format!(
-            "verifying {}: {command}",
-            run_id
-        )));
-        step.verify_actions.push(VerifyAction {
-            run_id,
-            command,
-            workspace: self.config.workspace.clone(),
-            cancel: Arc::new(AtomicBool::new(false)),
-        });
     }
 
     fn handle_add_run_step(
@@ -740,11 +572,11 @@ impl TeamRuntime {
         step: &mut RuntimeStep,
     ) -> Option<RunSummary> {
         match run_id {
-            Some(id) => match self.store.active_run(id) {
+            Some(id) => match self.store.resolve_run_ref(id) {
                 Ok(run) => Some(run),
                 Err(_) => {
                     step.events
-                        .push(RuntimeEvent::Notice(format!("{id} was not found")));
+                        .push(RuntimeEvent::Notice(format!("run-{} was not found", id.0)));
                     None
                 }
             },
@@ -960,16 +792,17 @@ fn team_checklist_requirements() -> &'static str {
      3. Before ending your turn, ensure every step is done or blocked and post a final outcome summary."
 }
 
-fn team_start_prompt(goal: &str, teammates: &str) -> String {
+fn team_start_prompt(goal: &str, teammates: &str, allow_add_members: bool) -> String {
     format!(
         "Coordinate this goal with the Asterline team.\n\nGoal: {goal}\n\n\
          {}\n\
+         {}\n\
          {}\n\n\
          Plan the work, emit the checklist first, then delegate to teammates through the team protocol. \
-         Add a teammate first if the roster lacks a needed specialty. \
          Teammates: {}.",
         team_skill_hint(),
         team_checklist_requirements(),
+        team_roster_policy(allow_add_members),
         teammates
     )
 }
@@ -984,6 +817,7 @@ fn team_continue_prompt(
     verification: Option<(&str, bool, &str)>,
     note: Option<&str>,
     verify_repair: bool,
+    allow_add_members: bool,
 ) -> String {
     let verification = verification
         .map(|(command, ok, summary)| {
@@ -1004,10 +838,20 @@ fn team_continue_prompt(
     format!(
         "Continue team run {run_id}.\n\nGoal: {goal}\nCurrent status: {status}{verification}{note}{repair}\n\n\
          {}\n\
+         {}\n\
          {}\n\n\
          Review the current state, continue the plan, delegate through the team protocol, \
-         and report what changed. If the roster lacks a needed specialty, add a teammate first.",
+         and report what changed.",
         team_skill_hint(),
-        team_checklist_requirements()
+        team_checklist_requirements(),
+        team_roster_policy(allow_add_members)
     )
+}
+
+fn team_roster_policy(allow_add_members: bool) -> &'static str {
+    if allow_add_members {
+        "You may add a teammate with @@team_member if the roster lacks a specialty; they join immediately."
+    } else {
+        "The roster is locked to the current teammates. Do not emit @@team_member."
+    }
 }

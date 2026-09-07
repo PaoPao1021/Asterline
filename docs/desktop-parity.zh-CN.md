@@ -1,6 +1,6 @@
 # 桌面端功能对齐清单
 
-> 状态：**0.3.0** — 下表中的每一项 TUI 工作台能力都同时具备 GUI 入口、命令入口和自动化验收用例。对齐基准为上游 Asterline `v1.0.1`（`e94e357`）。
+> 状态：**开发中（v1.0.4 对齐）** — 对齐基准为上游 Asterline `v1.0.4` 之后的最新主干（`93746b9`）。
 
 Asterline Desktop 与 TUI 共享同一功能契约：命令解析、命令目录、补全与定向 Skill 调用规范位于 UI 无关的 Rust 模块 `src/contract`，两端共同消费。桌面端不再用 TypeScript 重复解析；WebView 通过宿主 IPC（`parse_composer_text`）获得与 TUI 相同的解析结果。
 
@@ -19,7 +19,7 @@ Asterline Desktop 与 TUI 共享同一功能契约：命令解析、命令目录
 | `/import` / `@member /import` | 侧栏“导入原生会话” | `import_session` | `session_adapter::tests` |
 | `/export [claude]` | 侧栏导出按钮 | `export_session` | 同上 |
 | `/approve` `/reject` | 审批卡按钮 | `approve_first` → `approve` | `App.test.tsx` 审批流 |
-| `/continue` `/note` `/block` `/verify` | Runs 面板对应操作 | `continue_run` 等 | `contract.test.ts`、e2e |
+| `/continue` `/note` `/block` | Runs 面板对应操作；`/verify` 与引擎验证已按 v1.0.2 移除 | `continue_run` 等 | `contract.test.ts`、e2e |
 | `/step` 全部子命令 | Runs 面板步骤编辑（状态/负责人/新增/删除） | `run_*` 命令 | 参数缺失/非法 run ID 测试 |
 | `/mode <mode>` | 模式切换按钮 | `set_mode` | e2e 面板切换模式 |
 | `/find` | 工具抽屉 Find 页 | `ComposerAction::find` | `App.test.tsx` |
@@ -46,7 +46,10 @@ Asterline Desktop 与 TUI 共享同一功能契约：命令解析、命令目录
 | 保存为团队默认 | “保存为团队默认” | mock 命令路径（运行时与 TUI 共用实现） |
 | 重置覆盖 | “重置覆盖” | `bridge::clear_mode_overrides` |
 | 直接启动模式运行 | 面板任务框 | mock `run_mode`、适配器校验 |
-| Plan `builder` / `auto_execute` | 设置→模式→Plan；面板旋钮 | `plan_mode_builder_and_auto_execute_round_trip` |
+| Plan `builder` / `auto_execute` | 设置→模式→Plan；面板旋钮 | `current_mode_fields_round_trip` |
+| Review `reviewer_hint` | 设置→模式→Review；面板旋钮 | `current_mode_fields_round_trip`、`ModePanel.test.tsx` |
+| Team `allow_add_members` | 设置→模式→Team；面板旋钮 | 同上 |
+| `/new` 保留模式覆盖；Run 显示会话内编号 | 模式状态保留，Runs 使用 `run-{number}` | 根运行时回归 + 前端渲染 |
 | 未知设置字段原样保存 | —（宿主侧保证） | DTO `#[serde(flatten)] extra` 往返测试 |
 
 ## 3. 团队与会话
@@ -56,7 +59,8 @@ Asterline Desktop 与 TUI 共享同一功能契约：命令解析、命令目录
 | CLI 安装检测 | 设置→General 的 CLI 状态芯片 | `catalog::tests` |
 | 真实模型目录 + 手动输入 + 刷新 | 设置→成员的模型 datalist + 刷新 | mock `list_models`；宿主复用共享 `discover_models` |
 | 原生会话搜索选择 | 设置→成员的会话 datalist | `native_sessions` 模块测试（Claude/Codex/Grok） |
-| 默认目标、完整成员字段、审批策略 | 设置（保留原有面板 + 新增） | `SettingsModal.test.tsx` |
+| 默认目标、完整成员字段、后端原生权限预设 | 设置→成员；Codex/Claude/Grok/Agy 使用各自 CLI 名称 | `SettingsModal.test.tsx`、根权限映射测试 |
+| Codex 原生人工审批（默认关闭） | 设置→审批；高级启动可仅本次开启 | `SettingsModal.test.tsx`、启动项映射测试 |
 | 完整历史搜索（不再只显示前 8 条） | 侧栏搜索框 | e2e 页面快照 |
 | 原生会话导入 | 侧栏导入弹窗（后端 + 成员 + 搜索） | e2e 冒烟 |
 | Claude 格式导出 | 侧栏导出按钮 | `contract.test.ts` |
@@ -69,7 +73,8 @@ Asterline Desktop 与 TUI 共享同一功能契约：命令解析、命令目录
 | `--team` / `--pick-team` | 项目选择器“高级启动” | `launch_options_map_onto_shared_session_options` |
 | `--db` | 高级启动数据库路径 | 同上 |
 | `--no-restore` | 高级启动恢复开关 | 同上 |
-| `--debug`（仅本次启动关闭审批门） | 高级启动两步风险确认 | 风险确认未勾选时无法启动 |
+| `--debug`（仅开发诊断） | 高级启动开关；不再隐式改变审批 | 启动项映射测试 |
+| `--manual-approvals` | 高级启动“人工审批 Codex 工具请求” | 启动项映射测试 |
 | `--fake`（仅本次启动） | 高级启动离线假代理 | 同上 |
 | `--no-auto-update` | 桌面默认手动检查；可自愿开启 | `to_session_options` 测试 |
 | `--banner` | 不适用（终端装饰，有意不复制） | — |
@@ -80,9 +85,9 @@ Asterline Desktop 与 TUI 共享同一功能契约：命令解析、命令目录
 
 ## 5. 质量门
 
-- 根 crate `cargo test`（含 `contract`、`native_sessions` 与 TUI 回归套件）— 966 通过。
+- 根 crate `cargo test`（含 `contract`、`native_sessions` 与 TUI 回归套件）— 995 项。
 - 根 crate 与 `desktop/src-tauri` 的 `cargo clippy` 干净。
-- `desktop/src-tauri` `cargo test` — 59 通过（桥接 V2、适配器、解析、附件、启动项）。
-- `pnpm lint`（严格 TS）、`pnpm test`（36 个 Vitest）、`pnpm build`。
-- `pnpm test:e2e` — 6 个 Playwright 场景（主流程、面板/工具、设置持久化、队列拉回、命令面板、Runs 面板）。
+- `desktop/src-tauri` `cargo test` — 60 项（桥接 V2、适配器、解析、附件、启动项）。
+- `pnpm lint`（严格 TS）、`pnpm test`（46 个 Vitest）、`pnpm build`。
+- `pnpm test:e2e` — 9 个 Playwright 场景（主流程、无障碍、面板/工具、设置持久化、队列拉回、命令面板、Runs 面板）。
 - 三平台冒烟（剪贴板图片、外部终端 attach、路径、锁冲突、诊断、安装包启动）按 `docs/real-smoke.md` 随发布执行。

@@ -47,7 +47,7 @@ describe("composer contract via the bridge parser (mock mirror)", () => {
   });
 
   it("surfaces the suggested verify command and structured mode state", () => {
-    expect(demoSnapshot.suggested_verify).toBe("cargo test --locked");
+    expect(demoSnapshot.suggested_verify).toBeNull();
     expect(demoSnapshot.runs[0].mode?.state.phase).toBe("implementing");
     expect(demoSnapshot.runs[0].mode?.state.max_iterations).toBe(4);
   });

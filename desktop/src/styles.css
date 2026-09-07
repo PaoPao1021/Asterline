@@ -1049,8 +1049,10 @@ button,
 .palette-list small { color: var(--muted); font-size: 8px; text-transform: uppercase; letter-spacing: .4px; }
 .palette-empty { padding: 12px; color: var(--muted); font-size: 11px; }
 .mode-panel-tabs { display: flex; gap: 6px; padding: 0 16px 10px; }
-.mode-panel-tabs span { padding: 5px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--muted); font-size: 11px; }
-.mode-panel-tabs span.active { color: var(--accent-strong); border-color: var(--accent); background: var(--accent-faint); }
+.mode-panel-tabs button { padding: 5px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--muted); background: transparent; font: inherit; font-size: 11px; cursor: pointer; }
+.mode-panel-tabs button:hover:not(:disabled) { color: var(--text-strong); border-color: color-mix(in srgb, var(--accent) 50%, var(--border)); }
+.mode-panel-tabs button.active { color: var(--accent-strong); border-color: var(--accent); background: var(--accent-faint); }
+.mode-panel-tabs button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .mode-panel-modal h3 { margin: 8px 16px 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
 .mode-knobs { margin: 0 16px; border-collapse: collapse; }
 .mode-knobs th { padding: 5px 10px 5px 0; color: var(--text-strong); font-size: 11px; text-align: left; }
@@ -1090,6 +1092,11 @@ button,
 .run-events li { padding: 6px 2px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 11px; }
 .run-events time { float: right; color: var(--faint); font-size: 9px; }
 .runs-empty { padding: 14px 16px; color: var(--faint); font-size: 12px; }
+.approval-native-card { display: grid; gap: 10px; }
+.approval-native-card p, .settings-compat-note { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
+
+/* Let the WebView skip layout and paint for long off-screen transcript rows. */
+.timeline-list > * { content-visibility: auto; contain-intrinsic-size: auto 120px; }
 .session-import-controls { display: flex; gap: 8px; padding: 0 16px 10px; }
 .session-import-controls select, .session-import-controls input { padding: 7px 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-muted); color: var(--text); font-size: 11px; }
 .session-import-controls select { width: 110px; }

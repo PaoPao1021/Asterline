@@ -442,6 +442,61 @@ fn brainstorm_structured_cards_are_rendered_and_persisted() {
 }
 
 #[test]
+fn brainstorm_discards_cards_beyond_ideas_per_round() {
+    let mut rt = plan_runtime();
+    rt.config.modes.brainstorm = Some(BrainstormModeConfig {
+        ideas_per_round: Some(3),
+        ..BrainstormModeConfig::default()
+    });
+    let planner = MemberId::new("planner");
+    let start = rt.on_ui_command(run_brainstorm("cap extras"));
+    assert!(
+        start
+            .actions
+            .iter()
+            .all(|action| action.prompt.contains("exactly 3")
+                && action.prompt.contains("no more")
+                && !action.prompt.contains("at least 3"))
+    );
+    let run_id = find_run_id(&start);
+    let completed = rt.on_agent_event(
+        &planner,
+        AgentEvent::MessageCompleted(
+            (1..=5)
+                .map(|n| {
+                    format!(
+                        "@@brainstorm_card {{\"title\":\"Idea {n}\",\"proposal\":\"p{n}\",\"mechanism\":\"m{n}\",\"operation\":\"SEED\",\"sources\":[]}}"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+    );
+    assert!(completed.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::Notice(text)
+            if text.contains("2 extra brainstorm card") && text.contains("kept 3")
+    )));
+    let rendered = completed
+        .events
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::MessageCompleted { text, .. } => Some(text),
+            _ => None,
+        })
+        .expect("rendered message");
+    assert!(rendered.contains("### Card 3 · Idea 3"));
+    assert!(!rendered.contains("### Card 4"));
+    let state: serde_json::Value =
+        serde_json::from_str(&rt.store.run_mode_state(run_id).unwrap().unwrap()).unwrap();
+    assert_eq!(state["idea_count"], 3);
+    assert_eq!(
+        state["idea_batches"][0]["cards"].as_array().unwrap().len(),
+        3
+    );
+}
+
+#[test]
 fn brainstorm_retries_append_changed_ideas_without_duplicating_exact_replays() {
     let mut rt = plan_runtime();
     let planner = MemberId::new("planner");
@@ -801,7 +856,8 @@ fn brainstorm_respects_configured_generation_budget() {
         start
             .actions
             .iter()
-            .all(|action| action.prompt.contains("at least 6"))
+            .all(|action| action.prompt.contains("exactly 6")
+                && !action.prompt.contains("at least 6"))
     );
     let stretch = complete_all(
         &mut rt,
@@ -947,7 +1003,7 @@ fn continue_refuses_legacy_roundtable_mode() {
         step.events.iter().any(|e| matches!(
             e,
             RuntimeEvent::Notice(text)
-                if text.contains(&run.id.to_string())
+                if text.contains(&run.label())
                     && text.contains("older Asterline")
                     && text.contains("roundtable")
         )),
@@ -989,6 +1045,83 @@ fn plan_resume_after_abort_redispatches_leader() {
 }
 
 #[test]
+fn plan_keeps_going_when_a_member_is_denied_a_command() {
+    let mut rt = plan_runtime();
+    let planner = MemberId::new("planner");
+    let builder = MemberId::new("builder");
+    let reviewer = MemberId::new("reviewer");
+
+    let step = rt.on_ui_command(run_plan("permission deny must not block"));
+    let run_id = find_run_id(&step);
+    complete_ok(
+        &mut rt,
+        &planner,
+        "@@run_step {\"action\":\"add\",\"owner\":\"builder\",\"title\":\"Build the game\"}",
+    );
+    complete_ok(
+        &mut rt,
+        &reviewer,
+        "@@review {\"verdict\":\"approve\",\"summary\":\"ready\"}",
+    );
+    assert_eq!(latest_run(&rt).status, RunStatus::Running);
+
+    let mut step = rt.on_agent_event(
+        &builder,
+        AgentEvent::ToolCompleted {
+            id: "agy-step-4".into(),
+            ok: false,
+            summary: "User denied permission to run command:\n  node -c snake-game/game.js".into(),
+        },
+    );
+    let fatal = rt.on_agent_event(
+        &builder,
+        AgentEvent::Fatal(
+            "User denied permission to run command: node -c snake-game/game.js".into(),
+        ),
+    );
+    let exit = rt.on_agent_event(
+        &builder,
+        AgentEvent::Exited {
+            code: Some(1),
+            ok: false,
+        },
+    );
+    step.events.extend(fatal.events);
+    step.actions.extend(fatal.actions);
+    step.events.extend(exit.events);
+    step.actions.extend(exit.actions);
+    assert!(
+        !rt.failed_runs.contains(&run_id),
+        "a denied command is not a failed member run"
+    );
+    assert_eq!(
+        rt.store.run(run_id).unwrap().status,
+        RunStatus::Running,
+        "plan must stay running after a permission denial"
+    );
+    assert!(
+        !step.events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RunUpdated { run }
+                if run.id == run_id && run.status == RunStatus::Blocked
+        )),
+        "plan must not block: {:?}",
+        step.events
+    );
+    assert!(
+        step.events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::Notice(text)
+                if text.contains("denied permission to run")
+                    && text.contains("node -c snake-game/game.js")
+                    && text.contains("the run continues")
+        )),
+        "expected a notice that names the denied command: {:?}",
+        step.events
+    );
+}
+
+#[test]
 fn continue_refuses_when_mode_member_left_roster() {
     let mut rt = runtime();
     let step = rt.on_ui_command(run_mode("review this"));
@@ -1020,22 +1153,4 @@ fn continue_refuses_when_mode_member_left_roster() {
         RunStatus::Blocked,
         "the run stays blocked instead of half-resuming"
     );
-}
-
-#[test]
-fn manual_verify_on_active_mode_run_is_refused() {
-    let mut rt = runtime();
-    let step = rt.on_ui_command(run_mode("review this"));
-    let run_id = find_run_id(&step);
-
-    let step = rt.on_ui_command(UiCommand::VerifyRun {
-        run_id: Some(run_id),
-        command: Some("true".to_string()),
-    });
-
-    assert!(step.events.iter().any(|e| matches!(
-        e,
-        RuntimeEvent::Notice(text) if text.contains("active mode run")
-    )));
-    assert!(step.verify_actions.is_empty());
 }

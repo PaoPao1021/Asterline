@@ -8,13 +8,13 @@ import type {
   ModelSummary,
   NativeSessionSummary,
   PermissionMode,
-  SandboxPolicy,
   TeamMemberSettingsV2,
   TeamSettingsV2,
 } from "../bridge/types";
 import type { Translate } from "../i18n";
 import { Dropdown } from "./Dropdown";
 import { AlertIcon, ApprovalIcon, CheckIcon, ModeIcon, PlusIcon, RefreshIcon, SettingsIcon, UsersIcon, XIcon } from "./Icons";
+import { useDialogFocus } from "./useDialogFocus";
 
 type SettingsTab = "general" | "members" | "approvals" | "modes";
 
@@ -120,6 +120,61 @@ function effortsFor(backend: BackendKind): TeamMemberSettingsV2["effort"][] {
   return ["low", "medium", "high", "xhigh", "max"];
 }
 
+function backendDefaults(backend: BackendKind): Partial<TeamMemberSettingsV2> {
+  if (backend === "codex") return { sandbox: "workspace-write", permission_mode: "auto", approvals_reviewer: "user" };
+  if (backend === "claude") return { sandbox: "read-only", permission_mode: "acceptEdits", approvals_reviewer: "user" };
+  if (backend === "grok") return { sandbox: "workspace-write", permission_mode: "auto", approvals_reviewer: "user" };
+  return { sandbox: "workspace-write", permission_mode: "acceptEdits", approvals_reviewer: "user" };
+}
+
+function nativePermissionValue(member: TeamMemberSettingsV2): string {
+  if (member.backend === "codex") {
+    if (member.sandbox === "read-only") return "read-only";
+    if (member.sandbox === "danger-full-access") return "full-access";
+    return member.approvals_reviewer === "auto_review" ? "approve-for-me" : "ask-for-approval";
+  }
+  if (member.backend === "grok") {
+    if (member.permission_mode === "bypassPermissions") return "always-approve";
+    return member.permission_mode === "auto" || member.permission_mode === "plan" ? member.permission_mode : "default";
+  }
+  if (member.backend === "agy") {
+    if (member.sandbox === "read-only" || member.permission_mode === "plan") return "plan";
+    if (member.permission_mode === "bypassPermissions") return "dangerously-skip-permissions";
+    return member.permission_mode === "acceptEdits" ? "accept-edits" : "cli-default";
+  }
+  return member.permission_mode ?? "default";
+}
+
+function nativePermissionOptions(backend: BackendKind): Array<{ value: string; label: string }> {
+  if (backend === "codex") return [
+    { value: "read-only", label: "Read Only" },
+    { value: "ask-for-approval", label: "Ask for approval" },
+    { value: "approve-for-me", label: "Approve for me" },
+    { value: "full-access", label: "Full Access" },
+  ];
+  if (backend === "grok") return ["default", "auto", "plan", "always-approve"].map((value) => ({ value, label: value }));
+  if (backend === "agy") return ["cli-default", "accept-edits", "plan", "dangerously-skip-permissions"].map((value) => ({ value, label: value }));
+  return ["default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"].map((value) => ({ value, label: value }));
+}
+
+function nativePermissionPatch(backend: BackendKind, value: string): Partial<TeamMemberSettingsV2> {
+  if (backend === "codex") {
+    if (value === "read-only") return { sandbox: "read-only", permission_mode: "auto", approvals_reviewer: "user" };
+    if (value === "approve-for-me") return { sandbox: "workspace-write", permission_mode: "auto", approvals_reviewer: "auto_review" };
+    if (value === "full-access") return { sandbox: "danger-full-access", permission_mode: "dontAsk", approvals_reviewer: "user" };
+    return { sandbox: "workspace-write", permission_mode: "auto", approvals_reviewer: "user" };
+  }
+  if (backend === "grok") return {
+    sandbox: value === "always-approve" ? "danger-full-access" : "workspace-write",
+    permission_mode: value === "default" ? null : value === "always-approve" ? "bypassPermissions" : value as PermissionMode,
+  };
+  if (backend === "agy") return {
+    sandbox: value === "plan" ? "read-only" : value === "dangerously-skip-permissions" ? "danger-full-access" : "workspace-write",
+    permission_mode: value === "cli-default" ? null : value === "accept-edits" ? "acceptEdits" : value === "dangerously-skip-permissions" ? "bypassPermissions" : "plan",
+  };
+  return { permission_mode: value === "default" ? null : value as PermissionMode };
+}
+
 function Field({ label, help, children, wide }: { label: string; help?: string; children: React.ReactNode; wide?: boolean }) {
   return <label className={`settings-field ${wide ? "field-wide" : ""}`}><span>{label}</span>{children}{help && <small>{help}</small>}</label>;
 }
@@ -215,13 +270,12 @@ function MembersSettings({ draft, setDraft, t }: { draft: TeamSettingsV2; setDra
         <div className="settings-grid">
           <Field label={t("displayName")}><input aria-label={t("displayName")} value={member.display_name} onChange={(event) => update({ display_name: event.target.value })} /></Field>
           <Field label={t("memberId")}><input aria-label={t("memberId")} value={member.id} onChange={(event) => { const id = event.target.value; setDraft((value) => replaceMemberReference({ ...value, members: value.members.map((item, index) => index === memberIndex ? patchMember(item, { id }) : item) }, member.id, id)); setSelected(id); }} /></Field>
-          <Field label={t("backend")}><Dropdown label={t("backend")} value={member.backend} onChange={(next) => { const backend = next as BackendKind; const effort = effortsFor(backend).includes(member.effort) ? member.effort : null; update({ backend, effort }); }} options={["codex", "claude", "grok", "agy"].map((value) => ({ value, label: value }))} /></Field>
+          <Field label={t("backend")}><Dropdown label={t("backend")} value={member.backend} onChange={(next) => { const backend = next as BackendKind; const effort = effortsFor(backend).includes(member.effort) ? member.effort : null; update({ backend, effort, model: null, session_id: null, ...backendDefaults(backend) }); }} options={["codex", "claude", "grok", "agy"].map((value) => ({ value, label: value }))} /></Field>
           <Field label={t("role")}><input value={member.role} onChange={(event) => update({ role: event.target.value })} /></Field>
           <Field label={t("model")} help={t("manualModel")}><input list={`models-${member.id}`} value={member.model ?? ""} placeholder="default" onChange={(event) => update({ model: event.target.value || null })} /><datalist id={`models-${member.id}`}>{models.map((model) => <option key={model.id} value={model.id}>{model.description ?? model.name}</option>)}</datalist></Field>
           <Field label={t("modelCatalog")}><button type="button" className="secondary-button" onClick={() => void refreshCatalog()}><RefreshIcon size={13} />{t("refreshModels")}</button><small>{t("refreshModelsHint")}</small></Field>
           <Field label={t("effort")}><Dropdown label={t("effort")} value={member.effort ?? ""} onChange={(next) => update({ effort: (next || null) as TeamMemberSettingsV2["effort"] })} options={[{ value: "", label: "default" }, ...effortsFor(member.backend).map((value) => ({ value: String(value), label: String(value) }))]} /></Field>
-          <Field label={t("sandbox")}><Dropdown label={t("sandbox")} value={member.sandbox} onChange={(next) => update({ sandbox: next as SandboxPolicy })} options={["read-only", "workspace-write", "danger-full-access"].map((value) => ({ value, label: value }))} /></Field>
-          <Field label={t("permissionMode")}><Dropdown label={t("permissionMode")} value={member.permission_mode ?? ""} onChange={(next) => update({ permission_mode: (next || null) as PermissionMode | null })} options={[{ value: "", label: "default" }, ...["default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"].map((value) => ({ value, label: value }))]} /></Field>
+          <Field label={t("nativePermissions")} help={t("nativePermissionsHelp")}><Dropdown label={t("nativePermissions")} value={nativePermissionValue(member)} onChange={(next) => update(nativePermissionPatch(member.backend, next))} options={nativePermissionOptions(member.backend)} /></Field>
           <Field label={t("cwd")} wide><input value={member.cwd ?? ""} placeholder={draft.workspace} onChange={(event) => update({ cwd: event.target.value || null })} /></Field>
           <Field label={t("allowedTools")} help={t("allowedToolsHelp")} wide><input value={member.allowed_tools.join(", ")} onChange={(event) => update({ allowed_tools: event.target.value.split(",").map((value) => value.trim()).filter(Boolean) })} /></Field>
           <Field label={t("sessionPolicy")}><Dropdown label={t("sessionPolicy")} value={member.session_policy} onChange={(next) => update({ session_policy: next as "resume" | "fresh" })} options={[{ value: "resume", label: "resume" }, { value: "fresh", label: "fresh" }]} /></Field>
@@ -233,32 +287,15 @@ function MembersSettings({ draft, setDraft, t }: { draft: TeamSettingsV2; setDra
   );
 }
 
-function keywordText(keywords: Record<string, string[]>): string {
-  return Object.entries(keywords).map(([name, values]) => `${name}: ${values.join(", ")}`).join("\n");
-}
-
-function parseKeywords(value: string): Record<string, string[]> {
-  const result: Record<string, string[]> = {};
-  value.split("\n").forEach((line) => {
-    const [name, rest] = line.split(":", 2);
-    if (name?.trim() && rest?.trim()) result[name.trim()] = rest.split(",").map((word) => word.trim()).filter(Boolean);
-  });
-  return result;
-}
-
 function ApprovalsSettings({ policy, onChange, t }: { policy: ApprovalPolicyV2; onChange: (policy: ApprovalPolicyV2) => void; t: Translate }) {
-  const toggle = <T extends string,>(values: T[] | null | undefined, value: T, defaults: T[]): T[] => {
-    const current = values ?? defaults;
-    return current.includes(value) ? current.filter((item) => item !== value) : [...current, value];
-  };
-  const gates = policy.gate ?? ["git", "shell", "file"];
-  const surfaces = policy.apply_to ?? ["user", "relay", "mode"];
   return (
     <div className="settings-pane">
       <div className="pane-intro"><h3>{t("approvals")}</h3><p>{t("gateHelp")}</p></div>
-      <div className="settings-block"><strong>{t("gateCategories")}</strong><div className="check-grid">{["git", "shell", "file"].map((gate) => <label key={gate}><input type="checkbox" checked={gates.includes(gate)} onChange={() => onChange({ ...policy, gate: toggle(policy.gate, gate, ["git", "shell", "file"]) })} /><span><CheckIcon size={12} /></span>{gate}</label>)}</div></div>
-      <div className="settings-block"><strong>{t("surfaces")}</strong><div className="check-grid">{(["user", "relay", "mode"] as const).map((surface) => <label key={surface}><input type="checkbox" checked={surfaces.includes(surface)} onChange={() => onChange({ ...policy, apply_to: toggle(policy.apply_to, surface, ["user", "relay", "mode"]) })} /><span><CheckIcon size={12} /></span>{surface}</label>)}</div></div>
-      <Field label={t("customKeywords")} help={t("keywordHelp")} wide><textarea rows={7} value={keywordText(policy.keywords)} placeholder="deploy: publish, release" onChange={(event) => onChange({ ...policy, keywords: parseKeywords(event.target.value) })} /></Field>
+      <div className="settings-block approval-native-card">
+        <label className="switch-field"><input type="checkbox" checked={policy.manual ?? false} onChange={(event) => onChange({ ...policy, manual: event.target.checked })} /><span />{t("manualApprovals")}</label>
+        <p>{t("manualApprovalsHint")}</p>
+      </div>
+      <p className="settings-compat-note">{t("legacyApprovalNote")}</p>
     </div>
   );
 }
@@ -279,8 +316,7 @@ function ModesSettings({ modes, members, onChange, t }: { modes: ModesConfigV2; 
         <SelectMember label={t("builder")} value={review.builder} members={members} onChange={(builder) => onChange({ ...modes, review: { ...review, builder } })} />
         <SelectMember label={t("reviewer")} value={review.reviewer} members={members} onChange={(reviewer) => onChange({ ...modes, review: { ...review, reviewer } })} />
         <Field label={t("maxIterations")}><input type="number" min={1} value={review.max_iterations ?? 3} onChange={(event) => onChange({ ...modes, review: { ...review, max_iterations: Number(event.target.value) } })} /></Field>
-        <Field label={t("verifyCommand")}><input value={review.verify_command ?? ""} onChange={(event) => onChange({ ...modes, review: { ...review, verify_command: event.target.value || null } })} /></Field>
-        <label className="switch-field"><input type="checkbox" checked={review.auto_verify ?? true} onChange={(event) => onChange({ ...modes, review: { ...review, auto_verify: event.target.checked } })} /><span />{t("autoVerify")}</label>
+        <Field label={t("reviewerHintLabel")} wide><textarea rows={3} value={review.reviewer_hint ?? ""} onChange={(event) => onChange({ ...modes, review: { ...review, reviewer_hint: event.target.value || null } })} /></Field>
       </ModeCard>
       <ModeCard title={t("plan")}>
         <SelectMember label={t("leader")} value={plan.leader} members={members} onChange={(leader) => onChange({ ...modes, plan: { ...plan, leader } })} />
@@ -288,8 +324,6 @@ function ModesSettings({ modes, members, onChange, t }: { modes: ModesConfigV2; 
         <SelectMember label={t("reviewer")} value={plan.reviewer} members={members} onChange={(reviewer) => onChange({ ...modes, plan: { ...plan, reviewer } })} />
         <Field label={t("maxIterations")}><input type="number" min={1} value={plan.max_iterations ?? 3} onChange={(event) => onChange({ ...modes, plan: { ...plan, max_iterations: Number(event.target.value) } })} /></Field>
         <label className="switch-field"><input type="checkbox" checked={plan.auto_execute ?? false} onChange={(event) => onChange({ ...modes, plan: { ...plan, auto_execute: event.target.checked } })} /><span />{t("planAutoExecute")}</label>
-        <Field label={t("verifyCommand")}><input value={plan.verify_command ?? ""} onChange={(event) => onChange({ ...modes, plan: { ...plan, verify_command: event.target.value || null } })} /></Field>
-        <label className="switch-field"><input type="checkbox" checked={plan.auto_verify ?? true} onChange={(event) => onChange({ ...modes, plan: { ...plan, auto_verify: event.target.checked } })} /><span />{t("autoVerify")}</label>
       </ModeCard>
       <ModeCard title={t("brainstorm")}>
         <Field label={t("participants")} wide><div className="participant-grid">{members.map((member) => { const selected = (brainstorm.participants ?? members.map(({ id }) => id)).includes(member.id); return <label key={member.id}><input type="checkbox" checked={selected} onChange={() => { const current = brainstorm.participants ?? members.map(({ id }) => id); const participants = selected ? current.filter((id) => id !== member.id) : [...current, member.id]; onChange({ ...modes, brainstorm: { ...brainstorm, participants } }); }} /><span><CheckIcon size={11} /></span>{member.display_name}</label>; })}</div></Field>
@@ -299,14 +333,14 @@ function ModesSettings({ modes, members, onChange, t }: { modes: ModesConfigV2; 
       <ModeCard title={t("team")}>
         <SelectMember label={t("coordinator")} value={team.coordinator} members={members} onChange={(coordinator) => onChange({ ...modes, team: { ...team, coordinator } })} />
         <Field label={t("maxIterations")}><input type="number" min={1} value={team.max_iterations ?? 3} onChange={(event) => onChange({ ...modes, team: { ...team, max_iterations: Number(event.target.value) } })} /></Field>
-        <Field label={t("verifyCommand")} wide><input value={team.verify_command ?? ""} onChange={(event) => onChange({ ...modes, team: { ...team, verify_command: event.target.value || null } })} /></Field>
-        <label className="switch-field"><input type="checkbox" checked={team.auto_verify ?? true} onChange={(event) => onChange({ ...modes, team: { ...team, auto_verify: event.target.checked } })} /><span />{t("autoVerify")}</label>
+        <label className="switch-field"><input type="checkbox" checked={team.allow_add_members ?? false} onChange={(event) => onChange({ ...modes, team: { ...team, allow_add_members: event.target.checked } })} /><span />{t("allowAddMembersLabel")}</label>
       </ModeCard>
     </div>
   );
 }
 
 export function SettingsModal({ settings, busy, t, onClose, onSave }: SettingsModalProps) {
+  const dialog = useDialogFocus<HTMLElement>();
   const [draft, setDraft] = useState(() => clone(settings));
   const [tab, setTab] = useState<SettingsTab>("general");
   const valid = useMemo(() => validate(draft), [draft]);
@@ -318,11 +352,11 @@ export function SettingsModal({ settings, busy, t, onClose, onSave }: SettingsMo
   }, [busy, onClose]);
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}>
-      <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <section ref={dialog} className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" tabIndex={-1}>
         <header className="settings-header"><div><span className="settings-header-icon"><SettingsIcon /></span><div><h2 id="settings-title">{t("settings")}</h2><p>{draft.name}</p></div></div><button className="icon-button" onClick={onClose} disabled={busy} aria-label={t("close")}><XIcon /></button></header>
         <div className="settings-body">
           <nav className="settings-nav" aria-label={t("settings")}>
-            {(["general", "members", "approvals", "modes"] as SettingsTab[]).map((value) => <button key={value} className={tab === value ? "active" : ""} onClick={() => setTab(value)}>{value === "members" ? <UsersIcon size={16} /> : value === "approvals" ? <ApprovalIcon size={16} /> : value === "modes" ? <ModeIcon size={16} /> : <SettingsIcon size={16} />}{t(value === "members" ? "memberSettings" : value)}</button>)}
+            {(["general", "members", "approvals", "modes"] as SettingsTab[]).map((value) => <button key={value} data-dialog-autofocus={value === tab ? "true" : undefined} className={tab === value ? "active" : ""} onClick={() => setTab(value)}>{value === "members" ? <UsersIcon size={16} /> : value === "approvals" ? <ApprovalIcon size={16} /> : value === "modes" ? <ModeIcon size={16} /> : <SettingsIcon size={16} />}{t(value === "members" ? "memberSettings" : value)}</button>)}
           </nav>
           <main className="settings-content">
             {tab === "general" && <GeneralSettings draft={draft} setDraft={setDraft} t={t} />}

@@ -10,7 +10,7 @@ opened on the same workspace at the same time.
 - Open a project or choose from recent projects.
 - Send messages to a member or the whole team and stream runtime events.
 - Inspect member state, change modes, cancel work, and answer approvals.
-- Browse and continue Runs, start verification, and restore local history.
+- Browse and continue Runs, edit their checklists, and restore local history.
 - Edit the complete team configuration without discarding advanced fields.
 - Open a member's native CLI in an external terminal. Codex and Claude history
   can be imported after the terminal exits; Grok and Agy remain terminal-only
@@ -40,8 +40,8 @@ including `/exit` (graceful shutdown, then window close).
 Highlights on top of the V1.1 drawers:
 
 - **Bridge v2.** `DesktopSnapshotV2` adds conversation-scoped mode overrides,
-  per-member prompt queues, relay pause state, the suggested verify command,
-  and the active conversation. Queue updates and pull-backs are structured
+  per-member prompt queues, relay pause state, and the active conversation.
+  Queue updates and pull-backs are structured
   events. The WebView IPC version is now `2`; SQLite stores, session
   snapshots, and `team.json` keep their on-disk formats.
 - **Queues and images.** Sending while a member runs joins that member's queue
@@ -53,16 +53,17 @@ Highlights on top of the V1.1 drawers:
   apply to this chat, save as team default, reset overrides, direct mode-run
   launch, and lossless plan-mode `builder`/`auto_execute` editing.
 - **Runs panel.** Structured mode-run state, full step editing (status, owner,
-  add, rename, remove), note/block/continue/verify, and event history.
+  add, rename, remove), note/block/continue, conversation-local run numbers,
+  and event history.
 - **Sessions.** Full searchable history, native session import for
   Claude/Codex/Grok with previews, one-click export to Claude format.
 - **Advanced launch.** Team roster file, ask-on-open, custom database path,
-  restore toggle, update-check opt-in, offline fake agents, and a debug mode
-  that disables approval gates behind an explicit risk confirmation. Debug and
-  fake apply to that launch only and are never persisted.
+  restore toggle, update-check opt-in, offline fake agents, developer
+  diagnostics, and an independent native Codex manual-approval switch. These
+  launch options are never persisted.
 - **Themed widgets and a11y.** Every native `<select>` is replaced by a themed,
-  keyboard-complete dropdown; focus visibility is guaranteed application-wide
-  and the app is checked with automated axe scans.
+  keyboard-complete dropdown; dialogs trap and restore keyboard focus, long
+  transcripts skip off-screen paint, and the app is checked with axe scans.
 
 The update check now uses rustls, so the Linux package build no longer needs
 OpenSSL. The full capability matrix (TUI feature → GUI entry → command entry →

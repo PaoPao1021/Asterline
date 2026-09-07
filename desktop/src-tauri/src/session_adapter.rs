@@ -41,10 +41,10 @@ pub struct DesktopLaunchOptionsV2 {
     pub db_path: Option<String>,
     /// Restore the last conversation on open. Desktop defaults to on.
     pub restore: Option<bool>,
-    /// Keep approval gating enabled. `debug` launches may turn it off after an
-    /// explicit risk confirmation in the UI.
-    pub approvals: Option<bool>,
-    /// `--debug`: disables approval gates for this launch only.
+    /// Show native Codex tool asks in the composer instead of auto-approving.
+    #[serde(alias = "approvals")]
+    pub manual_approvals: Option<bool>,
+    /// `--debug`: enables developer diagnostics without changing approvals.
     pub debug: bool,
     /// `--fake`: run offline fake agents instead of real CLIs, this launch only.
     pub fake: bool,
@@ -60,10 +60,7 @@ impl DesktopLaunchOptionsV2 {
             workspace: Some(workspace),
             db_path: self.db_path.as_ref().map(PathBuf::from),
             restore: self.restore.unwrap_or(true),
-            // `--debug` disables the approval gate for this launch only; the
-            // frontend must show an explicit risk confirmation before sending
-            // `debug: true`.
-            approvals: self.approvals.unwrap_or(!self.debug),
+            manual_approvals: self.manual_approvals.unwrap_or(false),
             fake: self.fake,
             pick_team: self.pick_team && self.team_path.is_none(),
             auto_update: self.auto_update.unwrap_or(false),
@@ -355,13 +352,6 @@ pub fn command_to_runtime(
                 reason,
             })
         }
-        DesktopCommandV2::VerifyRun {
-            run_id: id,
-            command,
-        } => Ok(UiCommand::VerifyRun {
-            run_id: run_id(id),
-            command,
-        }),
         DesktopCommandV2::AddRunStep {
             run_id: id,
             owner,
@@ -669,7 +659,7 @@ mod tests {
             pick_team: true,
             db_path: Some("D:\\db\\asterline.sqlite".to_string()),
             restore: Some(false),
-            approvals: None,
+            manual_approvals: None,
             debug: true,
             fake: true,
             auto_update: Some(true),
@@ -685,8 +675,7 @@ mod tests {
             Some(PathBuf::from("D:\\db\\asterline.sqlite"))
         );
         assert!(!session.restore);
-        // `--debug` disables the approval gate for this launch only.
-        assert!(!session.approvals);
+        assert!(!session.manual_approvals);
         assert!(session.fake);
         // An explicit roster file wins over the picker.
         assert!(!session.pick_team);
@@ -694,13 +683,13 @@ mod tests {
 
         let debug_options = DesktopLaunchOptionsV2 {
             debug: false,
-            approvals: Some(true),
+            manual_approvals: Some(true),
             ..Default::default()
         };
         assert!(
             debug_options
                 .to_session_options(PathBuf::from("/w"))
-                .approvals
+                .manual_approvals
         );
     }
 

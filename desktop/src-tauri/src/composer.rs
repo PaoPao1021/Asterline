@@ -252,10 +252,6 @@ fn ui_command_to_desktop(command: UiCommand) -> Option<DesktopCommandV2> {
             run_id: run_id.map(|id| id.0),
             reason,
         },
-        UiCommand::VerifyRun { run_id, command } => DesktopCommandV2::VerifyRun {
-            run_id: run_id.map(|id| id.0),
-            command,
-        },
         UiCommand::AddRunStep {
             run_id,
             owner,
@@ -532,13 +528,6 @@ mod tests {
                 },
             ),
             (
-                "/verify run-7 cargo test",
-                DesktopCommandV2::VerifyRun {
-                    run_id: Some(7),
-                    command: Some("cargo test".to_string()),
-                },
-            ),
-            (
                 "/import builder sess-9",
                 DesktopCommandV2::ImportSession {
                     member: Some("builder".to_string()),
@@ -558,6 +547,10 @@ mod tests {
                 "{text}"
             );
         }
+        assert_eq!(
+            parse_composer_text("/verify cargo test", &members, &[]),
+            ComposerActionV2::Help
+        );
     }
 
     #[test]
@@ -633,7 +626,7 @@ mod tests {
     #[test]
     fn catalog_lists_every_shared_command() {
         let catalog = command_catalog();
-        assert!(catalog.len() >= 24);
+        assert_eq!(catalog.len(), 23);
         assert!(catalog.iter().any(|spec| spec.name == "exit"));
         assert!(catalog.iter().any(|spec| spec.name == "export"));
         assert!(

@@ -212,6 +212,37 @@ fn approvals_track_pending_and_resolve() {
 }
 
 #[test]
+fn pending_approvals_can_be_cycled() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(RuntimeEvent::ApprovalRequested {
+        id: ApprovalId(1),
+        member: None,
+        action: "command".to_string(),
+        body: "first".to_string(),
+    });
+    state.apply(RuntimeEvent::ApprovalRequested {
+        id: ApprovalId(2),
+        member: None,
+        action: "patch".to_string(),
+        body: "second".to_string(),
+    });
+    assert_eq!(
+        state.selected_pending_approval().map(|pending| pending.id),
+        Some(ApprovalId(1))
+    );
+    state.select_next_pending_approval();
+    assert_eq!(
+        state.selected_pending_approval().map(|pending| pending.id),
+        Some(ApprovalId(2))
+    );
+    state.select_next_pending_approval();
+    assert_eq!(
+        state.selected_pending_approval().map(|pending| pending.id),
+        Some(ApprovalId(1))
+    );
+}
+
+#[test]
 fn member_status_drives_running_count() {
     let mut state = AppState::new(Vec::new());
     state.apply(ready());
@@ -462,6 +493,7 @@ fn accepted_runtime_events_drive_user_message_and_member_status() {
                 effort: None,
                 sandbox: SandboxPolicy::ReadOnly,
                 permission_mode: Some(PermissionMode::Default),
+                approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                 session_policy: SessionPolicy::Resume,
             },
             MemberSummary {
@@ -476,6 +508,7 @@ fn accepted_runtime_events_drive_user_message_and_member_status() {
                 effort: None,
                 sandbox: SandboxPolicy::ReadOnly,
                 permission_mode: Some(PermissionMode::Default),
+                approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                 session_policy: SessionPolicy::Resume,
             },
         ],
@@ -673,6 +706,7 @@ fn targeted_skill_completion_excludes_other_backends() {
         effort: None,
         sandbox: SandboxPolicy::ReadOnly,
         permission_mode: Some(PermissionMode::Default),
+        approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
         session_policy: SessionPolicy::Resume,
     });
     state.default_target = Some(DefaultTarget::Member(MemberId::new("claude")));
@@ -756,6 +790,7 @@ fn header_roster_selection() {
             effort: None,
             sandbox: SandboxPolicy::ReadOnly,
             permission_mode: Some(PermissionMode::Default),
+            approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
             session_policy: SessionPolicy::Resume,
         },
         MemberView {
@@ -770,6 +805,7 @@ fn header_roster_selection() {
             effort: None,
             sandbox: SandboxPolicy::ReadOnly,
             permission_mode: Some(PermissionMode::Default),
+            approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
             session_policy: SessionPolicy::Resume,
         },
     ];

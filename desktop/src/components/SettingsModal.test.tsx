@@ -50,6 +50,20 @@ describe("SettingsModal", () => {
     expect(removed.modes.brainstorm?.participants).not.toContain("builder");
   });
 
+  it("edits native manual approvals without exposing removed keyword gates", async () => {
+    const user = userEvent.setup();
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<SettingsModal settings={structuredClone(demoSnapshot.team!)} busy={false} t={createTranslator("en-US")} onClose={() => undefined} onSave={onSave} />);
+
+    await user.click(screen.getByRole("button", { name: "Approvals" }));
+    const manual = screen.getByRole("checkbox", { name: /Manual Codex tool approvals/ });
+    expect(manual).toBeChecked();
+    expect(screen.queryByText("Gate categories")).not.toBeInTheDocument();
+    await user.click(manual);
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(onSave.mock.calls[0][0].approvals.manual).toBe(false);
+  });
+
   it("rejects unsupported effort and brainstorm limits before submission", async () => {
     const user = userEvent.setup();
     const onSave = vi.fn().mockResolvedValue(undefined);

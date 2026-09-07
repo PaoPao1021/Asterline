@@ -99,7 +99,7 @@ pub struct SessionOptions {
     pub workspace: Option<PathBuf>,
     pub db_path: Option<PathBuf>,
     pub restore: bool,
-    pub approvals: bool,
+    pub manual_approvals: bool,
     pub fake: bool,
     pub pick_team: bool,
     pub auto_update: bool,
@@ -112,7 +112,7 @@ impl Default for SessionOptions {
             workspace: None,
             db_path: None,
             restore: true,
-            approvals: true,
+            manual_approvals: false,
             fake: false,
             pick_team: false,
             auto_update: true,
@@ -127,7 +127,7 @@ impl From<&AppConfig> for SessionOptions {
             workspace: config.workspace.clone(),
             db_path: config.db_path.clone(),
             restore: !config.no_restore,
-            approvals: !config.debug,
+            manual_approvals: config.manual_approvals,
             fake: config.fake,
             pick_team: config.pick_team,
             auto_update: !config.no_auto_update,
@@ -454,12 +454,13 @@ fn start_session(
     if options.auto_update {
         crate::update::spawn_auto_update(events_tx.clone());
     }
+    let manual_approvals = options.manual_approvals || team.approvals.manual;
     let (handle, join) = runtime::spawn_bounded(
         team,
         store,
         runners,
         events_tx,
-        options.approvals,
+        manual_approvals,
         options.fake,
         Some(team_save_path),
     );
@@ -497,6 +498,7 @@ pub struct AppConfig {
     db_path: Option<PathBuf>,
     no_restore: bool,
     debug: bool,
+    manual_approvals: bool,
     fake: bool,
     pick_team: bool,
     banner: bool,
@@ -536,6 +538,7 @@ impl AppConfig {
                 "--db" => config.db_path = Some(Self::value(&args, &mut index, "--db")?.into()),
                 "--no-restore" => config.no_restore = true,
                 "--debug" => config.debug = true,
+                "--manual-approvals" => config.manual_approvals = true,
                 "--fake" => config.fake = true,
                 "--pick-team" => config.pick_team = true,
                 "--banner" => config.banner = true,
@@ -583,7 +586,8 @@ impl AppConfig {
          \x20 --workspace <PATH>  Working directory for members. Default: current directory.\n\
          \x20 --db <PATH>         SQLite path. Default: <workspace>/.asterline/asterline.sqlite3.\n\
          \x20 --no-restore        Do not replay persisted chat history on startup.\n\
-         \x20 --debug             Disable the approval gate (developer mode).\n\
+         \x20 --debug             Developer mode.\n\
+         \x20 --manual-approvals  Show the composer card for Codex tool asks (off by default).\n\
          \x20 --fake              Use offline fake agents instead of real CLIs.\n\
          \x20 --banner            Print a compact startup banner before the TUI.\n\
          \x20 update              Update via Windows Setup or an owning Homebrew Formula.\n\
@@ -646,6 +650,14 @@ mod tests {
         assert!(AppConfig::help().contains("--update"));
         assert!(AppConfig::help().contains("asterline update"));
         assert!(AppConfig::help().contains("--no-auto-update"));
+        assert!(AppConfig::help().contains("--manual-approvals"));
+    }
+
+    #[test]
+    fn parses_manual_approvals_flag() {
+        let config = AppConfig::parse(["--manual-approvals"]).unwrap();
+        assert!(config.manual_approvals);
+        assert!(!AppConfig::parse(["--fake"]).unwrap().manual_approvals);
     }
 
     #[test]

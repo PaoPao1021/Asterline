@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::adapter::parser::{
     MAX_MESSAGE_TEXT_BYTES, MAX_TOOL_DETAIL_BYTES, append_bounded_text, bounded_text,
+    format_permission_denial, is_permission_denied_tool,
 };
 use crate::domain::config::{
     ASTERLINE_BRAINSTORM_SKILL_NAME, ASTERLINE_ROSTER_PATH, brainstorm_skill_text,
@@ -28,20 +29,17 @@ use crate::domain::event::{
 };
 use crate::domain::mode::{
     BrainstormCard, CollabMode, ModeStatusSummary, ModesConfig, ReviewVerdict, ReviewVerdictKind,
-    TerminalMode, apply_mode_overrides, clear_mode_overrides, format_mode_binding,
-    format_verify_label, merge_modes, mode_overrides_for, prune_empty_mode_overrides,
-    resolve_mode_roles, resolve_plan_auto_execute, resolve_plan_builder, resolve_plan_reviewer,
-    resolve_team_coordinator, resolve_team_limits, resolve_verify_command, validate_mode_overrides,
-    validate_terminal_mode,
+    TerminalMode, apply_mode_overrides, clear_mode_overrides, format_mode_binding, merge_modes,
+    mode_overrides_for, prune_empty_mode_overrides, resolve_mode_roles, resolve_plan_auto_execute,
+    resolve_plan_builder, resolve_plan_reviewer, resolve_team_allow_add_members,
+    resolve_team_coordinator, resolve_team_limits, validate_mode_overrides, validate_terminal_mode,
 };
 use crate::domain::team::{
-    ApprovalSurface, BackendKind, DefaultTarget, Effort, MemberId, SessionPolicy, TeamConfig,
-    TeamMember, TeamSettings,
+    BackendKind, DefaultTarget, Effort, MemberId, SessionPolicy, TeamConfig, TeamMember,
+    TeamSettings,
 };
 use crate::fs_safety;
 use crate::router::{self, RelayDecision, RelayGuard, parse_agent_output};
-use crate::run_support::suggested_verify_command;
-use crate::runtime::approval::ApprovalMatcher;
 use crate::runtime::mode_prompts::{
     brainstorm_build_prompt, brainstorm_propose_prompt, brainstorm_stretch_prompt,
     brainstorm_synthesis_prompt, brainstorm_vote_prompt, plan_iteration_prompt, plan_nudge_prompt,
@@ -123,6 +121,9 @@ struct RunningState {
     reasoning: String,
     reasoning_started: Option<Instant>,
     failed: bool,
+    permission_denied: bool,
+    denied_reason: Option<String>,
+    permission_noticed: bool,
     raw_persistence_failed: bool,
 }
 
@@ -213,8 +214,8 @@ pub struct TeamRuntime {
     session_mode_overrides: ModesConfig,
     last_user: Option<(MessageTarget, String)>,
     next_message_id: u64,
-    approvals_enabled: bool,
-    matcher: ApprovalMatcher,
+    /// When false (default), Codex tool asks are approved automatically.
+    manual_approvals: bool,
     startup_notices: Vec<String>,
     startup_events: Vec<RuntimeEvent>,
     startup_reconciled: bool,
@@ -291,7 +292,7 @@ impl TeamRuntime {
             .map(|m| (m.id.clone(), MemberState::new(m.effort)))
             .collect();
         let relay = RelayGuard::new(config.max_auto_relays);
-        let matcher = ApprovalMatcher::from_policy(&config.approvals);
+        let manual_approvals = config.approvals.manual;
         let runtime = Self {
             config,
             store,
@@ -310,8 +311,7 @@ impl TeamRuntime {
             session_mode_overrides,
             last_user: None,
             next_message_id: 0,
-            approvals_enabled: true,
-            matcher,
+            manual_approvals,
             startup_notices,
             startup_events: Vec::new(),
             startup_reconciled,
@@ -331,9 +331,13 @@ impl TeamRuntime {
         runtime
     }
 
-    /// Disable the risky-action approval gate (used in tests and by `--debug`).
-    pub fn with_approvals(mut self, enabled: bool) -> Self {
-        self.approvals_enabled = enabled;
+    /// Enable the composer approval card for Codex tool asks. Off by default.
+    pub fn with_approvals(self, manual: bool) -> Self {
+        self.with_manual_approvals(manual)
+    }
+
+    pub fn with_manual_approvals(mut self, enabled: bool) -> Self {
+        self.manual_approvals = enabled;
         self
     }
 
@@ -343,6 +347,15 @@ impl TeamRuntime {
 
     fn effective_config(&self) -> TeamConfig {
         apply_mode_overrides(&self.config, &self.session_mode_overrides)
+    }
+
+    /// Conversation-local `run-N` handle. Notices and chat must use this, not
+    /// the raw SQLite id, or `/new` makes the footer and transcript disagree.
+    fn run_label(&self, id: RunId) -> String {
+        self.store
+            .run(id)
+            .map(|run| run.label())
+            .unwrap_or_else(|_| format!("run-{}", id.0))
     }
 
     fn emit_modes_updated(&self) -> RuntimeEvent {
@@ -461,14 +474,14 @@ impl TeamRuntime {
                 effort: self.members.get(&m.id).and_then(|s| s.effort),
                 sandbox: m.sandbox,
                 permission_mode: m.permission_mode,
+                approvals_reviewer: m.approvals_reviewer,
                 session_policy: m.session_policy,
             })
             .collect();
         RuntimeEvent::Ready {
             modes: self.config.modes.clone(),
             mode_overrides: self.session_mode_overrides.clone(),
-            suggested_verify: suggested_verify_command(&self.config.workspace)
-                .map(ToString::to_string),
+            suggested_verify: None,
             team: self.config.name.clone(),
             workspace: self.config.workspace.display().to_string(),
             default_target: self.config.default_target.clone(),
@@ -494,7 +507,6 @@ impl TeamRuntime {
                 }
                 | UiCommand::ResolvePausedRoute { resume: true }
                 | UiCommand::ContinueRun { .. }
-                | UiCommand::VerifyRun { .. }
                 | UiCommand::RunMode { .. }
         );
         if requires_reconciled_startup && !self.startup_reconciled {
@@ -598,9 +610,6 @@ impl TeamRuntime {
             UiCommand::BlockRun { run_id, reason } => {
                 self.handle_block_run(run_id, reason, &mut step)
             }
-            UiCommand::VerifyRun { run_id, command } => {
-                self.handle_verify_run(run_id, command, &mut step)
-            }
             UiCommand::AddRunStep {
                 run_id,
                 owner,
@@ -654,11 +663,7 @@ impl TeamRuntime {
                 "mode → normal — next plain text uses the last @target".to_string()
             }
             _ => {
-                let binding = format_mode_binding(
-                    &self.effective_config(),
-                    mode,
-                    suggested_verify_command(&self.config.workspace),
-                );
+                let binding = format_mode_binding(&self.effective_config(), mode);
                 format!(
                     "mode → {mode} — next plain text starts this run ({binding}); @member still sends directly"
                 )
@@ -735,12 +740,11 @@ impl TeamRuntime {
         step: &mut RuntimeStep,
     ) {
         self.last_user = Some((target.clone(), body.clone()));
-        // A collaboration run owns its orchestration task, but an explicit
-        // member route is still a normal, one-to-one instruction.  Do not
-        // reinterpret it as a second mode task while the run is active.
+        // Plain text starts the selected mode. An explicit @member / @all is
+        // always a direct chat, even after a team run has finished — team
+        // runs do not use ModeSession, so "run is active" is the wrong gate.
         if !matches!(self.active_mode, TerminalMode::Normal)
-            && matches!(target, MessageTarget::Member(_))
-            && !self.mode_sessions.is_empty()
+            && !matches!(target, MessageTarget::Default)
         {
             self.handle_user_message(target, body, step);
             return;
@@ -786,16 +790,12 @@ impl TeamRuntime {
                 return None;
             }
         };
-        let approval_kind = (self.approvals_enabled
-            && self.matcher.applies_to(ApprovalSurface::User))
-        .then(|| self.matcher.classify(&body))
-        .flatten();
         let starts_immediately = targets.iter().any(|member| {
             self.members
                 .get(member)
                 .is_some_and(|state| state.running.is_none())
         });
-        let defer_persistence = approval_kind.is_none() && !starts_immediately;
+        let defer_persistence = !starts_immediately;
         if !defer_persistence && let Err(err) = self.store.record_user(turn, &targets, &body) {
             self.report_store_error("save the user message", err, step);
             return None;
@@ -809,39 +809,6 @@ impl TeamRuntime {
                 LogEntry::info("user", format!("→ {}: {}", targets_str.join(", "), body)),
                 step,
             );
-        }
-
-        if let Some(kind) = approval_kind {
-            step.events.push(RuntimeEvent::UserMessage {
-                turn,
-                targets: targets.clone(),
-                body: body.clone(),
-            });
-            match self.store.insert_approval(Some(turn), None, &kind, &body) {
-                Ok(id) => {
-                    self.held_approvals.insert(
-                        id,
-                        HeldApproval {
-                            turn,
-                            targets,
-                            prompt: body.clone(),
-                            mode_run: None,
-                            member_request: None,
-                        },
-                    );
-                    step.events.push(RuntimeEvent::ApprovalRequested {
-                        id,
-                        member: None,
-                        action: kind,
-                        body,
-                    });
-                }
-                Err(err) => {
-                    self.report_store_error("save an approval request", err, step);
-                    step.events.push(RuntimeEvent::TurnFinished { turn });
-                }
-            }
-            return Some(turn);
         }
 
         self.pending_user_messages.insert(
@@ -1013,10 +980,11 @@ impl TeamRuntime {
             member.session_id = None;
             member.session_policy = SessionPolicy::Fresh;
         }
-        match self
-            .store
-            .create_fresh_conversation(&snapshot_team, TerminalMode::Normal)
-        {
+        match self.store.create_fresh_conversation(
+            &snapshot_team,
+            TerminalMode::Normal,
+            &self.session_mode_overrides,
+        ) {
             Ok(_) => {}
             Err(err) => {
                 step.events.push(RuntimeEvent::Notice(format!(
@@ -1027,7 +995,6 @@ impl TeamRuntime {
         }
         let previous_mode = self.active_mode;
         self.active_mode = TerminalMode::Normal;
-        self.session_mode_overrides = ModesConfig::default();
         self.sessions = SessionRegistry::new();
         for member in &mut self.config.members {
             member.session_id = None;
@@ -1048,6 +1015,7 @@ impl TeamRuntime {
             });
         }
         step.events.push(RuntimeEvent::SessionReset);
+        step.events.push(self.emit_modes_updated());
         self.note_roster_write(step);
     }
 
@@ -1159,7 +1127,6 @@ impl TeamRuntime {
             self.sessions
                 .set(saved.member, AgentSessionId(saved.session_id));
         }
-        self.matcher = ApprovalMatcher::from_policy(&self.config.approvals);
         self.relay = RelayGuard::new(self.config.max_auto_relays);
         self.paused_routes.clear();
         self.held_approvals.clear();
@@ -1358,8 +1325,17 @@ impl TeamRuntime {
             })
             .map(|(id, held)| (*id, held.turn, held.mode_run))
             .collect();
-        let approval_ids: Vec<ApprovalId> =
-            approvals_to_reject.iter().map(|(id, _, _)| *id).collect();
+        let native_to_reject: Vec<ApprovalId> = self
+            .native_approvals
+            .iter()
+            .filter(|(_, held)| removed_set.contains(&held.member))
+            .map(|(id, _)| *id)
+            .collect();
+        let approval_ids: Vec<ApprovalId> = approvals_to_reject
+            .iter()
+            .map(|(id, _, _)| *id)
+            .chain(native_to_reject.iter().copied())
+            .collect();
         let next_sessions: Vec<StoredConversationSession> = raw_config
             .members
             .iter()
@@ -1409,6 +1385,22 @@ impl TeamRuntime {
                 decision: ApprovalDecision::Reject,
             });
         }
+        for id in native_to_reject {
+            let Some(held) = self.native_approvals.remove(&id) else {
+                continue;
+            };
+            cleanup_turns.insert(held.turn);
+            step.events.push(RuntimeEvent::ApprovalResolved {
+                id,
+                decision: ApprovalDecision::Reject,
+            });
+            step.runner_controls
+                .push(RunnerControl::ResolveNativeApproval {
+                    member: held.member,
+                    request_id: held.request_id,
+                    decision: ApprovalDecision::Reject,
+                });
+        }
 
         self.paused_routes.retain(|route| {
             let keep = !removed_set.contains(&route.from)
@@ -1446,7 +1438,7 @@ impl TeamRuntime {
         }
 
         self.config = operational_config;
-        self.matcher = ApprovalMatcher::from_policy(&self.config.approvals);
+        self.manual_approvals |= self.config.approvals.manual;
         self.relay.set_max_auto_relays(self.config.max_auto_relays);
         for member in self.config.members.clone() {
             step.runner_changes.push(RunnerChange::Upsert {
@@ -2011,6 +2003,9 @@ impl TeamRuntime {
                 {
                     self.report_store_error("save a tool result", err, &mut step);
                 }
+                if !ok && is_permission_denied_tool(&output) {
+                    self.record_permission_denial(member, &output, &mut step);
+                }
                 step.events.push(RuntimeEvent::ToolCompleted {
                     member: member.clone(),
                     tool_id: id,
@@ -2047,6 +2042,20 @@ impl TeamRuntime {
                         });
                     return step;
                 };
+                if !self.manual_approvals {
+                    self.log(
+                        member,
+                        LogEntry::info(member.as_str(), format!("auto-approved {action}")),
+                        &mut step,
+                    );
+                    step.runner_controls
+                        .push(RunnerControl::ResolveNativeApproval {
+                            member: member.clone(),
+                            request_id,
+                            decision: ApprovalDecision::Approve,
+                        });
+                    return step;
+                }
                 match self
                     .store
                     .insert_approval(Some(turn), Some(member), &action, &body)
@@ -2102,24 +2111,31 @@ impl TeamRuntime {
                 self.log(member, LogEntry::warn(member.as_str(), line), &mut step)
             }
             AgentEvent::Log(message) => {
+                if message.contains("agy quota exhausted") {
+                    step.events.push(RuntimeEvent::Notice(message.clone()));
+                }
                 self.log(member, LogEntry::info(member.as_str(), message), &mut step)
             }
             AgentEvent::ParseWarning(message) => {
                 self.log(member, LogEntry::warn(member.as_str(), message), &mut step)
             }
             AgentEvent::Fatal(message) => {
-                let (turn, cancelled) = self
+                let permission_denied = is_permission_denied_tool(&message);
+                let (turn, cancelled, already_denied) = self
                     .members
                     .get_mut(member)
                     .and_then(|state| state.running.as_mut())
                     .map(|running| {
                         let cancelled = running.cancel.load(Ordering::Relaxed);
-                        if !cancelled {
+                        if permission_denied {
+                            running.permission_denied = true;
+                        } else if !cancelled && !running.permission_denied {
                             running.failed = true;
                         }
-                        (running.turn, cancelled)
+                        (running.turn, cancelled, running.permission_denied)
                     })
-                    .unzip();
+                    .map(|(turn, cancelled, denied)| (Some(turn), Some(cancelled), denied))
+                    .unwrap_or((None, None, permission_denied));
                 if cancelled == Some(true) {
                     self.log(
                         member,
@@ -2129,6 +2145,8 @@ impl TeamRuntime {
                         ),
                         &mut step,
                     );
+                } else if permission_denied || already_denied {
+                    self.record_permission_denial(member, &message, &mut step);
                 } else {
                     if let Some(turn) = turn
                         && let Err(err) =
@@ -2268,7 +2286,7 @@ impl TeamRuntime {
         } else {
             supplied_text
         };
-        let parsed = parse_agent_output(&text);
+        let mut parsed = parse_agent_output(&text);
         for warning in &parsed.warnings {
             self.log(
                 member,
@@ -2303,6 +2321,15 @@ impl TeamRuntime {
             }
         }
 
+        if let Some(limit) = self.brainstorm_ideas_cap(member) {
+            let extra = parsed.brainstorm_cards.len().saturating_sub(limit);
+            if extra > 0 {
+                parsed.brainstorm_cards.truncate(limit);
+                step.events.push(RuntimeEvent::Notice(format!(
+                    "{member} emitted {extra} extra brainstorm card(s); kept {limit}"
+                )));
+            }
+        }
         let visible_text =
             render_brainstorm_response(&parsed.visible_text, &parsed.brainstorm_cards);
         if !visible_text.is_empty() {
@@ -2337,8 +2364,17 @@ impl TeamRuntime {
         for member_request in parsed.members {
             self.request_team_member_from_agent(member, turn, member_request, step);
         }
+        let mut checklist_run = None;
         for request in parsed.run_steps {
-            self.apply_run_step_from_agent(member, turn, request, step);
+            if let Some(run) = self.apply_run_step_from_agent(member, turn, request, step) {
+                checklist_run = Some(run);
+            }
+        }
+        if let Some(run) = checklist_run {
+            step.events.push(RuntimeEvent::Notice(format!(
+                "{member} updated {} checklist",
+                run.label()
+            )));
         }
         for tmsg in parsed.messages {
             self.route_team_message(member, turn, tmsg, step);
@@ -2367,53 +2403,25 @@ impl TeamRuntime {
     fn request_team_member_from_agent(
         &mut self,
         from: &MemberId,
-        turn: TurnId,
+        _turn: TurnId,
         member: TeamMember,
         step: &mut RuntimeStep,
     ) {
         if !self.validate_agent_team_member(from, &member, step) {
             return;
         }
-        if self.approvals_enabled && self.matcher.applies_to(ApprovalSurface::Relay) {
-            let body = match serde_json::to_string(&member) {
-                Ok(body) => body,
-                Err(err) => {
-                    step.events.push(RuntimeEvent::Notice(format!(
-                        "{from} could not request teammate {}: {err}",
-                        member.id
-                    )));
-                    return;
-                }
-            };
-            match self
-                .store
-                .insert_approval(Some(turn), Some(from), "team_member", &body)
-            {
-                Ok(id) => {
-                    self.held_approvals.insert(
-                        id,
-                        HeldApproval {
-                            turn,
-                            targets: Vec::new(),
-                            prompt: String::new(),
-                            mode_run: None,
-                            member_request: Some((from.clone(), member)),
-                        },
-                    );
-                    step.events.push(RuntimeEvent::ApprovalRequested {
-                        id,
-                        member: Some(from.clone()),
-                        action: "team_member".to_string(),
-                        body,
-                    });
-                }
-                Err(err) => {
-                    self.report_store_error("save a teammate approval request", err, step);
-                }
-            }
+        if self.active_mode == TerminalMode::Team && !self.team_allows_add_members() {
+            step.events.push(RuntimeEvent::Notice(format!(
+                "{from} could not add teammate {}: team mode is locked to the current roster",
+                member.id
+            )));
             return;
         }
         self.add_team_member_from_agent(from, member, step);
+    }
+
+    fn team_allows_add_members(&self) -> bool {
+        resolve_team_allow_add_members(&self.effective_config())
     }
 
     fn validate_agent_team_member(
@@ -2535,43 +2543,6 @@ impl TeamRuntime {
         }
         match self.relay.record_auto_relay(turn, from) {
             RelayDecision::Continue { .. } => {
-                // Gate risky relay bodies the same way as user messages. A
-                // user-resumed paused route (/retry) is intentionally left
-                // ungated below / in resolve_next_paused_route — that path is
-                // itself an explicit human decision.
-                if self.approvals_enabled
-                    && self.matcher.applies_to(ApprovalSurface::Relay)
-                    && let Some(kind) = self.matcher.classify(&tmsg.body)
-                {
-                    match self
-                        .store
-                        .insert_approval(Some(turn), Some(from), &kind, &tmsg.body)
-                    {
-                        Ok(id) => {
-                            self.held_approvals.insert(
-                                id,
-                                HeldApproval {
-                                    turn,
-                                    targets: resolved.members,
-                                    prompt,
-                                    mode_run: None,
-                                    member_request: None,
-                                },
-                            );
-                            step.events.push(RuntimeEvent::ApprovalRequested {
-                                id,
-                                member: Some(from.clone()),
-                                action: kind,
-                                body: tmsg.body,
-                            });
-                        }
-                        Err(err) => {
-                            self.report_store_error("save a relay approval request", err, step);
-                            self.check_turn_complete(turn, step);
-                        }
-                    }
-                    return;
-                }
                 for member in resolved.members {
                     self.enqueue_prompt(&member, turn, prompt.clone(), step);
                 }
@@ -2597,12 +2568,12 @@ impl TeamRuntime {
         turn: TurnId,
         request: RunStepRequest,
         step: &mut RuntimeStep,
-    ) {
+    ) -> Option<crate::domain::event::RunSummary> {
         let Some(run_id) = self.run_turns.get(&turn).copied() else {
             step.events.push(RuntimeEvent::Notice(format!(
                 "{from} ignored run step update: no active run"
             )));
-            return;
+            return None;
         };
 
         let requested_owner = match &request {
@@ -2617,7 +2588,7 @@ impl TeamRuntime {
             step.events.push(RuntimeEvent::Notice(format!(
                 "{from} could not update run {run_id}: unknown step owner {owner}"
             )));
-            return;
+            return None;
         }
 
         let result = match request {
@@ -2648,20 +2619,22 @@ impl TeamRuntime {
 
         match result {
             Ok(run) => {
-                let id = run.id;
-                step.events.push(RuntimeEvent::RunUpdated { run });
-                step.events.push(RuntimeEvent::Notice(format!(
-                    "{from} updated run {id} checklist"
-                )));
+                step.events
+                    .push(RuntimeEvent::RunUpdated { run: run.clone() });
+                Some(run)
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 step.events.push(RuntimeEvent::Notice(format!(
                     "{from} could not update run {run_id}: step was not found"
                 )));
+                None
             }
-            Err(err) => step.events.push(RuntimeEvent::Notice(format!(
-                "{from} could not update run {run_id}: {err}"
-            ))),
+            Err(err) => {
+                step.events.push(RuntimeEvent::Notice(format!(
+                    "{from} could not update run {run_id}: {err}"
+                )));
+                None
+            }
         }
     }
 
@@ -2711,12 +2684,15 @@ impl TeamRuntime {
             self.complete_message(member, text, step);
         }
 
-        let (turn, cancelled, failed) =
+        let (turn, cancelled, failed, permission_denied, denied_reason, permission_noticed) =
             match self.members.get_mut(member).and_then(|s| s.running.take()) {
                 Some(running) => (
                     running.turn,
                     running.cancel.load(Ordering::Relaxed),
                     running.failed,
+                    running.permission_denied,
+                    running.denied_reason,
+                    running.permission_noticed,
                 ),
                 None => return,
             };
@@ -2732,6 +2708,16 @@ impl TeamRuntime {
             // A structured backend failure remains authoritative even when the
             // child process subsequently exits with status 0.
             self.mark_run_turn(turn, RunStatus::Failed, step)
+        } else if !ok && permission_denied {
+            // Agy/Claude print-mode auto-deny is a tool result. The member may
+            // exit non-zero; Plan must keep going instead of blocking.
+            if !permission_noticed {
+                let reason = denied_reason.unwrap_or_else(|| "a command".to_string());
+                step.events.push(RuntimeEvent::Notice(format!(
+                    "{member} was denied permission to run {reason}; the run continues"
+                )));
+            }
+            true
         } else if !ok {
             let message = format!(
                 "{} exited without success (code {})",
@@ -2784,6 +2770,42 @@ impl TeamRuntime {
             self.emit_queue_updated(member, step);
             self.start_run(member, queued.turn, queued.prompt, step);
         }
+    }
+
+    fn record_permission_denial(
+        &mut self,
+        member: &MemberId,
+        detail: &str,
+        step: &mut RuntimeStep,
+    ) {
+        let reason = format_permission_denial(detail);
+        let already_noticed = self
+            .members
+            .get(member)
+            .and_then(|state| state.running.as_ref())
+            .is_some_and(|running| running.permission_noticed);
+        if let Some(running) = self
+            .members
+            .get_mut(member)
+            .and_then(|state| state.running.as_mut())
+        {
+            running.permission_denied = true;
+            if running.denied_reason.is_none() {
+                running.denied_reason = Some(reason.clone());
+            }
+            running.permission_noticed = true;
+        }
+        if already_noticed {
+            return;
+        }
+        self.log(
+            member,
+            LogEntry::warn(member.as_str(), format!("tool permission denied: {detail}")),
+            step,
+        );
+        step.events.push(RuntimeEvent::Notice(format!(
+            "{member} was denied permission to run {reason}; the run continues"
+        )));
     }
 
     fn emit_queue_updated(&self, member: &MemberId, step: &mut RuntimeStep) {
@@ -2930,6 +2952,9 @@ impl TeamRuntime {
                 reasoning: String::new(),
                 reasoning_started: None,
                 failed: false,
+                permission_denied: false,
+                denied_reason: None,
+                permission_noticed: false,
                 raw_persistence_failed: false,
             });
             state.status = MemberStatus::Running;
@@ -3015,10 +3040,7 @@ impl TeamRuntime {
             .unwrap_or(MemberStatus::Idle);
         let model = member.model.as_deref().unwrap_or("-");
         let effort = member.effort.map(Effort::as_str).unwrap_or("-");
-        let permission = member
-            .permission_mode
-            .map(|mode| mode.claude_arg())
-            .unwrap_or("-");
+        let permission = member.permission_native_label();
         let allowed_tools = if member.allowed_tools.is_empty() {
             "-".to_string()
         } else {
@@ -3037,7 +3059,7 @@ impl TeamRuntime {
                 .resolved_cwd(&self.config.workspace)
                 .display()
                 .to_string(),
-            member.sandbox.codex_arg(),
+            member.sandbox_native_label(),
             permission,
             session_policy_label(member.session_policy),
             allowed_tools,
@@ -3126,15 +3148,15 @@ impl TeamRuntime {
 
     fn append_reasoning(&mut self, member: &MemberId, text: &str) -> Option<String> {
         let text = bounded_text(text, MAX_MESSAGE_TEXT_BYTES);
-        if text.is_empty() {
-            return None;
-        }
         self.members
             .get_mut(member)
             .and_then(|state| state.running.as_mut())
             .and_then(|running| {
                 if running.reasoning_started.is_none() {
                     running.reasoning_started = Some(Instant::now());
+                }
+                if text.is_empty() {
+                    return Some(String::new());
                 }
                 if text.starts_with(running.reasoning.as_str()) {
                     if text == running.reasoning {

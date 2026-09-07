@@ -237,8 +237,7 @@ fn review_config_is_empty(config: &ReviewModeConfig) -> bool {
     config.builder.is_none()
         && config.reviewer.is_none()
         && config.max_iterations.is_none()
-        && config.auto_verify.is_none()
-        && config.verify_command.is_none()
+        && config.reviewer_hint.is_none()
 }
 
 fn plan_config_is_empty(config: &PlanModeConfig) -> bool {
@@ -247,8 +246,6 @@ fn plan_config_is_empty(config: &PlanModeConfig) -> bool {
         && config.reviewer.is_none()
         && config.max_iterations.is_none()
         && config.auto_execute.is_none()
-        && config.auto_verify.is_none()
-        && config.verify_command.is_none()
 }
 
 fn brainstorm_config_is_empty(config: &BrainstormModeConfig) -> bool {
@@ -260,8 +257,7 @@ fn brainstorm_config_is_empty(config: &BrainstormModeConfig) -> bool {
 fn team_config_is_empty(config: &TeamModeConfig) -> bool {
     config.coordinator.is_none()
         && config.max_iterations.is_none()
-        && config.auto_verify.is_none()
-        && config.verify_command.is_none()
+        && config.allow_add_members.is_none()
 }
 
 /// Validate merged knobs for modes that have any override fields set.
@@ -340,11 +336,11 @@ fn merge_review(
             builder: over.builder.clone().or_else(|| base.builder.clone()),
             reviewer: over.reviewer.clone().or_else(|| base.reviewer.clone()),
             max_iterations: over.max_iterations.or(base.max_iterations),
-            auto_verify: over.auto_verify.or(base.auto_verify),
-            verify_command: over
-                .verify_command
+            reviewer_hint: over
+                .reviewer_hint
                 .clone()
-                .or_else(|| base.verify_command.clone()),
+                .or_else(|| base.reviewer_hint.clone()),
+            auto_verify: None,
         }),
     }
 }
@@ -363,11 +359,8 @@ fn merge_plan(
             reviewer: over.reviewer.clone().or_else(|| base.reviewer.clone()),
             max_iterations: over.max_iterations.or(base.max_iterations),
             auto_execute: over.auto_execute.or(base.auto_execute),
-            auto_verify: over.auto_verify.or(base.auto_verify),
-            verify_command: over
-                .verify_command
-                .clone()
-                .or_else(|| base.verify_command.clone()),
+            auto_verify: None,
+            verify_command: None,
         }),
     }
 }
@@ -405,49 +398,31 @@ fn merge_team(
                 .clone()
                 .or_else(|| base.coordinator.clone()),
             max_iterations: over.max_iterations.or(base.max_iterations),
-            auto_verify: over.auto_verify.or(base.auto_verify),
-            verify_command: over
-                .verify_command
-                .clone()
-                .or_else(|| base.verify_command.clone()),
+            allow_add_members: over.allow_add_members.or(base.allow_add_members),
+            auto_verify: None,
+            verify_command: None,
         }),
-    }
-}
-
-pub fn format_verify_label(
-    auto_verify: bool,
-    configured: Option<&str>,
-    suggested: Option<&str>,
-) -> String {
-    if !auto_verify {
-        return "verify off".to_string();
-    }
-    match resolve_verify_command(configured, suggested) {
-        Some(command) => format!("verify `{command}`"),
-        None => "verify on (no command detected)".to_string(),
     }
 }
 
 /// Human binding line for a mode using merged config. Errors stay as the line
 /// text so the panel can paint them in yellow.
-pub fn format_mode_binding(
-    config: &TeamConfig,
-    mode: TerminalMode,
-    suggested: Option<&str>,
-) -> String {
+pub fn format_mode_binding(config: &TeamConfig, mode: TerminalMode) -> String {
     match mode {
         TerminalMode::Normal => "plain text goes to the last @target".to_string(),
         TerminalMode::Review => match resolve_mode_roles(config, CollabMode::Review) {
             Ok((roles, limits)) => format!(
-                "builder {} · reviewer {} · {} iterations · {}",
+                "builder {} · reviewer {} · {} iterations{}",
                 member_label(config, &roles.builder),
                 member_label(config, &roles.reviewer),
                 limits.max_iterations,
-                format_verify_label(
-                    limits.auto_verify,
-                    limits.verify_command.as_deref(),
-                    suggested
-                )
+                limits
+                    .reviewer_hint
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|hint| !hint.is_empty())
+                    .map(|_| " · hint")
+                    .unwrap_or("")
             ),
             Err(err) => err,
         },
@@ -457,7 +432,7 @@ pub fn format_mode_binding(
             resolve_plan_reviewer(config),
         ) {
             (Ok((roles, limits)), Ok(builder), Ok(reviewer)) => format!(
-                "leader {} · builder {} · reviewer {} · {} · {} iterations · {}",
+                "leader {} · builder {} · reviewer {} · {} · {} iterations",
                 member_label(config, &roles.leader),
                 member_label(config, &builder),
                 reviewer
@@ -469,12 +444,7 @@ pub fn format_mode_binding(
                 } else {
                     "manual execute confirmation"
                 },
-                limits.max_iterations,
-                format_verify_label(
-                    limits.auto_verify,
-                    limits.verify_command.as_deref(),
-                    suggested
-                )
+                limits.max_iterations
             ),
             (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => err,
         },
@@ -501,11 +471,11 @@ pub fn format_mode_binding(
                 "coordinator {} · {} iterations · {}",
                 member_label(config, &coordinator),
                 limits.max_iterations,
-                format_verify_label(
-                    limits.auto_verify,
-                    limits.verify_command.as_deref(),
-                    suggested
-                )
+                if limits.allow_add_members {
+                    "free add"
+                } else {
+                    "roster only"
+                }
             ),
             (Err(err), _) | (_, Err(err)) => err,
         },
@@ -545,11 +515,16 @@ pub struct ReviewModeConfig {
     pub reviewer: Option<MemberId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_iterations: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Extra instructions appended to the reviewer prompt. Not executed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "verify_command"
+    )]
+    pub reviewer_hint: Option<String>,
+    /// Older `team.json` files may still carry this. Review no longer runs a command.
+    #[serde(default, skip_serializing)]
     pub auto_verify: Option<bool>,
-    /// Shell command used for auto-verify after approve (e.g. `just check`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verify_command: Option<String>,
 }
 
 /// Plan leader, required execution builder, optional reviewer, and execution settings stored in `team.json`.
@@ -571,10 +546,11 @@ pub struct PlanModeConfig {
     /// explicit `/approve` before the Builder receives it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_execute: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Older team.json files may still carry this. Plan no longer runs a command.
+    #[serde(default, skip_serializing)]
     pub auto_verify: Option<bool>,
-    /// Shell command used for auto-verify after approve (e.g. `just check`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Older team.json files may still carry this. Plan no longer runs a command.
+    #[serde(default, skip_serializing)]
     pub verify_command: Option<String>,
 }
 
@@ -600,10 +576,14 @@ pub struct TeamModeConfig {
     pub coordinator: Option<MemberId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_iterations: Option<u32>,
+    /// When true, `@@team_member` joins immediately. Default is the current roster only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_add_members: Option<bool>,
+    /// Older team.json files may still carry this. Team no longer runs a command.
+    #[serde(default, skip_serializing)]
     pub auto_verify: Option<bool>,
-    /// Shell command used for auto-verify after the coordinator finishes (e.g. `just check`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Older team.json files may still carry this. Team no longer runs a command.
+    #[serde(default, skip_serializing)]
     pub verify_command: Option<String>,
 }
 
@@ -611,6 +591,7 @@ pub struct TeamModeConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TeamLimits {
     pub max_iterations: u32,
+    pub allow_add_members: bool,
     pub auto_verify: bool,
     pub verify_command: Option<String>,
 }
@@ -619,24 +600,26 @@ impl Default for TeamLimits {
     fn default() -> Self {
         Self {
             max_iterations: 3,
-            auto_verify: true,
+            allow_add_members: false,
+            auto_verify: false,
             verify_command: None,
         }
     }
 }
 
-/// Resolve team-mode limits from `modes.team` (defaults: max_iterations=3, auto_verify=true).
+/// Resolve team-mode limits from `modes.team` (default max_iterations=3).
 pub fn resolve_team_limits(config: &TeamConfig) -> Result<TeamLimits, String> {
     config
         .modes
         .team
         .as_ref()
         .map(|settings| {
-            resolve_iteration_settings(
-                settings.max_iterations,
-                settings.auto_verify,
-                settings.verify_command.as_deref(),
-            )
+            Ok(TeamLimits {
+                max_iterations: positive_or_default("max_iterations", settings.max_iterations, 3)?,
+                allow_add_members: settings.allow_add_members.unwrap_or(false),
+                auto_verify: false,
+                verify_command: None,
+            })
         })
         .unwrap_or_else(|| Ok(TeamLimits::default()))
 }
@@ -661,8 +644,10 @@ pub struct ModeLimits {
     /// Requested brainstorm idea cards per participant and wave (default 4).
     pub ideas_per_round: u32,
     pub auto_verify: bool,
-    /// Optional explicit auto-verify command from mode config (review/plan).
+    /// Optional explicit auto-verify command from mode config (plan).
     pub verify_command: Option<String>,
+    /// Optional extra text appended to the Review-mode reviewer prompt.
+    pub reviewer_hint: Option<String>,
 }
 
 impl Default for ModeLimits {
@@ -671,13 +656,14 @@ impl Default for ModeLimits {
             max_iterations: 3,
             rounds: 3,
             ideas_per_round: 4,
-            auto_verify: true,
+            auto_verify: false,
             verify_command: None,
+            reviewer_hint: None,
         }
     }
 }
 
-/// Prefer a non-empty trimmed config command; otherwise `fallback` (e.g. workspace heuristic).
+/// Prefer a non-empty trimmed config command; otherwise `fallback`.
 pub fn resolve_verify_command(configured: Option<&str>, fallback: Option<&str>) -> Option<String> {
     configured
         .map(str::trim)
@@ -758,32 +744,30 @@ pub fn resolve_mode_roles(
     let mut limits = ModeLimits::default();
     match mode {
         CollabMode::Review => {
+            limits.auto_verify = false;
+            limits.verify_command = None;
             if let Some(settings) = &config.modes.review {
                 roles.builder =
                     resolve_or_derived(config, settings.builder.as_ref(), &roles.builder)?;
                 roles.reviewer =
                     resolve_or_derived(config, settings.reviewer.as_ref(), &roles.reviewer)?;
-                let iterations = resolve_iteration_settings(
-                    settings.max_iterations,
-                    settings.auto_verify,
-                    settings.verify_command.as_deref(),
-                )?;
-                limits.max_iterations = iterations.max_iterations;
-                limits.auto_verify = iterations.auto_verify;
-                limits.verify_command = iterations.verify_command;
+                limits.max_iterations =
+                    positive_or_default("max_iterations", settings.max_iterations, 3)?;
+                limits.reviewer_hint = settings
+                    .reviewer_hint
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|hint| !hint.is_empty())
+                    .map(ToString::to_string);
             }
         }
         CollabMode::Plan => {
+            limits.auto_verify = false;
+            limits.verify_command = None;
             if let Some(settings) = &config.modes.plan {
                 roles.leader = resolve_or_derived(config, settings.leader.as_ref(), &roles.leader)?;
-                let iterations = resolve_iteration_settings(
-                    settings.max_iterations,
-                    settings.auto_verify,
-                    settings.verify_command.as_deref(),
-                )?;
-                limits.max_iterations = iterations.max_iterations;
-                limits.auto_verify = iterations.auto_verify;
-                limits.verify_command = iterations.verify_command;
+                limits.max_iterations =
+                    positive_or_default("max_iterations", settings.max_iterations, 3)?;
             }
         }
         CollabMode::Brainstorm => {
@@ -854,6 +838,19 @@ pub fn resolve_plan_auto_execute(config: &TeamConfig) -> bool {
         .unwrap_or(true)
 }
 
+/// Whether team mode may grow the live roster via `@@team_member`.
+///
+/// The default keeps the current roster. When enabled, a requested teammate
+/// joins immediately and is not held for approval.
+pub fn resolve_team_allow_add_members(config: &TeamConfig) -> bool {
+    config
+        .modes
+        .team
+        .as_ref()
+        .and_then(|settings| settings.allow_add_members)
+        .unwrap_or(false)
+}
+
 fn resolve_bound_member(config: &TeamConfig, id: &MemberId) -> Result<MemberId, String> {
     config
         .member(id)
@@ -901,21 +898,6 @@ fn positive_or_default(field: &str, value: Option<u32>, default: u32) -> Result<
         return Err(format!("{field} must be > 0"));
     }
     Ok(value)
-}
-
-/// Resolve the three iteration settings shared by team, review, and plan
-/// modes. Keeping this one path prevents a mode from silently drifting in how
-/// it trims `verify_command` or applies the documented defaults.
-fn resolve_iteration_settings(
-    max_iterations: Option<u32>,
-    auto_verify: Option<bool>,
-    verify_command: Option<&str>,
-) -> Result<TeamLimits, String> {
-    Ok(TeamLimits {
-        max_iterations: positive_or_default("max_iterations", max_iterations, 3)?,
-        auto_verify: auto_verify.unwrap_or(true),
-        verify_command: resolve_verify_command(verify_command, None),
-    })
 }
 
 pub fn resolve_team_coordinator(config: &TeamConfig) -> Result<MemberId, String> {
@@ -1049,7 +1031,13 @@ mod tests {
                 MemberId::new("reviewer"),
             ]
         );
-        assert_eq!(limits, ModeLimits::default());
+        assert_eq!(
+            limits,
+            ModeLimits {
+                auto_verify: false,
+                ..ModeLimits::default()
+            }
+        );
     }
 
     #[test]
@@ -1082,15 +1070,34 @@ mod tests {
             builder: Some(MemberId::new("builder")),
             reviewer: Some(MemberId::new("reviewer")),
             max_iterations: Some(5),
-            auto_verify: Some(false),
-            verify_command: Some("  just check  ".to_string()),
+            reviewer_hint: Some("  look at the parser tests  ".to_string()),
+            ..ReviewModeConfig::default()
         });
         let (roles, limits) = resolve_mode_roles(&config, CollabMode::Review).unwrap();
         assert_eq!(roles.builder, MemberId::new("builder"));
         assert_eq!(roles.reviewer, MemberId::new("reviewer"));
         assert_eq!(limits.max_iterations, 5);
         assert!(!limits.auto_verify);
-        assert_eq!(limits.verify_command.as_deref(), Some("just check"));
+        assert_eq!(limits.verify_command, None);
+        assert_eq!(
+            limits.reviewer_hint.as_deref(),
+            Some("look at the parser tests")
+        );
+    }
+
+    #[test]
+    fn review_accepts_legacy_verify_command_as_hint() {
+        let cfg: ReviewModeConfig =
+            serde_json::from_str(r#"{"verify_command":"just check","auto_verify":false}"#).unwrap();
+        assert_eq!(cfg.reviewer_hint.as_deref(), Some("just check"));
+        let (roles, limits) = {
+            let mut config = mixed_roster();
+            config.modes.review = Some(cfg);
+            resolve_mode_roles(&config, CollabMode::Review).unwrap()
+        };
+        assert_eq!(roles.reviewer, MemberId::new("reviewer"));
+        assert_eq!(limits.reviewer_hint.as_deref(), Some("just check"));
+        assert!(!limits.auto_verify);
     }
 
     #[test]
@@ -1234,8 +1241,16 @@ mod tests {
         });
         let limits = resolve_team_limits(&config).unwrap();
         assert_eq!(limits.max_iterations, 5);
+        assert!(!limits.allow_add_members);
         assert!(!limits.auto_verify);
-        assert_eq!(limits.verify_command.as_deref(), Some("just check"));
+        assert_eq!(limits.verify_command, None);
+
+        config.modes.team = Some(TeamModeConfig {
+            allow_add_members: Some(true),
+            ..TeamModeConfig::default()
+        });
+        assert!(resolve_team_allow_add_members(&config));
+        assert!(resolve_team_limits(&config).unwrap().allow_add_members);
 
         let mut config = mixed_roster();
         config.modes.team = Some(TeamModeConfig {

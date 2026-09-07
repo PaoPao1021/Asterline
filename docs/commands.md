@@ -2,8 +2,9 @@
 
 This is the complete reference for Asterline's startup options, composer
 syntax, slash commands, drawers, and keyboard controls. For installation and
-the product overview, return to the [main README](../README.md). A
-[Chinese version](commands.zh-CN.md) is also available.
+the product overview, return to the [English README](../README.en.md). A
+[Chinese version](commands.zh-CN.md) is also available. The default product
+page is the [Chinese README](../README.md).
 
 ## Quick start
 
@@ -12,7 +13,6 @@ the product overview, return to the [main README](../README.md). A
 /mode brainstorm
 How could we reduce indexing latency?
 /runs
-/verify run-2 cargo test
 /new
 /resume
 ```
@@ -87,11 +87,19 @@ not delete saved conversations; use `/resume` to select one later.
 asterline --no-restore
 ```
 
+### `--manual-approvals`
+
+Show the approval card above the composer for Codex tool asks. Off by
+default: those asks are approved automatically. `team.json` can set the
+same switch with `"approvals": { "manual": true }`.
+
+```bash
+asterline --manual-approvals
+```
+
 ### `--debug`
 
-Enable developer mode and disable Asterline's risky-action approval gate.
-Backend-native permissions still apply. Use this only in a controlled
-environment.
+Developer mode. It no longer changes approval behavior.
 
 ```bash
 asterline --debug
@@ -234,8 +242,11 @@ Broadcast the message to every enabled member.
 
 Persist the current conversation, create a new conversation, clear the visible
 transcript and current run list, create fresh backend session IDs, and reset
-the terminal mode to `normal`. If a member, collaboration run, or verification
-is active, `/new` is rejected; press `Esc` and wait for cancellation first.
+the terminal mode to `normal`. Mode field settings from the previous chat
+(reviewer, builder, limits, and other this-chat overrides) stay in effect for
+the new conversation. New runs in that chat start again at `run-1`. If a
+member, collaboration run, or verification is active, `/new` is rejected;
+press `Esc` and wait for cancellation first.
 
 `/clear` is a direct alias for `/new`; both perform the same full
 new-conversation operation rather than merely hiding history. A normal restart
@@ -335,8 +346,10 @@ attached to a native backend CLI, that CLI's own `/exit` returns to Asterline.
 /approve
 ```
 
-Approve the oldest pending Asterline approval request. If no request is
-pending, Asterline reports that there is nothing to approve.
+Approve the selected pending request (oldest if you have not switched).
+The usual path is the card above the composer: `y` or Enter to agree, `n`
+to deny. If no request is pending, Asterline reports that there is nothing
+to approve.
 
 ### `/reject`
 
@@ -449,9 +462,11 @@ does not open the panel. After selecting `review`, `plan`, `brainstorm`, or
 `team`, enter the task as the next plain message — do **not** add an
 `@member` prefix. That message starts the selected mode with its configured
 participants. `@member <message>` deliberately remains a one-to-one
-instruction and bypasses the collaboration run. `/new` resets the new
-conversation to `normal` and clears this-chat overrides; `/resume` restores
-the selected conversation's mode and overrides.
+instruction and bypasses the collaboration run. `/new` starts the new
+conversation in `normal` but keeps the previous chat's mode field settings
+(reviewer, builder, limits, …) so you do not have to reconfigure them in the
+same project. `/resume` restores the selected conversation's mode and
+overrides.
 
 #### `/mode normal`
 
@@ -463,11 +478,11 @@ Use ordinary direct-message dispatch. A fresh chat requires `@member`,
 Start a builder/reviewer loop. The builder works, the reviewer emits a
 structured `@@review` verdict, and revision continues until approval or
 `max_iterations`. If the limit is reached, the run becomes blocked. The
-reviewer is asked to inspect the working tree and run the project's checks
-itself; after approval, auto-verify (when enabled) runs the verify command
-again as a deliberate second, independent gate — it is not a redundant step
-to switch off. A reviewer reply without a structured verdict is nudged once,
-then treated as `request_changes` (a notice says so) and costs an iteration.
+reviewer is asked to inspect the working tree rather than trusting the
+builder's report. An optional `reviewer_hint` is appended to that prompt.
+A reviewer reply
+without a structured verdict is nudged once, then treated as
+`request_changes` (a notice says so) and costs an iteration.
 
 ```text
 /mode review
@@ -506,18 +521,19 @@ How could we make graph retrieval robust without node text?
 #### `/mode team`
 
 Start a coordinator-driven team run. The coordinator creates and owns the
-checklist, dispatches work to teammates, integrates results, and can
-automatically verify completion according to `modes.team` configuration.
-Verification failure can return to the coordinator for repair until the
-configured iteration limit is reached.
+checklist, dispatches work to teammates, and integrates results. Repair
+loops continue until the configured iteration limit is reached. Team mode
+defaults to the current roster; turn on `allow_add_members` in the Mode
+panel if the coordinator may add teammates (they join immediately, with
+no `/approve` step).
 
 ```text
 /mode team
 Implement the feature, review it, update docs, and run the test suite
 ```
 
-Mode roles, participants, iteration limits, and verification settings are
-defined in `team.json`. Reviewers communicate a one-line verdict such as:
+Mode roles, participants, and iteration limits are defined in `team.json`.
+Reviewers communicate a one-line verdict such as:
 
 ```text
 @@review {"verdict":"approve","summary":"LGTM"}
@@ -526,7 +542,8 @@ defined in `team.json`. Reviewers communicate a one-line verdict such as:
 ## Run commands
 
 Runs belong to the current conversation. `/new` starts with no runs, and
-`/resume` restores only the selected conversation's runs.
+the next run in that chat is `run-1`. `/resume` restores only the selected
+conversation's runs.
 
 ### `/runs`
 
@@ -585,26 +602,6 @@ verified must be aborted before it can be blocked manually.
 ```text
 /block run-4 waiting for the schema decision
 ```
-
-### `/verify`
-
-```text
-/verify [run-<id>] [command]
-```
-
-Run a verification command in the workspace in the background and store its
-result on the run. Without a command, Asterline detects a suitable project
-check such as `cargo test`, `npm test`, or `pytest`. Without a run ID, it uses
-the latest run.
-
-```text
-/verify
-/verify run-4 cargo test --all-targets
-```
-
-Verification cannot start while the selected run is active or another
-verification is already running. In configured mode/team runs, failure may
-trigger an automatic repair iteration.
 
 ### `/step`
 

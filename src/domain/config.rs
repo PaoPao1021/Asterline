@@ -19,7 +19,7 @@ pub const ASTERLINE_TEAM_SKILL_PATH: &str = ".agents/skills/asterline-team/SKILL
 /// Live roster and member status. Rewritten whenever the team or a status changes.
 pub const ASTERLINE_ROSTER_PATH: &str = ".asterline/roster.md";
 /// Bump when the embedded skill protocol gains breaking agent-facing changes.
-pub const ASTERLINE_TEAM_SKILL_VERSION: u32 = 16;
+pub const ASTERLINE_TEAM_SKILL_VERSION: u32 = 20;
 const ASTERLINE_TEAM_SKILL: &str = include_str!("../../.agents/skills/asterline-team/SKILL.md");
 pub const ASTERLINE_BRAINSTORM_SKILL_NAME: &str = "asterline-brainstorm";
 pub const ASTERLINE_BRAINSTORM_SKILL_PATH: &str = ".agents/skills/asterline-brainstorm/SKILL.md";
@@ -110,7 +110,8 @@ fn is_managed_skill(text: &str) -> bool {
 
 pub fn team_skill_hint() -> String {
     format!(
-        "The Asterline team skill is available at {ASTERLINE_TEAM_SKILL_PATH}. Read this skill when you need its team controls."
+        "The Asterline team skill is available at {ASTERLINE_TEAM_SKILL_PATH}. Read this skill when you need its team controls. \
+         If a tool or plan is waiting for the user to approve in Asterline, wait — do not retry or assume it ran."
     )
 }
 
@@ -436,10 +437,12 @@ pub fn default_team(
         (true, true) => {
             let mut builder =
                 TeamMember::new("builder", "Builder", BackendKind::Codex, "implementation");
-            builder.sandbox = SandboxPolicy::WorkspaceWrite;
+            builder.apply_codex_permissions_preset(
+                crate::domain::team::CodexPermissionsPreset::AskForApproval,
+            );
             let mut reviewer =
                 TeamMember::new("reviewer", "Reviewer", BackendKind::Claude, "review");
-            reviewer.permission_mode = Some(PermissionMode::Plan);
+            reviewer.permission_mode = Some(PermissionMode::AcceptEdits);
             let mut config = TeamConfig::new("default-mixed", workspace)
                 .with_member(builder)
                 .with_member(reviewer);
@@ -448,11 +451,14 @@ pub fn default_team(
         }
         (true, false) => {
             let mut codex = TeamMember::new("codex", "Codex", BackendKind::Codex, "general");
-            codex.sandbox = SandboxPolicy::WorkspaceWrite;
+            codex.apply_codex_permissions_preset(
+                crate::domain::team::CodexPermissionsPreset::AskForApproval,
+            );
             Some(TeamConfig::new("default-codex", workspace).with_member(codex))
         }
         (false, true) => {
-            let claude = TeamMember::new("claude", "Claude", BackendKind::Claude, "general");
+            let mut claude = TeamMember::new("claude", "Claude", BackendKind::Claude, "general");
+            claude.permission_mode = Some(PermissionMode::AcceptEdits);
             Some(TeamConfig::new("default-claude", workspace).with_member(claude))
         }
         (false, false) if detected.grok => {
@@ -462,7 +468,9 @@ pub fn default_team(
             Some(TeamConfig::new("default-grok", workspace).with_member(grok))
         }
         (false, false) if detected.agy => {
-            let agy = TeamMember::new("agy", "Agy", BackendKind::Agy, "general");
+            let mut agy = TeamMember::new("agy", "Agy", BackendKind::Agy, "general");
+            agy.sandbox = SandboxPolicy::WorkspaceWrite;
+            agy.permission_mode = Some(PermissionMode::AcceptEdits);
             Some(TeamConfig::new("default-agy", workspace).with_member(agy))
         }
         (false, false) => None,
@@ -475,12 +483,14 @@ pub fn default_member(backend: BackendKind) -> TeamMember {
     match backend {
         BackendKind::Codex => {
             let mut m = TeamMember::new("builder", "Builder", BackendKind::Codex, "implementation");
-            m.sandbox = SandboxPolicy::WorkspaceWrite;
+            m.apply_codex_permissions_preset(
+                crate::domain::team::CodexPermissionsPreset::AskForApproval,
+            );
             m
         }
         BackendKind::Claude => {
             let mut m = TeamMember::new("reviewer", "Reviewer", BackendKind::Claude, "review");
-            m.permission_mode = Some(PermissionMode::Plan);
+            m.permission_mode = Some(PermissionMode::AcceptEdits);
             m
         }
         BackendKind::Grok => {
@@ -490,7 +500,10 @@ pub fn default_member(backend: BackendKind) -> TeamMember {
             m
         }
         BackendKind::Agy => {
-            TeamMember::new("researcher", "Researcher", BackendKind::Agy, "research")
+            let mut m = TeamMember::new("researcher", "Researcher", BackendKind::Agy, "research");
+            m.sandbox = SandboxPolicy::WorkspaceWrite;
+            m.permission_mode = Some(PermissionMode::AcceptEdits);
+            m
         }
     }
 }
@@ -608,6 +621,11 @@ mod tests {
         assert_eq!(config.members.len(), 2);
         assert_eq!(config.members[0].backend, BackendKind::Codex);
         assert_eq!(config.members[1].backend, BackendKind::Claude);
+        assert_eq!(config.members[0].sandbox, SandboxPolicy::WorkspaceWrite);
+        assert_eq!(
+            config.members[1].permission_mode,
+            Some(PermissionMode::AcceptEdits)
+        );
         assert_eq!(config.default_member_ids(), vec![MemberId::new("builder")]);
     }
 
@@ -637,6 +655,10 @@ mod tests {
 
         assert_eq!(config.members.len(), 1);
         assert_eq!(config.members[0].backend, BackendKind::Claude);
+        assert_eq!(
+            config.members[0].permission_mode,
+            Some(PermissionMode::AcceptEdits)
+        );
     }
 
     #[test]
@@ -661,6 +683,11 @@ mod tests {
         let config = default_team("/tmp/ws", detected).expect("agy team");
         assert_eq!(config.members.len(), 1);
         assert_eq!(config.members[0].backend, BackendKind::Agy);
+        assert_eq!(config.members[0].sandbox, SandboxPolicy::WorkspaceWrite);
+        assert_eq!(
+            config.members[0].permission_mode,
+            Some(PermissionMode::AcceptEdits)
+        );
     }
 
     #[test]
@@ -856,6 +883,28 @@ mod tests {
     }
 
     #[test]
+    fn default_member_uses_permissive_backend_controls() {
+        let codex = default_member(BackendKind::Codex);
+        assert_eq!(codex.sandbox, SandboxPolicy::WorkspaceWrite);
+        assert_eq!(codex.permission_mode, Some(PermissionMode::Auto));
+        assert_eq!(
+            codex.codex_permissions_preset(),
+            Some(crate::domain::team::CodexPermissionsPreset::AskForApproval)
+        );
+
+        let claude = default_member(BackendKind::Claude);
+        assert_eq!(claude.permission_mode, Some(PermissionMode::AcceptEdits));
+
+        let grok = default_member(BackendKind::Grok);
+        assert_eq!(grok.sandbox, SandboxPolicy::WorkspaceWrite);
+        assert_eq!(grok.permission_mode, Some(PermissionMode::Auto));
+
+        let agy = default_member(BackendKind::Agy);
+        assert_eq!(agy.sandbox, SandboxPolicy::WorkspaceWrite);
+        assert_eq!(agy.permission_mode, Some(PermissionMode::AcceptEdits));
+    }
+
+    #[test]
     fn team_protocol_is_injected_and_stripped_for_persistence() {
         let mut member = TeamMember::new("builder", "Builder", BackendKind::Codex, "impl");
         member.system_prompt = Some("custom prompt".to_string());
@@ -944,7 +993,7 @@ mod tests {
 
         ensure_team_skill(&dir).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("version: 16"));
+        assert!(text.contains("version: 20"));
         assert!(text.contains("@@review"));
         assert!(text.contains("Do not send `@@team_message` merely because teammates are listed"));
         assert!(text.contains(MANAGED_SKILL_MARKER));
@@ -1017,12 +1066,12 @@ mod tests {
     }
 
     #[test]
-    fn embedded_team_skill_is_protocol_v16() {
-        assert_eq!(skill_version(ASTERLINE_TEAM_SKILL), 16);
+    fn embedded_team_skill_is_protocol_v20() {
+        assert_eq!(skill_version(ASTERLINE_TEAM_SKILL), 20);
         assert!(
             ASTERLINE_TEAM_SKILL
                 .lines()
-                .any(|line| line.trim() == "version: 16")
+                .any(|line| line.trim() == "version: 20")
         );
         assert!(ASTERLINE_TEAM_SKILL.contains(MANAGED_SKILL_MARKER));
         assert!(ASTERLINE_TEAM_SKILL.contains("@@review"));
@@ -1047,7 +1096,9 @@ mod tests {
                 .contains("Writing the plan, review, or patch \"for the user\" is not delivery")
         );
         assert!(ASTERLINE_TEAM_SKILL.contains(ASTERLINE_ROSTER_PATH));
-        assert_eq!(ASTERLINE_TEAM_SKILL_VERSION, 16);
+        assert_eq!(ASTERLINE_TEAM_SKILL_VERSION, 20);
+        assert!(ASTERLINE_TEAM_SKILL.contains("write defaults"));
+        assert!(ASTERLINE_TEAM_SKILL.contains("Waiting For User Approval"));
     }
 
     #[test]

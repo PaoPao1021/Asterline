@@ -2,42 +2,26 @@
 //!
 //! Parsing, the command catalog, and completion live in [`crate::contract`]
 //! so the desktop GUI accepts exactly the same commands; this module maps the
-//! UI-agnostic [`crate::contract::ParsedInput`] onto the TUI's [`Submission`]
-//! (whose only TUI-specific concept is [`Drawer`]) and keeps the TUI-side
-//! parse tests as the TUI half of the parser-consistency guarantee.
+//! UI-agnostic [`crate::contract::ParsedInput`] onto the TUI's [`Submission`].
 
 use crate::contract::{self, ParsedInput, Surface};
 use crate::domain::event::{ApprovalDecision, MessageTarget, UiCommand};
 use crate::domain::team::MemberId;
 use crate::tui::drawers::Drawer;
 
-/// What submitting the composer should do.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(clippy::large_enum_variant)] // Runtime commands stay unboxed at the UI boundary.
+#[allow(clippy::large_enum_variant)]
 pub enum Submission {
-    /// Exit the Asterline TUI and begin normal runtime shutdown.
     Exit,
-    /// Open one member's native interactive CLI session.
     Attach { member: MemberId },
-    /// A targeted slash invocation resolved only against the target backend's
-    /// discovered prompt-invocable skills before any prompt is sent to a
-    /// noninteractive backend runner.
     TargetedSlash { member: MemberId, body: String },
-    /// Send a command to the runtime.
     Runtime(UiCommand),
-    /// Open a drawer (a local UI action).
     Drawer(Drawer),
-    /// Approve (true) or reject (false) the first pending approval.
     ApproveFirst(ApprovalDecision),
-    /// Search the transcript (`/find`); empty query clears the search.
     FindInChat(String),
-    /// Show help.
     Help,
-    /// Reject invalid command syntax while leaving the draft untouched.
     Invalid(String),
-    /// Non-empty message text without an explicit target prefix.
     NeedsTarget,
-    /// Nothing to do (blank input).
     Empty,
 }
 
@@ -70,13 +54,10 @@ fn drawer_from_surface(surface: Surface) -> Drawer {
     }
 }
 
-/// Parse the composer text.
 pub fn parse(input: &str) -> Submission {
     contract::parse(input).into()
 }
 
-/// `@member` / `@all` / `/ask member` / `/all` typed with no message body.
-/// Lets an image-only send keep an explicit target.
 pub fn parse_target_only(input: &str) -> Option<MessageTarget> {
     contract::parse_target_only(input)
 }
@@ -121,10 +102,10 @@ mod tests {
             })
         );
         assert_eq!(
-            parse("/continue run-12 fix verification"),
+            parse("/continue run-12 unblock delivery"),
             Submission::Runtime(UiCommand::ContinueRun {
                 run_id: Some(RunId(12)),
-                note: Some("fix verification".to_string())
+                note: Some("unblock delivery".to_string())
             })
         );
         assert_eq!(
@@ -151,8 +132,6 @@ mod tests {
 
     #[test]
     fn tui_and_contract_accept_identical_commands() {
-        // Every no-argument command and alias behaves identically through both
-        // entry points; the desktop bridge is tested against the same catalog.
         for (text, expected) in [
             ("/new", Submission::Runtime(UiCommand::NewSession)),
             ("/clear", Submission::Runtime(UiCommand::NewSession)),

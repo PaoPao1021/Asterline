@@ -1,8 +1,7 @@
 # Desktop parity checklist
 
-> Status: **0.3.0** — every TUI workbench capability below has a GUI entry, a
-> command entry, and an automated test. The alignment baseline is upstream
-> Asterline `v1.0.1` (`e94e357`).
+> Status: **in development (v1.0.4 parity)** — aligned to the latest upstream
+> main after Asterline `v1.0.4` (`93746b9`).
 
 Asterline Desktop shares one feature contract with the TUI: the composer
 parser, the command catalog, completion, and skill invocation rules live in
@@ -28,7 +27,7 @@ host (`parse_composer_text`) for the same `ParsedInput` the TUI consumes.
 | `/continue [run] [note]` | Runs panel "Continue" | `continue_run` | `RunsPanel` vitest coverage via mock, e2e runs panel |
 | `/note [run] <text>` | Runs panel note field | `note_run` | `contract.test.ts` note/block flow |
 | `/block [run] <reason>` | Runs panel block field | `block_run` | same |
-| `/verify [run] [command]` | Runs panel verify (suggested verify prefilled) | `verify_run` | `session_adapter` mapping, e2e |
+| Removed `/verify` engine command | No stale action is shown; verification belongs to the working agent | falls back to help | shared-contract tests |
 | `/step add\|todo\|doing\|done\|block\|rename\|edit\|remove\|delete\|drop\|assign\|owner\|unassign\|clear-owner` | Runs panel step editor (status/owner selects, add, remove) | same `run_*` commands | `contract::tests::plan_and_focus_commands` (arity), `session_adapter::tests::zero_step_is_rejected_at_bridge_boundary` |
 | `/mode <mode>` | Mode switcher buttons | `set_mode` | e2e `opens the command palette … and switches mode` |
 | `/find <query>` | Find tab of the utility drawer | `ComposerAction::find` | `App.test.tsx` find flow |
@@ -55,7 +54,9 @@ host (`parse_composer_text`) for the same `ParsedInput` the TUI consumes.
 | Save overrides into team.json (`SaveModeDefaults`) | "Save as team default" | mock command path; runtime `team_runtime` shares the TUI implementation |
 | Reset overrides | "Reset overrides" | `bridge::clear_mode_overrides` + host command |
 | Start a mode run (`RunMode`) | Task box in the panel | mock `run_mode` handler, `session_adapter` validation |
-| Plan `builder` / `auto_execute` fields | Settings → Modes → Plan; mode panel knobs | `bridge::tests::plan_mode_builder_and_auto_execute_round_trip` |
+| Plan `builder` / `auto_execute` fields | Settings → Modes → Plan; mode panel knobs | `bridge::tests::current_mode_fields_round_trip` |
+| Review `reviewer_hint` and Team `allow_add_members` | Settings and live Mode panel | `current_mode_fields_round_trip`, `ModePanel.test.tsx` |
+| `/new` keeps mode overrides; run labels restart per conversation | Stable Mode state and `run-{number}` labels | runtime regressions + frontend rendering |
 | Unknown settings fields preserved | — (host-side guarantee) | DTO `#[serde(flatten)] extra` round-trip tests |
 
 ## 3. Team & sessions
@@ -65,7 +66,8 @@ host (`parse_composer_text`) for the same `ParsedInput` the TUI consumes.
 | CLI install detection | Settings → General "Backend CLIs on PATH" | `catalog::tests::availability_reports_four_backends` |
 | Real model catalog per backend + manual entry + refresh | Settings → Members model `datalist` + Refresh | mock `list_models`; host `list_models` uses shared `discover_models` |
 | Native session search/selection for `session_id` | Settings → Members session `datalist` | mock `listNativeSessions`; `native_sessions` module tests (claude/codex/grok listing) |
-| Default target, full member fields, approval policy | Settings (unchanged panes + additions) | `SettingsModal.test.tsx` |
+| Default target, full member fields, backend-native permission presets | Settings → Members, using each CLI's own names | `SettingsModal.test.tsx`, root permission mapping tests |
+| Native Codex manual approvals (off by default) | Settings → Approvals and Advanced launch | settings + launch mapping tests |
 | Full conversation history (search, not first 8) | Sidebar search box | Sidebar rendering, e2e snapshot |
 | Session import | Sidebar → Import modal (backend + member + search) | e2e import modal smoke |
 | Session export (Claude format) | Sidebar export button | `contract.test.ts` export notice path |
@@ -78,7 +80,8 @@ host (`parse_composer_text`) for the same `ParsedInput` the TUI consumes.
 | `--team <path>` / `--pick-team` | Project picker "Advanced launch" | `session_adapter::tests::launch_options_map_onto_shared_session_options` |
 | `--db <path>` | Advanced launch "Database path" | same |
 | `--no-restore` | Advanced launch "Restore last conversation" checkbox | same |
-| `--debug` (approval gates off, session-scoped) | Advanced launch risk confirmation (two-step checkbox) | `launch_options_default_to_safe_values`, picker disables Open until acknowledged |
+| `--debug` (developer diagnostics only) | Advanced launch toggle; approval behavior is independent | launch mapping tests |
+| `--manual-approvals` | Advanced launch native Codex approval toggle | launch mapping tests |
 | `--fake` (session-scoped) | Advanced launch "Use offline fake agents" | same |
 | `--no-auto-update` | Desktop is manual-by-default; auto-check opt-in | `to_session_options` test |
 | `--banner` | N/A (terminal decoration, intentionally not copied) | — |
@@ -89,9 +92,9 @@ host (`parse_composer_text`) for the same `ParsedInput` the TUI consumes.
 
 ## 5. Quality gates
 
-- `cargo test` (root crate, includes `contract`, `native_sessions`, TUI regression suites) — 966 tests.
+- `cargo test` (root crate, includes `contract`, `native_sessions`, TUI regression suites) — 995 tests.
 - `cargo clippy` clean (root + `desktop/src-tauri`).
-- `cargo test` in `desktop/src-tauri` — 59 tests (bridge V2, session adapter, composer parsing, attachments, launch options).
-- `pnpm lint` (strict TypeScript), `pnpm test` (36 Vitest tests), `pnpm build`.
-- `pnpm test:e2e` — 6 Playwright scenarios over the mock runtime (primary flow, panels/utilities, settings persistence, queue pull-back, palette, runs panel).
+- `cargo test` in `desktop/src-tauri` — 60 tests (bridge V2, session adapter, composer parsing, attachments, launch options).
+- `pnpm lint` (strict TypeScript), `pnpm test` (46 Vitest tests), `pnpm build`.
+- `pnpm test:e2e` — 9 Playwright scenarios over the mock runtime, including accessibility checks.
 - Three-platform smoke (clipboard images, external attach, paths, lock conflict, diagnostics, installer launch) follows `docs/real-smoke.md` per release.

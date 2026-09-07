@@ -360,12 +360,6 @@ pub enum UiCommand {
         run_id: Option<RunId>,
         reason: String,
     },
-    /// Run verification for the latest run, or a specific run when
-    /// launched from `/runs`.
-    VerifyRun {
-        run_id: Option<RunId>,
-        command: Option<String>,
-    },
     /// Add one checklist step to the latest or specified run.
     AddRunStep {
         run_id: Option<RunId>,
@@ -560,6 +554,7 @@ pub struct MemberSummary {
     pub effort: Option<Effort>,
     pub sandbox: SandboxPolicy,
     pub permission_mode: Option<PermissionMode>,
+    pub approvals_reviewer: crate::domain::team::CodexApprovalsReviewer,
     pub session_policy: SessionPolicy,
 }
 
@@ -623,6 +618,9 @@ pub struct ModeRunStatus {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RunSummary {
     pub id: RunId,
+    /// 1-based index inside the current conversation. `run-1` after `/new`.
+    /// Zero means "use `id`" so older fixtures still render as `run-{id}`.
+    pub number: u32,
     pub goal: String,
     pub status: RunStatus,
     pub coordinator: Option<MemberId>,
@@ -640,6 +638,27 @@ pub struct RunSummary {
     /// `/continue` can refuse them with a clear notice instead of treating them
     /// as ordinary TEAM runs.
     pub legacy_mode: Option<String>,
+}
+
+impl RunSummary {
+    /// User-facing handle, reset per conversation (`run-1` after `/new`).
+    pub fn label(&self) -> String {
+        format!("run-{}", self.display_number())
+    }
+
+    pub fn display_number(&self) -> u64 {
+        if self.number == 0 {
+            self.id.0
+        } else {
+            u64::from(self.number)
+        }
+    }
+}
+
+impl fmt::Display for RunSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.label())
+    }
 }
 
 /// Events sent from the runtime to the TUI. This is the single source of truth

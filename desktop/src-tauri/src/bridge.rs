@@ -208,6 +208,7 @@ pub struct ModeRunV2 {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RunSummaryV2 {
     pub id: u64,
+    pub number: u32,
     pub goal: String,
     pub status: RunStatusV2,
     pub coordinator: Option<String>,
@@ -348,6 +349,8 @@ pub enum ApprovalSurfaceV2 {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ApprovalPolicyV2 {
+    #[serde(default)]
+    pub manual: bool,
     pub gate: Option<Vec<String>>,
     #[serde(default)]
     pub keywords: BTreeMap<String, Vec<String>>,
@@ -361,8 +364,7 @@ pub struct ReviewModeSettingsV2 {
     pub builder: Option<String>,
     pub reviewer: Option<String>,
     pub max_iterations: Option<u32>,
-    pub auto_verify: Option<bool>,
-    pub verify_command: Option<String>,
+    pub reviewer_hint: Option<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -376,8 +378,6 @@ pub struct PlanModeSettingsV2 {
     pub reviewer: Option<String>,
     pub max_iterations: Option<u32>,
     pub auto_execute: Option<bool>,
-    pub auto_verify: Option<bool>,
-    pub verify_command: Option<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -395,8 +395,7 @@ pub struct BrainstormModeSettingsV2 {
 pub struct TeamModeSettingsV2 {
     pub coordinator: Option<String>,
     pub max_iterations: Option<u32>,
-    pub auto_verify: Option<bool>,
-    pub verify_command: Option<String>,
+    pub allow_add_members: Option<bool>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -732,10 +731,6 @@ pub enum DesktopCommandV2 {
     BlockRun {
         run_id: Option<u64>,
         reason: String,
-    },
-    VerifyRun {
-        run_id: Option<u64>,
-        command: Option<String>,
     },
     AddRunStep {
         run_id: Option<u64>,
@@ -1644,6 +1639,7 @@ fn member_summary(value: MemberSummary) -> MemberSummaryV2 {
 fn run_summary(value: RunSummary) -> RunSummaryV2 {
     RunSummaryV2 {
         id: value.id.0,
+        number: value.number,
         goal: value.goal,
         status: run_status(value.status.as_str()),
         coordinator: value.coordinator.map(|id| id.to_string()),
@@ -2058,16 +2054,23 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_builder_and_auto_execute_round_trip() {
+    fn current_mode_fields_round_trip() {
         let modes = asterline::domain::mode::ModesConfig {
+            review: Some(asterline::domain::mode::ReviewModeConfig {
+                reviewer_hint: Some("Check accessibility before approving.".to_string()),
+                ..Default::default()
+            }),
             plan: Some(PlanModeConfig {
                 leader: Some(MemberId::new("lead")),
                 builder: Some(MemberId::new("builder")),
                 reviewer: Some(MemberId::new("reviewer")),
                 max_iterations: Some(2),
                 auto_execute: Some(true),
-                auto_verify: Some(false),
-                verify_command: Some("cargo test".to_string()),
+                ..Default::default()
+            }),
+            team: Some(asterline::domain::mode::TeamModeConfig {
+                allow_add_members: Some(true),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -2076,6 +2079,11 @@ mod tests {
         assert_eq!(plan.builder.as_deref(), Some("builder"));
         assert_eq!(plan.auto_execute, Some(true));
         assert_eq!(plan.leader.as_deref(), Some("lead"));
+        assert_eq!(
+            dto.review.as_ref().unwrap().reviewer_hint.as_deref(),
+            Some("Check accessibility before approving.")
+        );
+        assert_eq!(dto.team.as_ref().unwrap().allow_add_members, Some(true));
         let decoded = modes_config_to_domain(&dto).unwrap();
         assert_eq!(decoded, modes);
     }
@@ -2160,6 +2168,7 @@ mod tests {
     fn run_mode_state_is_structured_not_a_json_string() {
         let run = RunSummary {
             id: asterline::domain::event::RunId(3),
+            number: 2,
             goal: "ship".to_string(),
             status: asterline::domain::event::RunStatus::Running,
             coordinator: None,

@@ -154,6 +154,7 @@ export function Dropdown({
         aria-expanded={open}
         aria-haspopup="listbox"
         aria-controls={open ? menuId : undefined}
+        aria-activedescendant={open ? `${menuId}-option-${activeIndex}` : undefined}
         aria-label={label}
         disabled={disabled}
         onClick={() => (open ? setOpen(false) : openMenu())}
@@ -174,6 +175,7 @@ export function Dropdown({
           {options.map((option, index) => (
             <li
               key={option.value}
+              id={`${menuId}-option-${index}`}
               role="option"
               aria-selected={option.value === value}
               className={`dropdown-option ${index === activeIndex ? "is-active" : ""} ${option.value === value ? "is-selected" : ""}`}

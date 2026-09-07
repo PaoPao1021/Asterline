@@ -74,6 +74,7 @@ pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, state: &AppState,
         })
         .sum();
     let max_scroll = visual_count.saturating_sub(content.height as usize);
+    state.note_drawer_viewport(content.height as usize);
     let offset = state.drawer_scroll().min(max_scroll) as u16;
     frame.render_widget(
         Paragraph::new(lines)
@@ -633,7 +634,7 @@ fn drawer_team_editor(
     if !state.pending_approvals().is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            " Pending approvals are still handled with /approve or /reject.",
+            " Pending approvals are in the card above the composer (y agree · n deny).",
             theme::muted(),
         ));
     }
@@ -796,6 +797,7 @@ mod tests {
                 effort: None,
                 sandbox: SandboxPolicy::WorkspaceWrite,
                 permission_mode: Some(PermissionMode::Default),
+                approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                 session_policy: SessionPolicy::Resume,
             }],
         });
@@ -842,15 +844,9 @@ mod tests {
                 text.contains(':').then_some(text)
             })
             .filter(|line| {
-                [
-                    "name:",
-                    "role:",
-                    "sandbox:",
-                    "approval policy:",
-                    "session id:",
-                ]
-                .iter()
-                .any(|label| line.contains(label))
+                ["name:", "role:", "backend:", "permissions:", "session id:"]
+                    .iter()
+                    .any(|label| line.contains(label))
             })
             .collect::<Vec<_>>();
         let colon_positions = field_lines
@@ -980,6 +976,7 @@ mod tests {
                     effort: None,
                     sandbox: SandboxPolicy::WorkspaceWrite,
                     permission_mode: Some(PermissionMode::Default),
+                    approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                     session_policy: SessionPolicy::Resume,
                 },
                 MemberSummary {
@@ -994,6 +991,7 @@ mod tests {
                     effort: None,
                     sandbox: SandboxPolicy::WorkspaceWrite,
                     permission_mode: Some(PermissionMode::Default),
+                    approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
                     session_policy: SessionPolicy::Resume,
                 },
             ],
@@ -1085,22 +1083,16 @@ mod tests {
             .iter()
             .map(line_text)
             .filter(|text| {
-                [
-                    "builder:",
-                    "reviewer:",
-                    "max_iterations:",
-                    "auto_verify:",
-                    "verify_command:",
-                ]
-                .iter()
-                .any(|label| text.contains(label))
+                ["builder:", "reviewer:", "max_iterations:", "reviewer_hint:"]
+                    .iter()
+                    .any(|label| text.contains(label))
             })
             .map(|text| {
                 let byte = text.find(':').expect("field colon");
                 theme::display_width(&text[..byte])
             })
             .collect::<Vec<_>>();
-        assert!(colons.len() >= 5);
+        assert!(colons.len() >= 4);
         assert!(colons.windows(2).all(|pair| pair[0] == pair[1]));
     }
 }

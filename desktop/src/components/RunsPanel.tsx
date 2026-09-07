@@ -3,11 +3,11 @@ import type { DesktopCommandV2, MemberSummaryV2, RunStatus, RunSummaryV2, RunSte
 import type { Translate } from "../i18n";
 import { Dropdown } from "./Dropdown";
 import { CheckIcon, PlusIcon, XIcon } from "./Icons";
+import { useDialogFocus } from "./useDialogFocus";
 
 interface RunsPanelProps {
   runs: RunSummaryV2[];
   members: MemberSummaryV2[];
-  suggestedVerify?: string | null;
   busy: boolean;
   t: Translate;
   onClose: () => void;
@@ -16,7 +16,8 @@ interface RunsPanelProps {
 
 const STEP_STATUSES: RunStepStatus[] = ["todo", "doing", "done", "blocked"];
 
-export function RunsPanel({ runs, members, suggestedVerify, busy, t, onClose, dispatch }: RunsPanelProps) {
+export function RunsPanel({ runs, members, busy, t, onClose, dispatch }: RunsPanelProps) {
+  const dialog = useDialogFocus<HTMLElement>();
   const [openRun, setOpenRun] = useState<number | null>(runs[0]?.id ?? null);
   // Keyboard-dismissible dialog (WCAG): Escape closes the panel.
   useEffect(() => {
@@ -29,7 +30,6 @@ export function RunsPanel({ runs, members, suggestedVerify, busy, t, onClose, di
   const [stepTitle, setStepTitle] = useState("");
   const [noteText, setNoteText] = useState("");
   const [blockText, setBlockText] = useState("");
-  const [verifyText, setVerifyText] = useState("");
 
   const active = runs.find((run) => run.id === openRun) ?? null;
 
@@ -40,7 +40,7 @@ export function RunsPanel({ runs, members, suggestedVerify, busy, t, onClose, di
 
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <section className="runs-modal" role="dialog" aria-modal="true" aria-label={t("runs")}>
+      <section ref={dialog} className="runs-modal" role="dialog" aria-modal="true" aria-label={t("runs")} tabIndex={-1}>
         <header>
           <h2 id="runs-title">{t("runs")}</h2>
           <button className="icon-button" onClick={onClose} aria-label={t("close")}><XIcon size={15} /></button>
@@ -49,9 +49,9 @@ export function RunsPanel({ runs, members, suggestedVerify, busy, t, onClose, di
         <ul className="runs-list">
           {runs.map((run) => (
             <li key={run.id} className={run.id === openRun ? "active" : ""}>
-              <button onClick={() => setOpenRun(run.id === openRun ? null : run.id)}>
+              <button data-dialog-autofocus={run.id === openRun ? "true" : undefined} onClick={() => setOpenRun(run.id === openRun ? null : run.id)}>
                 <span className={`run-pill status-${run.status}`}>{t(run.status)}</span>
-                <strong>run-{run.id}</strong>
+                <strong>run-{run.number || run.id}</strong>
                 <span className="runs-goal">{run.goal}</span>
                 {run.mode && <span className="run-pill mode">{t(run.mode.mode)} · {run.mode.state.phase || t("running")} {run.mode.state.iteration > 0 ? `${run.mode.state.iteration}/${run.mode.state.max_iterations}` : ""}</span>}
               </button>
@@ -63,7 +63,7 @@ export function RunsPanel({ runs, members, suggestedVerify, busy, t, onClose, di
             <p className="runs-meta">
               {t("attemptLabel")} {active.attempt}
               {active.coordinator ? ` · ${t("coordinatorLabel")}: ${active.coordinator}` : ""}
-              {active.verification ? ` · ${t("verificationLabel")}: ${active.verification.ok ? "✓" : "✗"} ${active.verification.summary}` : ` · ${t("noVerification")}`}
+              {active.mode ? ` · ${t(active.mode.mode)}` : ""}
             </p>
             <ol className="run-steps">
               {active.steps.map((step) => (
@@ -126,14 +126,6 @@ export function RunsPanel({ runs, members, suggestedVerify, busy, t, onClose, di
             </div>
             <div className="run-actions">
               <button className="secondary-button" disabled={busy} onClick={() => withRun((runId) => ({ type: "continue_run", run_id: runId, note: noteText.trim() || null }))}>{t("continue")}</button>
-              <input
-                className="run-verify-input"
-                value={verifyText}
-                placeholder={suggestedVerify ?? t("verifyCommandLabel")}
-                aria-label={t("verify")}
-                onChange={(event) => setVerifyText(event.target.value)}
-              />
-              <button className="secondary-button" disabled={busy} onClick={() => { withRun((runId) => ({ type: "verify_run", run_id: runId, command: verifyText.trim() || null })); setVerifyText(""); }}>{t("verify")}</button>
             </div>
             <div className="run-actions">
               <input

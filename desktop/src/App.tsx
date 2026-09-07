@@ -66,7 +66,7 @@ function fallbackTeam(workspace = ""): TeamSettingsV2 {
       session_id: null,
       effort: "high",
     }],
-    approvals: { gate: null, keywords: {}, apply_to: null },
+    approvals: { manual: false, gate: null, keywords: {}, apply_to: null },
     modes: {},
   };
 }
@@ -262,7 +262,7 @@ export function App() {
   const openWorkspace = async (workspace: string, options: DesktopLaunchOptions = {}) => {
     setProjectBusy(true);
     try {
-      const { riskAck: _riskAck, ...launch } = options;
+      const launch = options;
       setLaunchOptions(launch);
       setUtilityKind(null);
       setUtilityQuery(undefined);
@@ -611,7 +611,7 @@ export function App() {
       {utilityKind && <UtilityDrawer kind={utilityKind} locale={locale} t={t} logs={state.utility.logs} diff={state.utility.diff} skills={state.utility.skills} timelineText={(snapshot?.timeline ?? []).map((item) => ({ id: item.id, title: item.title || item.kind, text: item.text || item.detail || "" }))} initialQuery={utilityQuery} onClose={() => setUtilityKind(null)} onOpen={openUtility} onRefresh={(kind, filters) => void requestUtility(kind, filters)} onExportDiagnostics={exportDiagnostics} />}
 
       {runsOpen && (
-        <RunsPanel runs={snapshot?.runs ?? []} members={snapshot?.members ?? []} suggestedVerify={snapshot?.suggested_verify} busy={membersBusy} t={t} onClose={() => setRunsOpen(false)} dispatch={dispatch} />
+        <RunsPanel runs={snapshot?.runs ?? []} members={snapshot?.members ?? []} busy={membersBusy} t={t} onClose={() => setRunsOpen(false)} dispatch={dispatch} />
       )}
       {modePanelOpen && (
         <ModePanel mode={snapshot?.mode ?? "normal"} defaults={teamSettings.modes} overrides={snapshot?.mode_overrides ?? {}} members={snapshot?.members ?? []} busy={membersBusy} t={t} onClose={() => setModePanelOpen(false)} dispatch={dispatch} />

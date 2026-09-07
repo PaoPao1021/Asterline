@@ -1,7 +1,7 @@
 # Asterline 命令与键盘完整参考
 
 本文档完整说明 Asterline 的启动参数、输入语法、斜杠命令、抽屉界面和键盘操作。
-安装与产品概览请返回[中文 README](../README.zh-CN.md)。也可查看
+安装与产品概览请返回[中文 README](../README.md)。也可查看
 [英文版](commands.md)。
 
 ## 快速上手
@@ -11,7 +11,6 @@
 /mode brainstorm
 怎样降低索引延迟？
 /runs
-/verify run-2 cargo test
 /new
 /resume
 ```
@@ -79,10 +78,18 @@ asterline --db /path/to/asterline.sqlite3
 asterline --no-restore
 ```
 
+### `--manual-approvals`
+
+为 Codex 工具询问显示输入框上方的审批卡片。默认关闭：这些询问会自动通过。
+`team.json` 里写 `"approvals": { "manual": true }` 效果相同。
+
+```bash
+asterline --manual-approvals
+```
+
 ### `--debug`
 
-启用开发模式并关闭 Asterline 的高风险操作审批门。后端自身的权限控制仍然有效。
-只应在受控环境中使用。
+开发模式。不再改变审批行为。
 
 ```bash
 asterline --debug
@@ -213,8 +220,10 @@ Codex Skill 的 `@<Codex 成员> /skill` 才会转换。`@member /` 会列出真
 ```
 
 保存当前对话，创建一个新对话，清空当前显示的聊天记录和运行列表，为所有后端
-创建新的会话 ID，并把终端模式重置为 `normal`。如果仍有成员、协作运行或验证
-处于活动状态，`/new` 会被拒绝；请按 `Esc` 并等待取消完成。
+创建新的会话 ID，并把终端模式重置为 `normal`。上一对话里配置的模式字段
+（审阅人、Builder、迭代上限等本对话覆盖）会带到新对话，同一项目下不必重配。
+新对话里的运行从 `run-1` 重新计数。如果仍有成员、协作运行或验证处于活动
+状态，`/new` 会被拒绝；请按 `Esc` 并等待取消完成。
 
 `/clear` 是 `/new` 的直接别名；两者都会执行完整的新建对话操作，而不是仅隐藏
 屏幕历史。正常重新打开会复用当前选中的对话，不会清空它。
@@ -301,7 +310,8 @@ Asterline 的命令；接入原生后端 CLI 时，那个 CLI 自己的 `/exit` 
 /approve
 ```
 
-批准最早的一条待处理 Asterline 审批请求。没有待审批项时会给出提示。
+批准当前选中的待处理请求（未切换时是最早一条）。日常用法是输入框上方的卡片：
+`y` 或 Enter 同意，`n` 拒绝。没有待审批项时会给出提示。
 
 ### `/reject`
 
@@ -403,8 +413,8 @@ Asterline 的命令；接入原生后端 CLI 时，那个 CLI 自己的 `/exit` 
 `/mode <name>` 仍是键盘快路径：立刻切模式、不打开面板，Notice 只有一行。选择
 `review`、`plan`、`brainstorm` 或 `team` 后，下一条直接输入任务即可，**不要**加
 `@member` 前缀；该消息会按所选模式交给配置的参与成员。`@member <消息>` 有意
-始终是一对一指令，会绕开当前协作 Run。`/new` 把新对话重置为 `normal` 并清空
-本对话覆盖；`/resume` 恢复所选历史对话的模式和覆盖。
+始终是一对一指令，会绕开当前协作 Run。`/new` 把新对话重置为 `normal`，但保留
+上一对话的模式字段设置；`/resume` 恢复所选历史对话的模式和覆盖。
 
 #### `/mode normal`
 
@@ -415,9 +425,9 @@ Asterline 的命令；接入原生后端 CLI 时，那个 CLI 自己的 `/exit` 
 
 启动 builder/reviewer 循环。Builder 执行工作，Reviewer 输出结构化
 `@@review` 结论；未批准时继续修改，直到批准或用尽 `max_iterations`。用尽后
-运行会进入 blocked。Reviewer 被要求亲自检查 working tree 并运行项目检查；
-批准后 auto-verify（若开启）会再次运行验证命令，这是刻意设计的第二道独立
-关卡，而不是可以关掉的冗余步骤。Reviewer 回复中没有结构化结论时会被提醒
+运行会进入 blocked。Reviewer 被要求亲自检查 working tree，而不是只信
+Builder 的报告。可选的 `reviewer_hint` 会追加到这条提示里。
+Reviewer 回复中没有结构化结论时会被提醒
 一次，之后整段回复按 `request_changes` 处理（会有 Notice 说明）并消耗一次
 迭代。
 
@@ -453,15 +463,16 @@ checklist。`modes.plan.auto_execute` 默认 `true`；设为 `false` 时，最�
 #### `/mode team`
 
 启动 Coordinator 驱动的团队运行。Coordinator 创建并负责清单、向其他成员派发
-任务、整合结果，并可按 `modes.team` 配置在完成时自动验证。验证失败后可以回到
-Coordinator 修复，直到达到配置的迭代上限。
+任务并整合结果。修复循环持续到配置的迭代上限。Team 默认只能使用当前队员；
+若允许 Coordinator 加人，在 Mode 面板打开 `allow_add_members`，新队员会立刻
+加入，不再经过 `/approve`。
 
 ```text
 /mode team
 实现功能、完成审查、更新文档并运行测试
 ```
 
-模式角色、参与者、迭代上限和验证设置定义在 `team.json` 中。Reviewer 使用类似
+模式角色、参与者和迭代上限定义在 `team.json` 中。Reviewer 使用类似
 下面的一行式结论通信：
 
 ```text
@@ -470,8 +481,8 @@ Coordinator 修复，直到达到配置的迭代上限。
 
 ## 运行命令
 
-运行只属于当前对话。`/new` 的新对话没有运行记录，`/resume` 只恢复所选对话的
-运行。
+运行只属于当前对话。`/new` 的新对话没有运行记录，下一轮从 `run-1` 开始；
+`/resume` 只恢复所选对话的运行。
 
 ### `/runs`
 
@@ -526,24 +537,6 @@ brainstorm 运行重跑当前生成波次（或投票/综合阶段）；处于�
 ```text
 /block run-4 等待 schema 决策
 ```
-
-### `/verify`
-
-```text
-/verify [run-<id>] [command]
-```
-
-在工作区后台执行验证命令，并把结果保存到运行中。不提供命令时，Asterline 会
-探测 `cargo test`、`npm test`、`pytest` 等常见项目检查。不提供运行 ID 时使用
-最近的运行。
-
-```text
-/verify
-/verify run-4 cargo test --all-targets
-```
-
-所选运行仍在活动，或已有另一个验证任务运行时，不能开始新的验证。在已配置的
-模式/团队运行中，失败可以触发自动修复迭代。
 
 ### `/step`
 

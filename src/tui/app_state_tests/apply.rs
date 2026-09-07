@@ -93,6 +93,7 @@ fn runtime_unavailable_disables_stale_controls_and_attach() {
     state.apply(RuntimeEvent::RunUpdated {
         run: RunSummary {
             id: RunId(9),
+            number: 0,
             goal: "verify release".to_string(),
             status: RunStatus::Verifying,
             coordinator: None,
@@ -116,6 +117,88 @@ fn runtime_unavailable_disables_stale_controls_and_attach() {
         item,
         ChatItem::Notice { text } if text.contains("runtime has stopped")
     )));
+}
+
+#[test]
+fn consecutive_identical_notices_are_coalesced() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready());
+    state.apply(RuntimeEvent::Notice("same".to_string()));
+    state.apply(RuntimeEvent::Notice("same".to_string()));
+    state.apply(RuntimeEvent::Notice("other".to_string()));
+
+    let notices = state
+        .chat()
+        .iter()
+        .filter_map(|item| match item {
+            ChatItem::Notice { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(notices, ["same", "other"]);
+}
+
+#[test]
+fn consecutive_checklist_notices_for_the_same_run_are_coalesced() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready());
+    state.apply(RuntimeEvent::Notice(
+        "builder updated run-1 checklist".to_string(),
+    ));
+    state.apply(RuntimeEvent::Notice(
+        "reviewer updated run-1 checklist".to_string(),
+    ));
+    state.apply(RuntimeEvent::Notice(
+        "builder updated run-2 checklist".to_string(),
+    ));
+
+    let notices = state
+        .chat()
+        .iter()
+        .filter_map(|item| match item {
+            ChatItem::Notice { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        notices,
+        [
+            "builder updated run-1 checklist",
+            "builder updated run-2 checklist"
+        ]
+    );
+}
+
+#[test]
+fn checklist_notices_skip_empty_agent_cells() {
+    let mut state = AppState::new(Vec::new());
+    state.apply(ready());
+    let builder = MemberId::new("builder");
+    state.apply(RuntimeEvent::Notice(
+        "builder updated run-1 checklist".to_string(),
+    ));
+    state.apply(RuntimeEvent::MessageStarted {
+        msg: MessageId(1),
+        turn: TurnId(1),
+        member: builder.clone(),
+    });
+    state.apply(RuntimeEvent::MessageCompleted {
+        msg: MessageId(1),
+        text: String::new(),
+    });
+    state.apply(RuntimeEvent::Notice(
+        "reviewer updated run-1 checklist".to_string(),
+    ));
+
+    let notices = state
+        .chat()
+        .iter()
+        .filter_map(|item| match item {
+            ChatItem::Notice { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(notices, ["builder updated run-1 checklist"]);
 }
 
 #[test]
@@ -186,6 +269,7 @@ fn new_chat_resets_member_sessions_to_fresh() {
             effort: None,
             sandbox: SandboxPolicy::WorkspaceWrite,
             permission_mode: None,
+            approvals_reviewer: crate::domain::team::CodexApprovalsReviewer::User,
             session_policy: SessionPolicy::Resume,
         }],
         runs: Vec::new(),
@@ -282,6 +366,11 @@ fn resume_choices_open_picker_and_selected_chat_replaces_transcript() {
         state.selected_resume_command(),
         Some(UiCommand::ResumeConversation { conversation: 3 })
     );
+    assert_eq!(
+        state.drawer_scroll(),
+        0,
+        "two short chats still fit; do not scroll just because we can"
+    );
 
     state.apply(RuntimeEvent::ConversationResumed {
         conversation: 3,
@@ -299,6 +388,46 @@ fn resume_choices_open_picker_and_selected_chat_replaces_transcript() {
             targets: Vec::new(),
             interrupted: Vec::new(),
         }]
+    );
+}
+
+#[test]
+fn resume_scrolls_only_after_the_selection_hits_the_bottom() {
+    let conversations = (1..=12)
+        .map(|id| ConversationSummary {
+            id,
+            created_at: "2026-08-18 12:00:00".to_string(),
+            preview: format!("chat {id}"),
+            message_count: 1,
+            member_count: 1,
+        })
+        .collect();
+    let mut state = AppState::new(Vec::new());
+    state.apply(RuntimeEvent::ResumeChoices { conversations });
+    state.note_drawer_viewport(10);
+
+    assert_eq!(state.drawer_scroll(), 0);
+    state.select_next_resume();
+    assert_eq!(state.selected_resume(), 1);
+    assert_eq!(
+        state.drawer_scroll(),
+        0,
+        "the second card still fits; stay put"
+    );
+
+    state.select_next_resume();
+    assert_eq!(state.selected_resume(), 2);
+    assert_eq!(
+        state.drawer_scroll(),
+        1,
+        "the selected card crossed the bottom, so scroll just enough"
+    );
+
+    state.select_previous_resume();
+    assert_eq!(
+        state.drawer_scroll(),
+        1,
+        "moving up while still visible must not jump the list"
     );
 }
 
@@ -326,6 +455,7 @@ fn run_updates_insert_then_replace() {
     let mut state = AppState::new(Vec::new());
     let run = RunSummary {
         id: RunId(1),
+        number: 0,
         goal: "ship parser".to_string(),
         status: RunStatus::Running,
         coordinator: Some(MemberId::new("builder")),
@@ -367,6 +497,7 @@ fn runs_drawer_stages_selected_run_action_without_overwriting_draft() {
     state.apply(RuntimeEvent::RunUpdated {
         run: RunSummary {
             id: RunId(1),
+            number: 0,
             goal: "ship parser".to_string(),
             status: RunStatus::Done,
             coordinator: Some(MemberId::new("builder")),
@@ -384,7 +515,7 @@ fn runs_drawer_stages_selected_run_action_without_overwriting_draft() {
     state.toggle_drawer(Drawer::Runs);
     assert!(state.stage_selected_run_action());
     assert_eq!(state.drawer(), None);
-    assert_eq!(state.composer().text(), "/verify run-1");
+    assert_eq!(state.composer().text(), "/mode plan");
 
     state.clear_composer();
     state.insert_char('x');
@@ -407,6 +538,7 @@ fn runs_drawer_can_select_an_older_run() {
         runs: vec![
             RunSummary {
                 id: RunId(1),
+                number: 0,
                 goal: "ship parser".to_string(),
                 status: RunStatus::Done,
                 coordinator: Some(MemberId::new("builder")),
@@ -421,6 +553,7 @@ fn runs_drawer_can_select_an_older_run() {
             },
             RunSummary {
                 id: RunId(2),
+                number: 0,
                 goal: "refactor ui".to_string(),
                 status: RunStatus::Running,
                 coordinator: Some(MemberId::new("builder")),
@@ -443,10 +576,10 @@ fn runs_drawer_can_select_an_older_run() {
     assert_eq!(state.selected_run().map(|run| run.id), Some(RunId(1)));
     assert_eq!(
         state.selected_run_action_command().as_deref(),
-        Some("/verify run-1")
+        Some("/mode plan")
     );
     assert!(state.stage_selected_run_action());
-    assert_eq!(state.composer().text(), "/verify run-1");
+    assert_eq!(state.composer().text(), "/mode plan");
 }
 
 #[test]
@@ -456,6 +589,7 @@ fn runs_drawer_can_select_steps_and_stage_step_actions() {
     state.apply(RuntimeEvent::RunUpdated {
         run: RunSummary {
             id: RunId(1),
+            number: 0,
             goal: "ship checklist".to_string(),
             status: RunStatus::Running,
             coordinator: Some(MemberId::new("builder")),
@@ -555,18 +689,14 @@ fn runs_drawer_can_select_steps_and_stage_step_actions() {
 }
 
 #[test]
-fn run_action_previews_detected_verify_command() {
-    let dir = std::env::temp_dir().join(format!("asterline-action-preview-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+fn run_action_previews_verify_without_guessing_a_command() {
     let mut state = AppState::new(Vec::new());
     state.apply(RuntimeEvent::Ready {
         modes: Default::default(),
         mode_overrides: Default::default(),
         suggested_verify: None,
         team: "mixed".to_string(),
-        workspace: dir.display().to_string(),
+        workspace: "/tmp/ws".to_string(),
         default_target: Some(DefaultTarget::Member(MemberId::new("builder"))),
         runs: Vec::new(),
         members: Vec::new(),
@@ -574,6 +704,7 @@ fn run_action_previews_detected_verify_command() {
     state.apply(RuntimeEvent::RunUpdated {
         run: RunSummary {
             id: RunId(1),
+            number: 0,
             goal: "ship parser".to_string(),
             status: RunStatus::Done,
             coordinator: Some(MemberId::new("builder")),
@@ -590,13 +721,11 @@ fn run_action_previews_detected_verify_command() {
 
     assert_eq!(
         state.latest_run_action_command().as_deref(),
-        Some("/verify cargo test")
+        Some("/mode plan")
     );
     state.toggle_drawer(Drawer::Runs);
     assert!(state.stage_selected_run_action());
-    assert_eq!(state.composer().text(), "/verify run-1 cargo test");
-
-    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(state.composer().text(), "/mode plan");
 }
 
 #[test]
@@ -606,6 +735,7 @@ fn run_action_continues_failed_and_blocked_runs() {
     state.apply(RuntimeEvent::RunUpdated {
         run: RunSummary {
             id: RunId(1),
+            number: 0,
             goal: "ship parser".to_string(),
             status: RunStatus::Failed,
             coordinator: Some(MemberId::new("builder")),
@@ -638,6 +768,7 @@ fn run_action_continues_failed_and_blocked_runs() {
     state.apply(RuntimeEvent::RunUpdated {
         run: RunSummary {
             id: RunId(2),
+            number: 0,
             goal: "unblock release".to_string(),
             status: RunStatus::Blocked,
             coordinator: Some(MemberId::new("builder")),

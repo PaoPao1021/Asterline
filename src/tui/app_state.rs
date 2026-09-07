@@ -2,6 +2,7 @@
 //! [`AppState::apply`]; the renderer reads it and the key handler mutates the
 //! composer / drawer / scroll. No state is inferred from matching strings.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -22,12 +23,19 @@ use crate::domain::event::{
 };
 use crate::domain::mode::{ModesConfig, TerminalMode};
 use crate::domain::team::{
-    BackendKind, DefaultTarget, Effort, MemberId, PermissionMode, SandboxPolicy, SessionPolicy,
-    TeamMember,
+    BackendKind, CodexApprovalsReviewer, DefaultTarget, Effort, MemberId, PermissionMode,
+    SandboxPolicy, SessionPolicy, TeamMember,
 };
-use crate::run_support::suggested_verify_command;
+
 use crate::tui::attach::AttachRequest;
 use crate::tui::completion::{self, AgentSkill, Completion};
+
+const RESUME_LIST_HEADER_LINES: usize = 2;
+const RESUME_CHOICE_LINES: usize = 3;
+
+fn resume_choice_line(index: usize) -> usize {
+    RESUME_LIST_HEADER_LINES + index.saturating_mul(RESUME_CHOICE_LINES)
+}
 use crate::tui::composer::{Composer, MAX_COMPOSER_BYTES};
 use crate::tui::drawers::Drawer;
 use crate::tui::mode_editor::{ModeEditor, ModeEditorOutcome};
@@ -65,6 +73,20 @@ pub(crate) fn member_status_is_active(status: MemberStatus) -> bool {
             | MemberStatus::Waiting
             | MemberStatus::NeedsApproval
     )
+}
+
+fn checklist_notice_run(text: &str) -> Option<&str> {
+    let rest = text.strip_suffix(" checklist")?;
+    let (_, run) = rest.rsplit_once(" updated ")?;
+    run.starts_with("run-").then_some(run)
+}
+
+fn notices_are_redundant(existing: &str, incoming: &str) -> bool {
+    existing == incoming
+        || matches!(
+            (checklist_notice_run(existing), checklist_notice_run(incoming)),
+            (Some(left), Some(right)) if left == right
+        )
 }
 
 fn reasoning_status_header(text: &str) -> Option<String> {
@@ -124,6 +146,7 @@ pub struct MemberView {
     pub effort: Option<Effort>,
     pub sandbox: SandboxPolicy,
     pub permission_mode: Option<PermissionMode>,
+    pub approvals_reviewer: CodexApprovalsReviewer,
     pub session_policy: SessionPolicy,
 }
 
@@ -131,6 +154,7 @@ pub struct MemberView {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingApproval {
     pub id: ApprovalId,
+    pub member: Option<MemberId>,
     pub action: String,
     pub body: String,
 }
@@ -193,6 +217,7 @@ pub struct AppState {
     selected_run_step: Option<u32>,
     runs_detail: bool,
     pending_approvals: Vec<PendingApproval>,
+    selected_approval: usize,
     paused_routes: usize,
     composer: Composer,
     pending_images: Vec<PromptImage>,
@@ -235,6 +260,9 @@ pub struct AppState {
     find: Option<FindState>,
     /// Vertical scroll offset for the open drawer (logs / team / diff).
     drawer_scroll: usize,
+    /// Last painted drawer body height. Resume selection uses it so we only
+    /// scroll when the highlighted chat would leave the viewport.
+    drawer_viewport: Cell<usize>,
     /// Captured working-tree diff text for the diff drawer (`/diff`).
     diff_text: Option<String>,
     /// Editable draft shown by the `/team` drawer.
@@ -301,6 +329,7 @@ impl AppState {
             selected_run_step: None,
             runs_detail: false,
             pending_approvals: Vec::new(),
+            selected_approval: 0,
             paused_routes: 0,
             composer: Composer::new(),
             pending_images: Vec::new(),
@@ -331,6 +360,7 @@ impl AppState {
             history_search: None,
             find: None,
             drawer_scroll: 0,
+            drawer_viewport: Cell::new(0),
             diff_text: None,
             team_editor: None,
             mode_editor: None,
@@ -399,6 +429,7 @@ impl AppState {
                         effort: m.effort,
                         sandbox: m.sandbox,
                         permission_mode: m.permission_mode,
+                        approvals_reviewer: m.approvals_reviewer,
                         session_policy: m.session_policy,
                     })
                     .collect();
@@ -804,19 +835,24 @@ impl AppState {
                 });
             }
             RuntimeEvent::ApprovalRequested {
-                id, action, body, ..
+                id,
+                member,
+                action,
+                body,
             } => {
                 self.pending_approvals.push(PendingApproval {
                     id,
-                    action: action.clone(),
-                    body: body.clone(),
+                    member,
+                    action,
+                    body,
                 });
-                self.push(ChatItem::Notice {
-                    text: format!("approval needed [{action}]: {body} — /approve or /reject"),
-                });
+                if self.pending_approvals.len() == 1 {
+                    self.selected_approval = 0;
+                }
             }
             RuntimeEvent::ApprovalResolved { id, decision } => {
                 self.pending_approvals.retain(|a| a.id != id);
+                self.clamp_selected_approval();
                 self.push(ChatItem::Notice {
                     text: format!("approval {}", decision.as_str()),
                 });
@@ -852,14 +888,15 @@ impl AppState {
                 self.push_log(entry);
             }
             RuntimeEvent::Notice(text) => {
-                self.push(ChatItem::Notice { text });
+                if !self.should_skip_notice(&text) {
+                    self.push(ChatItem::Notice { text });
+                }
             }
             RuntimeEvent::SessionReset => {
                 // Begin a fresh chat: clear the transcript and in-flight cells,
                 // but keep members, logs, and prompt history. Runs belong to
                 // the previous conversation and remain reachable via /resume.
                 self.active_mode = TerminalMode::Normal;
-                self.mode_overrides = ModesConfig::default();
                 self.mode_editor = None;
                 self.chat.clear();
                 self.touch_chat();
@@ -924,6 +961,19 @@ impl AppState {
                 self.stash_team_editor_catalog();
             }
         }
+    }
+
+    fn should_skip_notice(&self, text: &str) -> bool {
+        for item in self.chat.iter().rev() {
+            match item {
+                ChatItem::Notice { text: last } => {
+                    return notices_are_redundant(last, text);
+                }
+                ChatItem::Agent { text, .. } if text.trim().is_empty() => {}
+                _ => return false,
+            }
+        }
+        false
     }
 
     fn push(&mut self, item: ChatItem) -> usize {
@@ -1137,14 +1187,11 @@ impl AppState {
 
     fn update_reasoning_status(&mut self, member: MemberId, delta: &str) {
         let delta = bounded_text(delta, MAX_CHAT_ITEM_BYTES);
-        if delta.is_empty() {
-            return;
-        }
         self.thinking_started
             .entry(member.clone())
             .or_insert_with(Instant::now);
-        let current_text = {
-            let buffer = self.reasoning_buffers.entry(member.clone()).or_default();
+        let buffer = self.reasoning_buffers.entry(member.clone()).or_default();
+        if !delta.is_empty() {
             if delta.starts_with(buffer.as_str()) {
                 *buffer = delta;
             } else if !buffer.ends_with(&delta) {
@@ -1153,12 +1200,14 @@ impl AppState {
             if let Some(header) = reasoning_status_header(buffer) {
                 self.active_reasoning.insert(member.clone(), header);
             }
-            buffer.clone()
-        };
+        }
+        let current_text = buffer.clone();
         let (display_name, backend) = self.member_meta(&member);
         if backend != BackendKind::Codex {
             if let Some(&idx) = self.open_thinking.get(&member) {
-                if let Some(ChatItem::Thinking { text, .. }) = self.chat.get_mut(idx) {
+                if !current_text.is_empty()
+                    && let Some(ChatItem::Thinking { text, .. }) = self.chat.get_mut(idx)
+                {
                     *text = current_text;
                     self.touch_chat();
                 }
@@ -1633,6 +1682,40 @@ impl AppState {
 
     pub fn first_pending_approval(&self) -> Option<ApprovalId> {
         self.pending_approvals.first().map(|a| a.id)
+    }
+
+    pub fn selected_pending_approval(&self) -> Option<&PendingApproval> {
+        self.pending_approvals.get(self.selected_approval)
+    }
+
+    pub fn selected_approval_index(&self) -> usize {
+        self.selected_approval
+    }
+
+    pub fn select_next_pending_approval(&mut self) {
+        if self.pending_approvals.len() < 2 {
+            return;
+        }
+        self.selected_approval = (self.selected_approval + 1) % self.pending_approvals.len();
+    }
+
+    pub fn select_prev_pending_approval(&mut self) {
+        if self.pending_approvals.len() < 2 {
+            return;
+        }
+        self.selected_approval = if self.selected_approval == 0 {
+            self.pending_approvals.len() - 1
+        } else {
+            self.selected_approval - 1
+        };
+    }
+
+    fn clamp_selected_approval(&mut self) {
+        if self.pending_approvals.is_empty() {
+            self.selected_approval = 0;
+        } else {
+            self.selected_approval = self.selected_approval.min(self.pending_approvals.len() - 1);
+        }
     }
 
     /// Request attaching to the member at `idx`'s live backend session. The
@@ -2452,13 +2535,34 @@ impl AppState {
 
     pub fn select_previous_resume(&mut self) {
         self.selected_resume = self.selected_resume.saturating_sub(1);
-        self.drawer_scroll = self.selected_resume.saturating_mul(3);
+        self.reveal_selected_resume();
     }
 
     pub fn select_next_resume(&mut self) {
         if self.selected_resume + 1 < self.resume_choices.len() {
             self.selected_resume += 1;
-            self.drawer_scroll = self.selected_resume.saturating_mul(3);
+            self.reveal_selected_resume();
+        }
+    }
+
+    pub fn note_drawer_viewport(&self, height: usize) {
+        self.drawer_viewport.set(height);
+    }
+
+    /// Keep the highlighted resume chat in view. Scroll only when it would
+    /// leave the top or bottom of the drawer, not on every selection change.
+    fn reveal_selected_resume(&mut self) {
+        let viewport = self.drawer_viewport.get();
+        if viewport == 0 {
+            return;
+        }
+        let start = resume_choice_line(self.selected_resume);
+        let end = start.saturating_add(RESUME_CHOICE_LINES);
+        if end > self.drawer_scroll.saturating_add(viewport) {
+            self.drawer_scroll = end.saturating_sub(viewport);
+        }
+        if start < self.drawer_scroll {
+            self.drawer_scroll = start;
         }
     }
 
@@ -2711,7 +2815,6 @@ impl AppState {
             members,
             self.modes.clone(),
             self.mode_overrides.clone(),
-            self.suggested_verify.clone(),
             self.active_mode,
         ));
     }
@@ -2837,6 +2940,7 @@ impl AppState {
         member.model = view.model.clone();
         member.sandbox = view.sandbox;
         member.permission_mode = view.permission_mode;
+        member.approvals_reviewer = view.approvals_reviewer;
         member.session_policy = view.session_policy;
         member.session_id = view.session.clone();
         member.effort = view.effort;
@@ -2969,24 +3073,11 @@ impl AppState {
 
 pub(crate) fn run_action_command(
     run: &RunSummary,
-    workspace: &str,
+    _workspace: &str,
     include_run_id: bool,
 ) -> Option<String> {
     match run.status {
         RunStatus::Running | RunStatus::Verifying => None,
-        RunStatus::Done if run.verification.is_none() => {
-            let workspace = if workspace.is_empty() {
-                Path::new(".")
-            } else {
-                Path::new(workspace)
-            };
-            let mut command = verify_command_prefix(run, include_run_id);
-            if let Some(check) = suggested_verify_command(workspace) {
-                command.push(' ');
-                command.push_str(check);
-            }
-            Some(command)
-        }
         RunStatus::Done => run
             .mode
             .as_ref()
@@ -3007,17 +3098,9 @@ pub(crate) fn run_action_command(
     }
 }
 
-fn verify_command_prefix(run: &RunSummary, include_run_id: bool) -> String {
-    if include_run_id {
-        format!("/verify {}", run.id)
-    } else {
-        "/verify".to_string()
-    }
-}
-
 fn continue_command_prefix(run: &RunSummary, include_run_id: bool) -> String {
     if include_run_id {
-        format!("/continue {}", run.id)
+        format!("/continue {}", run.label())
     } else {
         "/continue".to_string()
     }
@@ -3034,7 +3117,7 @@ fn run_step_action_command(run: &RunSummary, step: u32) -> Option<String> {
         RunStepStatus::Blocked => ("doing", Some("blocker resolved")),
         RunStepStatus::Done => ("todo", Some("reopen")),
     };
-    let mut command = format!("/step {action} {} {}", run.id, step.number);
+    let mut command = format!("/step {action} {} {}", run.label(), step.number);
     if let Some(note) = note {
         command.push(' ');
         command.push_str(note);
@@ -3048,7 +3131,7 @@ fn run_step_dispatch_command(run: &RunSummary, step: u32) -> Option<String> {
         .iter()
         .find(|candidate| candidate.number == step)?;
     let Some(owner) = &step.owner else {
-        return Some(format!("/step assign {} {} ", run.id, step.number));
+        return Some(format!("/step assign {} {} ", run.label(), step.number));
     };
 
     let instruction = match step.status {
@@ -3060,7 +3143,7 @@ fn run_step_dispatch_command(run: &RunSummary, step: u32) -> Option<String> {
     Some(format!(
         "@{owner} {}",
         crate::runtime::mode_prompts::manual_step_dispatch_text(
-            run.id,
+            run.label(),
             instruction,
             step.number,
             &step.title,

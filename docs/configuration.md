@@ -4,7 +4,7 @@
 
 This page covers team files, runtime data, permissions, CLI options, agent
 coordination, and troubleshooting. For the product overview, return to the
-[main README](../README.md). For interactive controls, see the
+[English README](../README.en.md). For interactive controls, see the
 [command reference](commands.md).
 
 ## How Asterline resolves a team
@@ -104,8 +104,7 @@ terminal.
       "builder": "builder",
       "reviewer": "reviewer",
       "max_iterations": 3,
-      "auto_execute": true,
-      "auto_verify": true
+      "auto_execute": true
     },
     "brainstorm": {
       "participants": ["builder", "reviewer", "grok"],
@@ -113,7 +112,8 @@ terminal.
       "ideas_per_round": 4
     },
     "team": {
-      "coordinator": "builder"
+      "coordinator": "builder",
+      "allow_add_members": false
     }
   },
   "approvals": {
@@ -153,7 +153,7 @@ when omitted, a complete checklist proceeds directly to the Builder. `auto_execu
 to `true`; set it to `false` to require `/approve` before the Builder receives the finalized
 checklist. Defaults for budgets:
 `max_iterations = 3`, `generation_rounds = 3`, `ideas_per_round = 4`,
-`auto_execute = true`, `auto_verify = true`.
+`auto_execute = true`.
 Brainstorm requires at least two distinct resolved participants; repeating an
 ID or referring to the same member once by ID and once by display name is
 rejected.
@@ -175,12 +175,12 @@ Markdown numbering.
 | `leader`            | plan             | Member who writes and revises the checklist                 |
 | `participants`      | brainstorm       | Roster for all generation waves                             |
 | `generation_rounds` | brainstorm       | Seed/build/stretch wave budget (default 3, minimum 2)       |
-| `ideas_per_round`   | brainstorm       | Requested idea cards per member/wave (default 4, minimum 3) |
+| `ideas_per_round`   | brainstorm       | Exact cards per member/wave (default 4); extras discarded.  |
 | `coordinator`       | team             | Member who coordinates the whole-team run                   |
-| `max_iterations`    | review/plan/team | Loop budget before blocking or failing verify (def 3)       |
+| `allow_add_members` | team             | Free add via `@@team_member` (default locked to the roster) |
+| `max_iterations`    | review/plan/team | Loop budget before blocking (default 3)                     |
 | `auto_execute`      | plan             | Auto-dispatch final plan (default); false needs `/approve`  |
-| `auto_verify`       | review/plan/team | Runs after Review approval or Plan Builder completion.      |
-| `verify_command`    | review/plan/team | Explicit auto-verify shell command (else heuristic)         |
+| `reviewer_hint`     | review           | Optional extra text appended to the reviewer prompt         |
 
 Each mode has its own configuration shape; unrelated fields are rejected by
 Serde instead of being silently accepted and ignored.
@@ -192,24 +192,17 @@ conversation, while `w` writes the current mode's conversation overrides into
 
 ### Approvals (`approvals`)
 
-Policy for the approval gate. With no `approvals` section, all built-in
-categories and all surfaces are enabled.
+Older `team.json` files may still contain an `approvals` section (`gate`,
+`keywords`, `apply_to`). Those fields are kept for compatibility and no longer
+hold user messages, relays, or mode dispatches. Set `"approvals": { "manual":
+true }` (or pass `--manual-approvals`) to show the composer card for Codex
+tool asks; the default is to approve them automatically. Plan
+`auto_execute: false` is a separate confirmation. `@@team_member` is not an
+approval. Set `ASTERLINE_NO_BELL=1` to disable terminal BEL/OSC 9 notifications
+on approval, paused route, blocked run, and member error events.
 
-| Field      | Meaning                                                                 |
-| ---------- | ----------------------------------------------------------------------- |
-| `gate`     | Built-in categories to keep: `git`, `shell`, `file`. Omit for all three |
-| `keywords` | Custom categories: name → keyword list (case-insensitive match)         |
-| `apply_to` | Surfaces: `user`, `relay`, `mode`. Omit for all surfaces                |
-
-`user` is ordinary user messages; `relay` is agent-to-agent routes and
-agent-requested roster additions; `mode` is engine dispatches for collaboration
-modes. Roster additions are always held when the `relay` surface is enabled,
-independent of keyword categories. Set `ASTERLINE_NO_BELL=1` to disable terminal
-BEL/OSC 9 notifications on approval, paused route, blocked run, and member error
-events.
-
-See [approvals and tool-level control](approvals.md) for how this gate relates
-to backend-native sandbox and permission enforcement.
+See [approvals and tool-level control](approvals.md) for how tool callbacks
+relate to backend-native sandbox and permission enforcement.
 
 ### Member fields
 
@@ -283,19 +276,23 @@ Team editor.
 | `cwd`                  | App Server `thread/start`/`thread/resume`                          | Process cwd                                 | ACP session `cwd`                                               | Process cwd plus `--add-dir`; prompt identifies the project workspace        |
 | `model`                | App Server `model`                                                 | `--model`                                   | Agent `--model`                                                 | `--model`                                                                    |
 | `effort`               | App Server `effort`; picker follows model metadata                 | `--effort` (through `max`)                  | Cache-defined levels pass as Agent `--reasoning-effort`         | Model-specific effort; defined only by its listed model (not a generic menu) |
-| `sandbox`              | `read-only` / `workspace-write` / `danger-full-access`             | Not passed (not shown in `/team`)           | `read-only` / `workspace` / `off` profile mapping               | Terminal sandbox on/off; read-only intent also forces `--mode plan`          |
-| `permission_mode`      | App Server `approvalPolicy` (`never` by default)                   | `--permission-mode` (default omitted)       | Mode plus ACP responses                                         | `--mode`; bypass requires terminal sandbox off                               |
+| `sandbox`              | Folded into `/approvals` presets                                   | Not passed (not shown in `/team`)           | Default `workspace`; not shown in `/team`                       | Default off; not shown in `/team`                                            |
+| `permission_mode`      | Codex `/approvals` presets (`Ask for approval` default)            | `--permission-mode` (default omitted)       | `default` / `auto` / `plan` / `--always-approve`                | `--mode accept-edits`/`plan`; skip-permissions only when `off`               |
 | `allowed_tools`        | Not passed                                                         | `--tools` (hard built-in-tool allowlist)    | Added to ACP session rules; not a hard protocol-level allowlist | Not passed                                                                   |
 | `system_prompt`        | App Server `developerInstructions`                                 | `--append-system-prompt`                    | ACP session `rules`                                             | Prepended to the print prompt                                                |
 | `session_policy`       | Resume or fresh                                                    | Resume or fresh                             | ACP `session/load` or `session/new`                             | Resume or fresh conversation                                                 |
 | `session_id`           | App Server `thread/resume <thread.id>`                             | `claude --resume <id>`                      | ACP `session/load`                                              | `agy --conversation <id>`                                                    |
 
-For compatibility with existing `team.json` files, Codex's displayed policies
-are stored through the shared adapter field: omitted/default,
-`dontAsk`/`bypassPermissions` map to `never`; `plan`/`acceptEdits` map to
-`untrusted`; and `auto` maps to `on-request`. Codex command, file-change, and permission-escalation callbacks are
+`/team` shows the names each installed CLI's own UI uses. Codex combines
+sandbox and approval into the `/approvals` presets (`Read Only`, `Ask for
+approval`, `Approve for me`, `Full Access`) and sends App Server `approvalPolicy` (`never` by default)
+only for unmatched Custom leftovers, plus `sandbox` and `approvalsReviewer`.
+Shared `team.json` fields stay on the existing adapter names so older rosters
+still load: omitted/default,
+`dontAsk`/`bypassPermissions` map to Codex `never`; `plan`/`acceptEdits` map
+to `untrusted`; and `auto` maps to `on-request`. Codex command, file-change, and permission-escalation callbacks are
 shown as Asterline pending approvals and return your one-time decision to the
-live App Server thread; the selected sandbox remains an independent boundary.
+live App Server thread.
 For Claude and Grok, choose only permission modes accepted by the installed CLI version. Asterline serializes
 the configured value but does not negotiate vendor-version compatibility before
 launch. Agy 1.1.12 or newer is required;
@@ -463,12 +460,9 @@ Asterline launches backend CLIs locally and inherits their credentials,
 environment variables, filesystem access, and network access. It does not
 provide a security boundary around a backend process.
 
-Backend-native permission and sandbox settings still apply. Asterline also
-places requests it classifies as risky behind its own approval gate. Use
-`/approve` or `/reject` to resolve the first pending request.
-
-`--debug` disables the Asterline approval gate. It does not add a sandbox and
-should only be used in a controlled development environment.
+Backend-native permission and sandbox settings still apply. Codex tool asks
+are approved automatically unless `--manual-approvals` or
+`approvals.manual` is on; then the card above the composer is used.
 
 The `danger-full-access` sandbox and bypass-style permission modes should be
 treated as explicit trust decisions. Never assume a team role or model name
@@ -512,8 +506,10 @@ An agent may request a missing specialty:
 ```
 
 Asterline validates duplicate IDs and names, starts the runner, saves the
-roster, and broadcasts the updated team. Agent envelopes can add members but
-cannot delete them; deletion remains a `/team` action.
+roster, and broadcasts the updated team. Omitted `sandbox` and
+`permission_mode` take that backend's write defaults (Agy: `accept-edits`,
+sandbox off). Agent envelopes can add members but cannot delete them;
+deletion remains a `/team` action.
 
 ### Run checklist updates
 
@@ -539,7 +535,8 @@ These updates appear in `/runs` and are recorded in the run timeline.
 | `--workspace <PATH>` | Set the workspace; defaults to the current directory |
 | `--db <PATH>`        | Set the SQLite database path                         |
 | `--no-restore`       | Do not replay persisted chat on startup              |
-| `--debug`            | Disable Asterline's approval gate                    |
+| `--debug`            | Developer mode                                       |
+| `--manual-approvals` | Show the Codex tool-approval card (off by default)   |
 | `--fake`             | Use offline fake agents instead of backend CLIs      |
 | `--banner`           | Print a compact startup banner before the TUI        |
 | `-h`, `--help`       | Print command-line help                              |

@@ -75,20 +75,22 @@ const demoTeam: TeamSettingsV2 = {
     },
   ],
   approvals: {
+    manual: true,
     gate: ["git", "shell", "file"],
     keywords: { deploy: ["publish", "release", "deploy"] },
     apply_to: ["user", "relay", "mode"],
   },
   modes: {
-    review: { builder: "builder", reviewer: "reviewer", max_iterations: 3, auto_verify: true, verify_command: "cargo test --locked" },
-    plan: { leader: "builder", builder: "researcher", reviewer: "reviewer", max_iterations: 2, auto_execute: false, auto_verify: false, verify_command: null },
+    review: { builder: "builder", reviewer: "reviewer", max_iterations: 3, reviewer_hint: "Check the desktop flow and accessibility before approving." },
+    plan: { leader: "builder", builder: "researcher", reviewer: "reviewer", max_iterations: 2, auto_execute: false },
     brainstorm: { participants: ["builder", "reviewer", "researcher"], generation_rounds: 3, ideas_per_round: 4 },
-    team: { coordinator: "builder", max_iterations: 4, auto_verify: true, verify_command: "cargo test --locked" },
+    team: { coordinator: "builder", max_iterations: 4, allow_add_members: false },
   },
 };
 
 const demoRun: RunSummaryV2 = {
   id: 18,
+  number: 1,
   goal: "Ship the desktop event bridge",
   status: "running",
   coordinator: "builder",
@@ -122,7 +124,7 @@ export const demoSnapshot: DesktopSnapshotV2 = {
   mode_overrides: {},
   queues: [],
   relay_paused: false,
-  suggested_verify: "cargo test --locked",
+  suggested_verify: null,
   active_conversation: null,
   timeline_truncated: false,
   members: demoTeam.members.map((member, index) => ({
@@ -190,7 +192,6 @@ const demoCatalog: CommandSpec[] = [
   { name: "runs", hint: "run status · next action", takes_argument: false },
   { name: "step", hint: "manage run checklist", takes_argument: true },
   { name: "team", hint: "edit roster · sessions · approvals", takes_argument: false },
-  { name: "verify", hint: "verify latest or selected run", takes_argument: true },
 ];
 
 const demoModels: ModelSummary[] = [
@@ -303,17 +304,6 @@ class MockDesktopClient implements DesktopClient {
         case "retry": return argument ? invalidNoArgs("retry") : { type: "command", command: { type: "retry" } };
         case "runs": return argument ? invalidNoArgs("runs") : { type: "surface", surface: "runs" };
         case "team": return argument ? invalidNoArgs("team") : { type: "surface", surface: "team" };
-        case "verify": {
-          const match = argument.match(/^run-(\d+)\s*(.*)$/);
-          return {
-            type: "command",
-            command: {
-              type: "verify_run",
-              run_id: match ? Number(match[1]) : null,
-              command: match && match[2] ? match[2] : argument && !match ? argument : null,
-            },
-          };
-        }
         default: return { type: "help" };
       }
     }
@@ -596,6 +586,7 @@ class MockDesktopClient implements DesktopClient {
       case "new_session":
         this.snapshot.timeline = [];
         this.snapshot.approvals = [];
+        this.snapshot.runs = [];
         this.snapshot.active_conversation = null;
         this.emit({ type: "timeline_cleared" });
         return;
@@ -617,12 +608,10 @@ class MockDesktopClient implements DesktopClient {
         this.addNotice("Successfully exported session to Claude format: ~/.claude/projects/demo/session.jsonl");
         return;
       case "continue_run":
-      case "verify_run":
       case "block_run": {
         const run = this.snapshot.runs.find(({ id }) => id === command.run_id) ?? this.snapshot.runs[0];
         if (!run) return;
         if (command.type === "continue_run") run.status = "running";
-        if (command.type === "verify_run") run.status = "verifying";
         if (command.type === "block_run") run.status = "blocked";
         run.updated_at = now();
         this.emit({ type: "run_updated", run: clone(run) });
@@ -691,6 +680,7 @@ class MockDesktopClient implements DesktopClient {
       case "run_mode": {
         const run: RunSummaryV2 = {
           id: Math.max(18, ...this.snapshot.runs.map(({ id }) => id)) + 1,
+          number: Math.max(0, ...this.snapshot.runs.map(({ number }) => number)) + 1,
           goal: command.task,
           status: "running",
           coordinator: this.snapshot.members[0]?.id ?? null,

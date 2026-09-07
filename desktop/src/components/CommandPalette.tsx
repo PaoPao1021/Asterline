@@ -99,7 +99,6 @@ function exampleFor(spec: CommandSpec, members: Map<string, string>): string {
     case "mode": return "/mode plan";
     case "note": return "/note run-1 checkpoint";
     case "step": return "/step add title";
-    case "verify": return "/verify cargo test";
     default: return `/${spec.name} …`;
   }
 }

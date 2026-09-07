@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import type { DesktopCommandV2, MemberSummaryV2, RunSummaryV2 } from "../bridge/types";
 import type { Locale, Translate } from "../i18n";
-import { CheckIcon, ChevronIcon, MoreIcon, PanelRightIcon, RefreshIcon, RunIcon, UsersIcon } from "./Icons";
+import { CheckIcon, ChevronIcon, MoreIcon, PanelRightIcon, RunIcon, UsersIcon } from "./Icons";
 
 interface InspectorProps {
   open: boolean;
@@ -39,7 +39,7 @@ function RunCard({ run, t, dispatch }: { run: RunSummaryV2; t: Translate; dispat
     <div className="run-card">
       <button className="run-card-heading" onClick={() => setOpen((value) => !value)} aria-expanded={open}>
         <span className={`run-status-icon run-${run.status}`}><RunIcon size={15} /></span>
-        <span><strong>{run.goal}</strong><small>#{run.id} · {t(run.status)}</small></span>
+        <span><strong>{run.goal}</strong><small>run-{run.number || run.id} · {t(run.status)}</small></span>
         <ChevronIcon className={open ? "rotate-90" : ""} size={16} />
       </button>
       <div className="run-progress"><span style={{ width: `${progress}%` }} /></div>
@@ -56,7 +56,6 @@ function RunCard({ run, t, dispatch }: { run: RunSummaryV2; t: Translate; dispat
           </ol>
           <div className="run-actions">
             <button onClick={() => void dispatch({ type: "continue_run", run_id: run.id, note: null })}>{t("continue")}</button>
-            <button onClick={() => void dispatch({ type: "verify_run", run_id: run.id, command: null })}><RefreshIcon size={13} />{t("verify")}</button>
           </div>
         </>
       )}

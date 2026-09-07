@@ -76,14 +76,20 @@ fn bootstrap_desktop(
     let Some(workspace) = workspace else {
         return Ok(state.lock()?.model.snapshot());
     };
-    let mut options = options.unwrap_or_default();
+    let options = options.unwrap_or_default();
     // Debug-build escape hatch for smoke tests: run the offline fake agents
     // without walking the advanced launcher. Release builds ignore it, and it
     // is never persisted.
     #[cfg(debug_assertions)]
-    if std::env::var_os("ASTERLINE_DESKTOP_FAKE").as_deref() == Some(std::ffi::OsStr::new("1")) {
-        options.fake = true;
-    }
+    let options = {
+        let mut options = options;
+        if std::env::var_os("ASTERLINE_DESKTOP_FAKE").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            options.fake = true;
+        }
+        options
+    };
     // Debug and fake launches are session-scoped: they never persist anywhere.
     let workspace = validate_workspace(&workspace)?;
 
@@ -896,7 +902,6 @@ fn command_can_dispatch_backend(command: &DesktopCommandV2) -> bool {
             | DesktopCommandV2::ResumeConversation { .. }
             | DesktopCommandV2::ImportSession { .. }
             | DesktopCommandV2::ContinueRun { .. }
-            | DesktopCommandV2::VerifyRun { .. }
             | DesktopCommandV2::RunMode { .. }
     )
 }
@@ -1037,10 +1042,6 @@ mod tests {
                 attachments: Vec::new(),
             }
         ));
-        assert!(command_can_dispatch_backend(&DesktopCommandV2::VerifyRun {
-            run_id: None,
-            command: None,
-        }));
         assert!(command_can_dispatch_backend(
             &DesktopCommandV2::ImportSession {
                 member: None,
