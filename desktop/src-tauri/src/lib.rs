@@ -83,8 +83,7 @@ fn bootstrap_desktop(
     #[cfg(debug_assertions)]
     let options = {
         let mut options = options;
-        if std::env::var_os("ASTERLINE_DESKTOP_FAKE").as_deref()
-            == Some(std::ffi::OsStr::new("1"))
+        if std::env::var_os("ASTERLINE_DESKTOP_FAKE").as_deref() == Some(std::ffi::OsStr::new("1"))
         {
             options.fake = true;
         }
