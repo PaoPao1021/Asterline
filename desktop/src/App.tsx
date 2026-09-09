@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { getDesktopClient } from "./bridge/client";
 import type {
   BackendKind,
@@ -104,8 +104,6 @@ export function App() {
   const utilityRequest = useRef(0);
   const pendingEvents = useRef<DesktopEventV2[]>([]);
   const hasSnapshot = useRef(false);
-  const shell = useRef<HTMLDivElement>(null);
-  const pointerFrame = useRef<number | null>(null);
   const timelineScroll = useRef<HTMLDivElement>(null);
   const pendingTeamSettings = useRef<string | null>(null);
   const diagnosticsChecked = useRef(false);
@@ -175,17 +173,13 @@ export function App() {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem("asterline.theme", theme);
     const meta = document.querySelector('meta[name="theme-color"]');
-    meta?.setAttribute("content", theme === "dark" ? "#111816" : "#f4f2ec");
+    meta?.setAttribute("content", theme === "dark" ? "#0d1117" : "#ffffff");
   }, [theme]);
 
   useEffect(() => {
     document.documentElement.lang = locale;
     localStorage.setItem("asterline.locale", locale);
   }, [locale]);
-
-  useEffect(() => () => {
-    if (pointerFrame.current !== null) cancelAnimationFrame(pointerFrame.current);
-  }, []);
 
   useEffect(() => {
     let sidebarIsCompact = window.innerWidth <= SIDEBAR_BREAKPOINT;
@@ -491,18 +485,6 @@ export function App() {
     });
   };
 
-  const moveArtField = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const x = event.clientX;
-    const y = event.clientY;
-    if (pointerFrame.current !== null) cancelAnimationFrame(pointerFrame.current);
-    pointerFrame.current = requestAnimationFrame(() => {
-      shell.current?.style.setProperty("--pointer-x", `${x}px`);
-      shell.current?.style.setProperty("--pointer-y", `${y}px`);
-      shell.current?.style.setProperty("--pointer-tilt-x", `${(x / window.innerWidth - 0.5) * 2}`);
-      shell.current?.style.setProperty("--pointer-tilt-y", `${(y / window.innerHeight - 0.5) * 2}`);
-    });
-  };
-
   const membersBusy = snapshot?.members.some(({ status }) => status === "running" || status === "queued") ?? false;
 
   if (state.loading && !snapshot) {
@@ -516,21 +498,7 @@ export function App() {
 
   const teamSettings = snapshot?.team ?? fallbackTeam(snapshot?.workspace ?? "");
   return (
-    <div className="app-shell" ref={shell} onPointerMove={moveArtField}>
-      <div className="art-canvas" aria-hidden="true">
-        <span className="art-orbit art-orbit-one" />
-        <span className="art-orbit art-orbit-two" />
-        <span className="art-flare art-flare-one" />
-        <span className="art-flare art-flare-two" />
-        <span className="art-grid" />
-        <svg className="art-noise-svg" aria-hidden="true">
-          <filter id="canvas-grain">
-            <feTurbulence type="fractalNoise" baseFrequency="0.75" numOctaves="3" stitchTiles="stitch" />
-            <feColorMatrix type="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 0.05 0" />
-          </filter>
-          <rect width="100%" height="100%" filter="url(#canvas-grain)" />
-        </svg>
-      </div>
+    <div className="app-shell">
       <Sidebar
         open={sidebarOpen}
         locale={locale}
@@ -551,13 +519,9 @@ export function App() {
       />
 
       <main className="workspace-main">
-        <div className="stage-wordmark" aria-hidden="true">
-          <span>ASTERLINE</span>
-          <small>ORCHESTRATED INTELLIGENCE / LIVE SYSTEM</small>
-        </div>
         <header className="topbar">
           {!sidebarOpen && <button className="icon-button panel-restore-button" onClick={toggleSidebar} aria-label={t("expand")}><PanelLeftIcon /></button>}
-          <div className="topbar-title"><span className="topbar-folder"><FolderIcon size={16} /></span><div><span className="topbar-kicker">LIVE WORKSPACE / 01</span><strong>{snapshot?.team?.name || snapshot?.workspace?.split(/[\\/]/).at(-1) || t("workspace")}</strong><small><i className={snapshot?.phase === "ready" ? "online" : ""} />{snapshot?.phase === "ready" ? t("connected") : t("starting")}</small></div></div>
+          <div className="topbar-title"><span className="topbar-folder"><FolderIcon size={16} /></span><div><strong>{snapshot?.team?.name || snapshot?.workspace?.split(/[\\/]/).at(-1) || t("workspace")}</strong><small><i className={snapshot?.phase === "ready" ? "online" : ""} />{snapshot?.phase === "ready" ? t("connected") : t("starting")}</small></div></div>
           <div className="topbar-actions">
             {client.kind === "mock" && <span className="demo-pill">{t("demo")}</span>}
             <button className="icon-button" aria-label={snapshot?.relay_paused ? t("resumeRelayAuto") : t("pauseRelay")} title={snapshot?.relay_paused ? t("resumeRelayAuto") : t("pauseRelay")} onClick={() => void dispatch({ type: "set_relay_paused", paused: !snapshot?.relay_paused })}>{snapshot?.relay_paused ? <PlayIcon /> : <PauseIcon />}</button>

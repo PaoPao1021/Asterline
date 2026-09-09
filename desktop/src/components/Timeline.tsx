@@ -156,13 +156,8 @@ export function Timeline({ items, members, locale, t, resolvingRoute, onResolveP
   if (items.length === 0) {
     return (
       <div className="timeline-empty">
-        <div className="empty-typo-canvas" aria-hidden="true">
-          <div className="typo-word">ASTERLINE</div>
-          <div className="typo-word outline">ASTERLINE</div>
-          <div className="typo-word blur">ASTERLINE</div>
-        </div>
         <div className="empty-content-box">
-          <div className="empty-orbit"><span /><span /><span /></div>
+          <img src="/asterline-mark.svg" alt="" />
           <h2>{t("timelineEmptyTitle")}</h2>
           <p>{t("timelineEmptyBody")}</p>
         </div>

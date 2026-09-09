@@ -24,16 +24,19 @@ test("completes the primary collaboration and approval flow", async ({ page }) =
 });
 
 test("restores both panels and keeps utilities usable", async ({ page }) => {
-  const sidebar = page.getByRole("complementary", { name: "Menu" });
-  const inspector = page.getByRole("complementary", { name: "Inspector" });
+  // Collapsed panels are intentionally inert and absent from the a11y tree.
+  const sidebar = page.getByRole("complementary", { name: "Menu", includeHidden: true });
+  const inspector = page.getByRole("complementary", { name: "Inspector", includeHidden: true });
 
   await sidebar.getByRole("button", { name: "Collapse sidebar" }).click();
   await expect(sidebar).toHaveClass(/is-closed/);
+  await expect(sidebar).toHaveAttribute("inert", "");
   await page.getByRole("main").getByRole("button", { name: "Open navigation" }).click();
   await expect(sidebar).toHaveClass(/is-open/);
 
   await inspector.getByRole("button", { name: "Details" }).click();
   await expect(inspector).toHaveClass(/is-closed/);
+  await expect(inspector).toHaveAttribute("inert", "");
   await page.getByRole("main").getByRole("button", { name: "Details", exact: true }).click();
   await expect(inspector).toHaveClass(/is-open/);
 
@@ -92,7 +95,51 @@ test("opens the runs panel and shows the structured mode state", async ({ page }
   await expect(runs.getByText(/implementing/)).toBeVisible();
 });
 
+test("uses one rounded focus boundary for the composer", async ({ page }) => {
+  const textarea = page.getByRole("textbox", { name: /Message the team/ });
+  const shell = page.locator(".composer");
+  await textarea.focus();
+  await expect(shell).toHaveCSS("border-color", "rgb(17, 107, 69)");
+
+  const focusStyle = await textarea.evaluate((element) => {
+    const inputStyle = getComputedStyle(element);
+    const shellStyle = getComputedStyle(element.closest(".composer")!);
+    return {
+      inputOutline: inputStyle.outlineStyle,
+      inputShadow: inputStyle.boxShadow,
+      shellBorderColor: shellStyle.borderColor,
+      shellRadius: shellStyle.borderRadius,
+      shellShadow: shellStyle.boxShadow,
+    };
+  });
+
+  expect(focusStyle.inputOutline).toBe("none");
+  expect(focusStyle.inputShadow).toBe("none");
+  expect(focusStyle.shellBorderColor).toBe("rgb(17, 107, 69)");
+  expect(focusStyle.shellRadius).toBe("10px");
+  expect(focusStyle.shellShadow).not.toBe("none");
+});
+
 test("target selector is a themed dropdown with keyboard support", async ({ page }) => {
+  // Lucide already compensates for its viewBox. A CSS non-scaling-stroke
+  // override would compensate twice and clog the smallest button icons.
+  const icons = await page.locator("button .ui-icon:visible").evaluateAll((elements) =>
+    elements.map((svg) => {
+      const shape = svg.querySelector("path, circle, rect, line, polyline, polygon")!;
+      const style = getComputedStyle(shape);
+      const size = svg.getBoundingClientRect().width;
+      return { size, vectorEffect: style.vectorEffect, visualStroke: parseFloat(style.strokeWidth) * size / 24 };
+    }),
+  );
+  expect(icons.length).toBeGreaterThan(5);
+  for (const icon of icons) {
+    expect(icon.size).toBeGreaterThanOrEqual(16);
+    expect(icon.vectorEffect).toBe("none");
+    expect(icon.visualStroke).toBeCloseTo(2, 2);
+  }
+  await expect(page.locator(".mode-switcher button").first()).toHaveCSS("font-size", "14px");
+  await expect(page.locator(".mode-switcher button").first()).toHaveCSS("line-height", "20px");
+
   const composer = page.getByRole("textbox", { name: /Message the team/ });
   await composer.click();
 

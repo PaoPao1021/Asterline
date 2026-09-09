@@ -22,11 +22,12 @@ export function RunsPanel({ runs, members, busy, t, onClose, dispatch }: RunsPan
   // Keyboard-dismissible dialog (WCAG): Escape closes the panel.
   useEffect(() => {
     const listener = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !busy) onClose();
+      // Closing this view does not stop or mutate the active run.
+      if (event.key === "Escape") onClose();
     };
     window.addEventListener("keydown", listener);
     return () => window.removeEventListener("keydown", listener);
-  }, [busy, onClose]);
+  }, [onClose]);
   const [stepTitle, setStepTitle] = useState("");
   const [noteText, setNoteText] = useState("");
   const [blockText, setBlockText] = useState("");

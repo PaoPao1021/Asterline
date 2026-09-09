@@ -67,7 +67,7 @@ export function Inspector({ open, members, runs, t, onToggle, dispatch, onAttach
   const [tab, setTab] = useState<"members" | "runs">("members");
   const running = useMemo(() => members.filter(({ status }) => status === "running" || status === "queued").length, [members]);
   return (
-    <aside className={`inspector ${open ? "is-open" : "is-closed"}`} aria-label={t("inspector")}>
+    <aside className={`inspector ${open ? "is-open" : "is-closed"}`} aria-label={t("inspector")} inert={!open}>
       <div className="inspector-head">
         <div className="inspector-tabs" role="tablist">
           <button role="tab" aria-selected={tab === "members"} className={tab === "members" ? "active" : ""} onClick={() => setTab("members")}><UsersIcon size={16} />{t("members")}<span>{members.length}</span></button>

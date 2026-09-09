@@ -47,14 +47,19 @@ import {
 export type IconProps = LucideProps;
 
 function withDefaults(Component: LucideIcon) {
-  return function AsterlineIcon({ className, size = 20, strokeWidth = 1.8, ...props }: IconProps) {
+  return function AsterlineIcon({ className, size = 20, strokeWidth = 2, ...props }: IconProps) {
+    // Small, odd-sized SVGs lose internal detail in compact buttons. Keep the
+    // numeric UI sizes on an even grid, without changing Lucide's string API.
+    const iconSize = typeof size === "number" ? Math.max(16, Math.ceil(size / 2) * 2) : size;
+    // Lucide compensates for the viewBox scale exactly once. Do not also
+    // apply CSS non-scaling-stroke to the child paths.
     return (
       <Component
         aria-hidden="true"
         focusable="false"
         absoluteStrokeWidth
         className={["ui-icon", className].filter(Boolean).join(" ")}
-        size={size}
+        size={iconSize}
         strokeWidth={strokeWidth}
         {...props}
       />

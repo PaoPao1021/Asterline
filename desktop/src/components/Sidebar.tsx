@@ -65,11 +65,10 @@ export function Sidebar({
   }, [conversations, search]);
 
   return (
-    <aside className={`sidebar ${open ? "is-open" : "is-closed"}`} aria-label={t("menu")}>
+    <aside className={`sidebar ${open ? "is-open" : "is-closed"}`} aria-label={t("menu")} inert={!open}>
       <div className="brand-row">
         <img className="brand-mark" src="/asterline-mark.svg" alt="" />
         <div className="brand-copy">
-          <span className="brand-overline" aria-hidden="true">COLLECTIVE / 01</span>
           <strong>{t("appName")}</strong>
           <small>{t("desktop")}</small>
         </div>
@@ -146,7 +145,6 @@ export function Sidebar({
           <SettingsIcon size={17} />
           <span>{t("settings")}</span>
         </button>
-        <div className="profile-status"><span className="profile-dot">A</span><small>LOCAL / READY</small></div>
       </div>
     </aside>
   );
