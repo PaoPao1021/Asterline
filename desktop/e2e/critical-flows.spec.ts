@@ -157,3 +157,18 @@ test("target selector is a themed dropdown with keyboard support", async ({ page
   await expect(trigger).toContainText("Reviewer");
   await expect(listbox).toBeHidden();
 });
+
+test("compact widget buttons keep visible bounds and crisp vector geometry", async ({ page }) => {
+  const workspaceActions = page.getByRole("toolbar", { name: "Workspace actions" });
+  const settings = workspaceActions.getByRole("button", { name: "Team settings" });
+  const utilityPanels = page.getByRole("toolbar", { name: "Utility panels" });
+  const logs = utilityPanels.getByRole("button", { name: "Logs" });
+
+  await expect(workspaceActions).toHaveCSS("border-top-width", "1px");
+  await expect(settings).toHaveCSS("width", "32px");
+  await expect(settings).toHaveCSS("height", "32px");
+  await expect(settings.locator(".ui-icon")).toHaveCSS("width", "18px");
+  await expect(logs).toHaveCSS("min-height", "32px");
+  await expect(logs).toHaveCSS("border-top-width", "1px");
+  await expect(logs.locator(".ui-icon")).toHaveCSS("width", "16px");
+});

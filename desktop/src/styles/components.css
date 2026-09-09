@@ -981,6 +981,7 @@ select {
   display: block;
   flex: 0 0 auto;
   overflow: visible;
+  shape-rendering: geometricPrecision;
 }
 
 .brand-copy {
@@ -2816,22 +2817,22 @@ small {
 }
 
 .icon-button {
-  border: 0;
-  background: transparent;
-  color: var(--muted);
+  border: 1px solid var(--border);
+  background: var(--surface-soft);
+  color: var(--text);
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  transition: color .15s ease, background-color .15s ease, box-shadow .15s ease;
-  width: 34px;
-  height: 34px;
+  transition: color .12s ease, border-color .12s ease, background-color .12s ease, box-shadow .12s ease;
+  width: 36px;
+  height: 36px;
   border-radius: 6px;
 }
 
 .subtle-icon-button {
-  border: 0;
+  border: 1px solid transparent;
   background: transparent;
-  color: var(--muted);
+  color: var(--text);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -3102,23 +3103,36 @@ small {
 .topbar-actions {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: 8px;
   flex-shrink: 0;
 }
 
-.topbar-actions .icon-button small {
-  position: absolute;
-  right: 0;
-  bottom: 0;
-  border-radius: 3px;
-  font-weight: 600;
-  min-width: 13px;
-  line-height: 1;
-  background: var(--panel-muted);
-  color: var(--text);
-  font-size: var(--text-control);
-  line-height: var(--line-control);
-  padding: 1px 2px;
+.topbar-control-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.topbar-control-group .icon-button {
+  width: 32px;
+  height: 32px;
+  border-color: transparent;
+  background: transparent;
+}
+
+.topbar-control-group .icon-button:hover:not(:disabled),
+.topbar-control-group .icon-button:active:not(:disabled) {
+  border-color: var(--border-strong);
+}
+
+.language-code {
+  color: currentColor;
+  font: 650 12px/1 var(--font-sans);
+  letter-spacing: .02em;
 }
 
 .demo-pill {
@@ -3157,16 +3171,21 @@ small {
   padding: 5px 16px;
   border-bottom: 1px solid var(--border);
   overflow-x: auto;
+  background: var(--panel);
 }
 
 .utility-launcher button {
-  color: var(--muted);
+  color: var(--text);
   cursor: pointer;
-  border: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border);
   border-radius: 5px;
-  padding: 7px 10px;
+  min-height: 32px;
+  padding: 5px 10px;
   font: 500 var(--text-control)/var(--line-control) var(--font-sans);
-  background: transparent;
+  background: var(--surface);
   white-space: nowrap;
 }
 
@@ -3176,7 +3195,7 @@ small {
   display: inline-flex;
   gap: 5px;
   align-items: center;
-  border: 0;
+  border: 1px solid transparent;
   border-radius: 5px;
   padding: 7px 10px;
   font: 500 var(--text-control)/var(--line-control) var(--font-sans);
@@ -3185,19 +3204,20 @@ small {
 }
 
 .utility-launcher button:hover {
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  border-color: var(--border-strong);
   color: var(--text-strong);
   background: var(--surface-hover);
 }
 
 .utility-launcher button.active {
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
-  color: var(--text-strong);
-  background: var(--surface-hover);
+  border-color: color-mix(in srgb, var(--accent) 65%, var(--border));
+  color: var(--accent-strong);
+  background: var(--accent-faint);
+  box-shadow: inset 0 -2px var(--accent);
 }
 
 .utility-launcher-button:hover {
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  border-color: var(--border-strong);
   color: var(--text-strong);
   background: var(--surface-hover);
 }

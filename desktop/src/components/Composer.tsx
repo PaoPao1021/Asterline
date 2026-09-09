@@ -18,7 +18,7 @@ import type {
 } from "../bridge/types";
 import type { Translate } from "../i18n";
 import { Dropdown } from "./Dropdown";
-import { ImageIcon, PlusIcon, SendIcon, SparkIcon, StopIcon } from "./Icons";
+import { ImageIcon, PlusIcon, SendIcon, SparkIcon, StopIcon, XIcon } from "./Icons";
 
 /** Composer budget mirrored from the shared contract (256 KiB). */
 export const MAX_COMPOSER_BYTES = 256 * 1024;
@@ -358,7 +358,7 @@ export function Composer({
       <div className="mode-row" role="toolbar" aria-label={t("modes")}>
         <div className="mode-switcher">
           <SparkIcon size={13} className="mode-switcher-glyph" />
-          {MODES.map((value) => <button key={value} className={mode === value ? "active" : ""} onClick={() => onMode(value)} disabled={disabled}>{t(value)}</button>)}
+          {MODES.map((value) => <button key={value} className={mode === value ? "active" : ""} aria-pressed={mode === value} onClick={() => onMode(value)} disabled={disabled}>{t(value)}</button>)}
         </div>
       </div>
       <div className={`composer ${disabled ? "disabled" : ""}`}>
@@ -389,7 +389,7 @@ export function Composer({
                     getDesktopClient().removeStagedAttachment(attachment.token).catch(() => undefined);
                   }}
                 >
-                  ×
+                  <XIcon size={16} />
                 </button>
               </span>
             ))}

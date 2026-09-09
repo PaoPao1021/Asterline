@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { BackendKind, DesktopCommandV2, MemberSummaryV2, NativeSessionSummary } from "../bridge/types";
 import type { Translate } from "../i18n";
 import { Dropdown } from "./Dropdown";
-import { XIcon } from "./Icons";
+import { RefreshIcon, XIcon } from "./Icons";
 
 const BACKENDS: BackendKind[] = ["codex", "claude", "grok", "agy"];
 
@@ -84,7 +84,7 @@ export function SessionImportModal({ workspace, members, busy, t, onClose, dispa
             aria-label={t("nativeSessionSearch")}
             onChange={(event) => setQuery(event.target.value)}
           />
-          <button className="icon-button" aria-label={t("refreshUtility")} onClick={() => void load()} disabled={busy}>⟳</button>
+          <button className="icon-button" aria-label={t("refreshUtility")} title={t("refreshUtility")} onClick={() => void load()} disabled={busy}><RefreshIcon size={18} /></button>
         </div>
         {error && <p className="session-import-error">{error}</p>}
         <ul className="session-import-list">

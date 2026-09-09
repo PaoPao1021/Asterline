@@ -17,7 +17,7 @@ import type {
 import { ApprovalQueue } from "./components/ApprovalQueue";
 import { CommandPalette } from "./components/CommandPalette";
 import { Composer } from "./components/Composer";
-import { ChevronIcon, CommandIcon, FolderIcon, GlobeIcon, MoonIcon, PanelLeftIcon, PanelRightIcon, PauseIcon, PlayIcon, RefreshIcon, SettingsIcon, SunIcon, XIcon } from "./components/Icons";
+import { ChevronIcon, CodeIcon, FolderIcon, ModeIcon, MoonIcon, PanelLeftIcon, PanelRightIcon, PauseIcon, PlayIcon, RefreshIcon, RunIcon, SearchIcon, SettingsIcon, SunIcon, TerminalIcon, ToolIcon, XIcon } from "./components/Icons";
 import { Inspector } from "./components/Inspector";
 import { ModePanel } from "./components/ModePanel";
 import { ProjectPicker } from "./components/ProjectPicker";
@@ -524,22 +524,26 @@ export function App() {
           <div className="topbar-title"><span className="topbar-folder"><FolderIcon size={16} /></span><div><strong>{snapshot?.team?.name || snapshot?.workspace?.split(/[\\/]/).at(-1) || t("workspace")}</strong><small><i className={snapshot?.phase === "ready" ? "online" : ""} />{snapshot?.phase === "ready" ? t("connected") : t("starting")}</small></div></div>
           <div className="topbar-actions">
             {client.kind === "mock" && <span className="demo-pill">{t("demo")}</span>}
-            <button className="icon-button" aria-label={snapshot?.relay_paused ? t("resumeRelayAuto") : t("pauseRelay")} title={snapshot?.relay_paused ? t("resumeRelayAuto") : t("pauseRelay")} onClick={() => void dispatch({ type: "set_relay_paused", paused: !snapshot?.relay_paused })}>{snapshot?.relay_paused ? <PlayIcon /> : <PauseIcon />}</button>
-            <button className="icon-button" aria-label={t("commandPalette")} title={`${t("commandPalette")} (Ctrl+K)`} onClick={() => { setPaletteExecutable(true); setPaletteOpen(true); }}><CommandIcon /></button>
-            <button className="icon-button" aria-label={t("language")} title={t("language")} onClick={() => setLocale((value) => value === "zh-CN" ? "en-US" : "zh-CN")}><GlobeIcon /><small>{locale === "zh-CN" ? "中" : "EN"}</small></button>
-            <button className="icon-button" aria-label={t("theme")} title={t("theme")} onClick={() => setTheme((value) => value === "light" ? "dark" : "light")}>{theme === "light" ? <MoonIcon /> : <SunIcon />}</button>
-            <button className={`icon-button ${updateBusy ? "is-spinning" : ""}`} aria-label={t("update")} title={t("update")} disabled={updateBusy} onClick={() => void checkUpdate()}><RefreshIcon /></button>
-            <button className="icon-button" aria-label={t("settings")} title={t("settings")} onClick={() => setSettingsOpen(true)}><SettingsIcon /></button>
-            <button className="utility-launcher-button" onClick={() => openUtility("find")} title={t("find")}><span>/</span>{t("find")}</button>
-            {!inspectorOpen && <button className="icon-button panel-restore-button" onClick={toggleInspector} aria-label={t("details")}><PanelRightIcon /></button>}
+            <div className="topbar-control-group" role="toolbar" aria-label={t("workspaceActions")}>
+              <button className="icon-button" aria-label={snapshot?.relay_paused ? t("resumeRelayAuto") : t("pauseRelay")} aria-pressed={Boolean(snapshot?.relay_paused)} title={snapshot?.relay_paused ? t("resumeRelayAuto") : t("pauseRelay")} onClick={() => void dispatch({ type: "set_relay_paused", paused: !snapshot?.relay_paused })}>{snapshot?.relay_paused ? <PlayIcon size={18} /> : <PauseIcon size={18} />}</button>
+              <button className="icon-button" aria-label={t("commandPalette")} title={`${t("commandPalette")} (Ctrl+K)`} onClick={() => { setPaletteExecutable(true); setPaletteOpen(true); }}><TerminalIcon size={18} /></button>
+              <button className="icon-button language-button" aria-label={t("language")} title={t("language")} onClick={() => setLocale((value) => value === "zh-CN" ? "en-US" : "zh-CN")}><span className="language-code" aria-hidden="true">{locale === "zh-CN" ? "中" : "EN"}</span></button>
+              <button className="icon-button" aria-label={t("theme")} title={t("theme")} onClick={() => setTheme((value) => value === "light" ? "dark" : "light")}>{theme === "light" ? <MoonIcon size={18} /> : <SunIcon size={18} />}</button>
+              <button className={`icon-button ${updateBusy ? "is-spinning" : ""}`} aria-label={t("update")} title={t("update")} disabled={updateBusy} onClick={() => void checkUpdate()}><RefreshIcon size={18} /></button>
+              <button className="icon-button" aria-label={t("settings")} title={t("settings")} onClick={() => setSettingsOpen(true)}><SettingsIcon size={18} /></button>
+              <button className="utility-launcher-button" onClick={() => openUtility("find")} title={t("find")}><SearchIcon size={16} /><span>{t("find")}</span></button>
+              {!inspectorOpen && <button className="icon-button panel-restore-button" onClick={toggleInspector} aria-label={t("details")}><PanelRightIcon size={18} /></button>}
+            </div>
           </div>
         </header>
 
         {client.kind === "mock" && <div className="demo-banner">{t("mockBanner")}</div>}
-        <div className="utility-launcher" aria-label={t("utilities")}>
-          {(["logs", "diff", "skills"] as const).map((kind) => <button key={kind} onClick={() => openUtility(kind)} className={utilityKind === kind ? "active" : ""}>{t(kind)}</button>)}
-          <button onClick={() => setRunsOpen(true)} className={runsOpen ? "active" : ""}>{t("runs")}</button>
-          <button onClick={() => setModePanelOpen(true)} className={modePanelOpen ? "active" : ""}>{t("modes")}</button>
+        <div className="utility-launcher" role="toolbar" aria-label={t("utilityPanels")}>
+          <button onClick={() => openUtility("logs")} aria-pressed={utilityKind === "logs"} className={utilityKind === "logs" ? "active" : ""}><TerminalIcon size={16} /><span>{t("logs")}</span></button>
+          <button onClick={() => openUtility("diff")} aria-pressed={utilityKind === "diff"} className={utilityKind === "diff" ? "active" : ""}><CodeIcon size={16} /><span>{t("diff")}</span></button>
+          <button onClick={() => openUtility("skills")} aria-pressed={utilityKind === "skills"} className={utilityKind === "skills" ? "active" : ""}><ToolIcon size={16} /><span>{t("skills")}</span></button>
+          <button onClick={() => setRunsOpen(true)} aria-pressed={runsOpen} className={runsOpen ? "active" : ""}><RunIcon size={16} /><span>{t("runs")}</span></button>
+          <button onClick={() => setModePanelOpen(true)} aria-pressed={modePanelOpen} className={modePanelOpen ? "active" : ""}><ModeIcon size={16} /><span>{t("modes")}</span></button>
         </div>
         <div className="conversation-column">
           <div className="timeline-scroll" ref={timelineScroll}>
