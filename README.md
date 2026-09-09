@@ -1,27 +1,52 @@
 <h1 align="center">Asterline</h1>
 
 <p align="center">
-  <strong>在一个终端里，运行一支看得见、能恢复的编程 Agent 团队。</strong><br>
-  调度本机已经安装的 Codex、Claude、Grok 和 Agy。
+  <strong>在终端与桌面工作台里，运行一支看得见、能恢复的编程 Agent 团队。</strong><br>
+  调度本机已经安装的 Codex、Claude、Grok 和 Agy，共享同一套运行时与会话状态。
 </p>
 
 <p align="center"><sub>中文 · <a href="README.en.md">English</a></sub></p>
 
 <p align="center">
-  <img src="docs/assets/chat.webp" alt="Asterline 中成员互相交接任务" width="100%">
+  <img src="docs/assets/desktop-workbench-dark.png" alt="Asterline Desktop 暗色三栏协作工作台" width="100%">
 </p>
 
 <p align="center">
-  <a href="https://github.com/song0705/Asterline/actions/workflows/ci.yml"><img src="https://github.com/song0705/Asterline/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/song0705/Asterline/releases/latest"><img src="https://img.shields.io/github/v/release/song0705/Asterline" alt="最新版本"></a>
+  <a href="https://github.com/PaoPao1021/Asterline/actions/workflows/ci.yml?query=branch%3Agui"><img src="https://github.com/PaoPao1021/Asterline/actions/workflows/ci.yml/badge.svg?branch=gui" alt="GUI 分支 CI"></a>
+  <a href="https://github.com/PaoPao1021/Asterline/releases/latest"><img src="https://img.shields.io/github/v/release/PaoPao1021/Asterline" alt="最新版本"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
 </p>
 
 Asterline 把各厂商官方 CLI 的原生事件汇进同一块工作台：消息、思考、工具、diff、审批和交接都挂在真正产出它的成员上。多步骤工作记成结构化 Runs，关掉再打开也能接着干。
 
-偏好图形界面？**Asterline Desktop** 在同一套本地运行时之上提供项目历史、聊天、Runs、审批、工作模式和完整团队设置。参见 [Desktop 指南](docs/desktop.zh-CN.md)。
+本仓库的 `gui` 分支基于 [song0705/Asterline](https://github.com/song0705/Asterline) v1.0.4，重点维护与 TUI 功能对齐的 **Asterline Desktop**：项目历史、聊天、Runs、审批、工作模式和完整团队设置均通过同一本地运行时工作。参见 [Desktop 指南](docs/desktop.zh-CN.md)。
 
-[安装](#安装) · [开始使用](#开始使用) · [工作模式](#工作模式) · [文档](#文档) · [版本发布](https://github.com/song0705/Asterline/releases/latest)
+[Desktop 工作台](#desktop-工作台) · [安装](#安装) · [开始使用](#开始使用) · [工作模式](#工作模式) · [文档](#文档) · [版本发布](https://github.com/PaoPao1021/Asterline/releases/latest)
+
+## Desktop 工作台
+
+Desktop 保留 TUI 的成员路由、模式、Runs、审批、恢复、命令与配置语义，并把它们组织为连续三栏工作台。亮色与暗色主题共用语义色；左侧导航使用轻微磨砂，聊天与设置区保持实色，适合长时间阅读。
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <strong>亮色工作台</strong><br><br>
+      <img src="docs/assets/desktop-workbench-light.png" alt="Asterline Desktop 亮色工作台" width="100%">
+    </td>
+    <td width="50%" valign="top">
+      <strong>团队设置</strong><br><br>
+      <img src="docs/assets/desktop-settings-dark.png" alt="Asterline Desktop 团队设置" width="100%">
+    </td>
+  </tr>
+  <tr>
+    <td colspan="2" valign="top">
+      <strong>结构化 Runs</strong><br><br>
+      <img src="docs/assets/desktop-runs-dark.png" alt="Asterline Desktop Runs 面板" width="100%">
+    </td>
+  </tr>
+</table>
+
+当前 [GUI Release](https://github.com/PaoPao1021/Asterline/releases/latest) 是源码预览版，不包含签名安装包。上游正式跨平台安装包仍从 [song0705/Asterline Releases](https://github.com/song0705/Asterline/releases/latest) 获取。
 
 ## 安装
 
@@ -184,7 +209,8 @@ Codex 工具询问默认自动通过。只有加上 `--manual-approvals`，或�
 | 查命令和快捷键                 | [命令与键盘](docs/commands.zh-CN.md)          |
 | 改团队、权限和本地数据         | [配置与本地数据](docs/configuration.zh-CN.md) |
 | 弄清谁会问你、默认会不会自动过 | [审批与工具控制](docs/approvals.zh-CN.md)     |
-| 看这一版改了什么               | [v1.0.4 发布说明](docs/releases/v1.0.4.md)    |
+| 看 GUI 预览版改了什么          | [GUI v0.3.0 发布说明](docs/releases/gui-v0.3.0.md) |
+| 看上游这一版改了什么           | [v1.0.4 发布说明](docs/releases/v1.0.4.md)    |
 | 看全部文档怎么分工             | [文档索引](docs/README.md)                    |
 
 ### 开发者与维护者
@@ -215,7 +241,7 @@ cargo test --all-targets --locked --no-fail-fast
 cargo audit
 ```
 
-完整检查需要 Rust 1.88 或更高，以及 `cargo-audit` 0.22.2。真实后端 smoke 是显式启用的，见[说明](docs/real-smoke.zh-CN.md)。可复现的问题和范围明确的建议请提到 [GitHub Issues](https://github.com/song0705/Asterline/issues)。
+完整检查需要 Rust 1.88 或更高，以及 `cargo-audit` 0.22.2。真实后端 smoke 是显式启用的，见[说明](docs/real-smoke.zh-CN.md)。本分支可复现的问题和范围明确的建议请提到 [GitHub Issues](https://github.com/PaoPao1021/Asterline/issues)；上游问题请提交到原项目。
 
 ## 项目状态
 

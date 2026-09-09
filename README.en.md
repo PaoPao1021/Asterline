@@ -1,27 +1,54 @@
 <h1 align="center">Asterline</h1>
 
 <p align="center">
-  <strong>Run a visible, persistent team of coding agents in one terminal.</strong><br>
-  Coordinates the Codex, Claude, Grok, and Agy CLIs already on your machine.
+  <strong>Run a visible, persistent team of coding agents in a terminal or desktop workbench.</strong><br>
+  Coordinates the Codex, Claude, Grok, and Agy CLIs already on your machine through one runtime and session model.
 </p>
 
 <p align="center"><sub><a href="README.md">中文</a> · English</sub></p>
 
 <p align="center">
-  <img src="docs/assets/chat.webp" alt="Asterline teammates handing work to each other" width="100%">
+  <img src="docs/assets/desktop-workbench-dark.png" alt="Asterline Desktop dark three-column collaboration workbench" width="100%">
 </p>
 
 <p align="center">
-  <a href="https://github.com/song0705/Asterline/actions/workflows/ci.yml"><img src="https://github.com/song0705/Asterline/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/song0705/Asterline/releases/latest"><img src="https://img.shields.io/github/v/release/song0705/Asterline" alt="Latest release"></a>
+  <a href="https://github.com/PaoPao1021/Asterline/actions/workflows/ci.yml?query=branch%3Agui"><img src="https://github.com/PaoPao1021/Asterline/actions/workflows/ci.yml/badge.svg?branch=gui" alt="GUI branch CI"></a>
+  <a href="https://github.com/PaoPao1021/Asterline/releases/latest"><img src="https://img.shields.io/github/v/release/PaoPao1021/Asterline" alt="Latest release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
 </p>
 
 Asterline folds each provider's native event stream into one workspace. Messages, reasoning, tools, diffs, approvals, and handoffs stay attached to the member that produced them. Multi-step work is recorded as structured Runs, so you can close the terminal and continue later.
 
-[Install](#installation) · [Get started](#get-started) · [Modes](#modes) · [Documentation](#documentation) · [Releases](https://github.com/song0705/Asterline/releases/latest)
+The `gui` branch in this repository is based on [song0705/Asterline](https://github.com/song0705/Asterline) v1.0.4 and focuses on **Asterline Desktop** with TUI feature parity: project history, chat, Runs, approvals, modes, and team settings all use the same local runtime. See the [Desktop guide](docs/desktop.md).
+
+[Desktop workbench](#desktop-workbench) · [Install](#installation) · [Get started](#get-started) · [Modes](#modes) · [Documentation](#documentation) · [Releases](https://github.com/PaoPao1021/Asterline/releases/latest)
 
 The default product README is [Chinese](README.md). This page is the English counterpart.
+
+## Desktop workbench
+
+Desktop preserves the TUI semantics for member routing, modes, Runs, approvals, recovery, commands, and configuration, then arranges them as a continuous three-column workbench. Light and dark themes share semantic colors; only navigation uses subtle frost while chat and settings remain solid for sustained reading.
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <strong>Light workbench</strong><br><br>
+      <img src="docs/assets/desktop-workbench-light.png" alt="Asterline Desktop light workbench" width="100%">
+    </td>
+    <td width="50%" valign="top">
+      <strong>Team settings</strong><br><br>
+      <img src="docs/assets/desktop-settings-dark.png" alt="Asterline Desktop team settings" width="100%">
+    </td>
+  </tr>
+  <tr>
+    <td colspan="2" valign="top">
+      <strong>Structured Runs</strong><br><br>
+      <img src="docs/assets/desktop-runs-dark.png" alt="Asterline Desktop Runs panel" width="100%">
+    </td>
+  </tr>
+</table>
+
+The current [GUI Release](https://github.com/PaoPao1021/Asterline/releases/latest) is a source preview and does not include signed installers. Use the [upstream releases](https://github.com/song0705/Asterline/releases/latest) for official cross-platform packages.
 
 ## Installation
 
@@ -184,7 +211,8 @@ This page is the English product overview. Read by goal:
 | Commands and shortcuts              | [Commands and keyboard](docs/commands.md)          |
 | Team files, permissions, local data | [Configuration](docs/configuration.md)             |
 | Who asks, and what auto-passes      | [Approvals and tool control](docs/approvals.md)    |
-| What changed in this version        | [v1.0.4 release notes](docs/releases/v1.0.4.en.md) |
+| What changed in the GUI preview     | [GUI v0.3.0 release notes](docs/releases/gui-v0.3.0.md) |
+| What changed upstream               | [v1.0.4 release notes](docs/releases/v1.0.4.en.md) |
 | Full documentation map              | [Documentation index](docs/README.en.md)           |
 
 ### Developer and maintainer documentation
@@ -215,7 +243,7 @@ cargo test --all-targets --locked --no-fail-fast
 cargo audit
 ```
 
-Rust 1.88 or newer and `cargo-audit` 0.22.2 are required for this complete gate. Real-backend smoke tests are opt-in; see the [controlled local and Actions entrypoints](docs/real-smoke.md). Use [GitHub Issues](https://github.com/song0705/Asterline/issues) for reproducible bugs and focused proposals.
+Rust 1.88 or newer and `cargo-audit` 0.22.2 are required for this complete gate. Real-backend smoke tests are opt-in; see the [controlled local and Actions entrypoints](docs/real-smoke.md). Use this repository's [GitHub Issues](https://github.com/PaoPao1021/Asterline/issues) for reproducible GUI-branch bugs and focused proposals; report upstream issues to the original project.
 
 ## Project status
 
